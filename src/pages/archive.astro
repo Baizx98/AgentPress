@@ -1,0 +1,24 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import PostCard from '../components/PostCard.astro';
+import { publishedPosts } from '../lib/content';
+
+const posts = await publishedPosts();
+const groups = posts.reduce((result, post) => {
+  const year = post.data.publishedAt.getFullYear();
+  result.set(year, [...(result.get(year) ?? []), post]);
+  return result;
+}, new Map<number, typeof posts>());
+---
+
+<BaseLayout title="归档" description="按时间浏览白卓新的论文介绍、技术报告与随笔。">
+  <section class="page-intro"><p class="eyebrow">ARCHIVE</p><h1>归档</h1><p class="lede">论文介绍、技术报告与随笔，按时间沉淀。</p></section>
+  <div class="archive-list">
+    {[...groups.entries()].sort(([a], [b]) => b - a).map(([year, entries]) => (
+      <section>
+        <div class="section-head"><h2>{year}</h2></div>
+        <div class="post-grid">{entries.map((post) => <PostCard post={post} />)}</div>
+      </section>
+    ))}
+  </div>
+</BaseLayout>

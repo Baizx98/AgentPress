@@ -1,0 +1,44 @@
+---
+import '../styles/global.css';
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const {
+  title = '今夜白的知识宫殿',
+  description = '白卓新的个人知识中心',
+} = Astro.props;
+const pageTitle = title === '今夜白的知识宫殿' ? title : `${title} · 今夜白的知识宫殿`;
+---
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#1769d1" />
+    <link rel="canonical" href={new URL(Astro.url.pathname, Astro.site)} />
+    <title>{pageTitle}</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="今夜白的知识宫殿 首页">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>今夜白的知识宫殿</span>
+      </a>
+      <nav aria-label="主导航">
+        <a href="/archive/">归档</a>
+        <a href="/skills/">Skills</a>
+        <a href="/about/">关于</a>
+      </nav>
+    </header>
+    <main><slot /></main>
+    <footer class="site-footer">
+      <p>© {new Date().getFullYear()} 白卓新 · 个人知识中心</p>
+      <p class="filing-placeholder">网站备案号 · 公安备案号</p>
+    </footer>
+  </body>
+</html>

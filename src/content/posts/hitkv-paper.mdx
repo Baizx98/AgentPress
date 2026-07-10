@@ -1,0 +1,23 @@
+---
+title: "HitKV：哪些 Token 真正重要？"
+description: "从激活频率出发，理解 KV Cache 重要性评估的一种思路。"
+publishedAt: 2026-03-01
+author: "白卓新"
+type: paper
+tags: ["LLM Inference", "KV Cache"]
+draft: false
+featured: true
+paperTitle: "HitKV: Activation Frequency Knows Which Tokens Are Important"
+authors: ["Zhuoxin Bai", "Collaborators"]
+affiliations: ["Chongqing University"]
+venue: "Proceedings of the AAAI Conference on Artificial Intelligence"
+publicationDate: 2026-03-01
+paperUrl: "https://doi.org/"
+---
+
+大语言模型的长上下文推理使 KV Cache 成为影响吞吐与延迟的关键资源。本页将作为论文背景、方法直觉与复现信息的公开入口。
+
+## 关注的问题
+
+在有限显存预算下，如何识别对后续生成更重要的历史 Token，并以低开销完成缓存管理。
+

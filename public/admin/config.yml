@@ -1,0 +1,11 @@
+# Placeholder only. Complete this after the GitHub OAuth gateway and repository
+# identity are configured; see docs/design.md section 9.
+backend:
+  name: github
+  repo: YOUR_GITHUB_ORG/YOUR_PRIVATE_REPOSITORY
+  branch: main
+
+media_folder: public/uploads
+public_folder: /uploads
+
+collections: []

@@ -1,0 +1,25 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import PostCard from '../components/PostCard.astro';
+import { publishedPosts } from '../lib/content';
+
+const posts = await publishedPosts();
+const featured = posts.filter((post) => post.data.featured);
+const latest = posts.filter((post) => !post.data.featured).slice(0, 6);
+---
+
+<BaseLayout title="今夜白的知识宫殿" description="白卓新的 Agent-native 个人知识中心">
+  <section class="hero">
+    <p class="eyebrow">PERSONAL KNOWLEDGE CENTER</p>
+    <h1>记录推理系统，也记录正在形成的想法。</h1>
+    <p class="lede">白卓新的个人知识中心，聚焦 LLM 推理、KV Cache、Agent Memory 与系统优化。</p>
+  </section>
+  {featured.length > 0 && <section>
+    <div class="section-head"><h2>精选内容</h2></div>
+    <div class="post-grid">{featured.map((post) => <PostCard post={post} />)}</div>
+  </section>}
+  <section>
+    <div class="section-head"><h2>最新发布</h2><a href="/archive/">浏览全部 →</a></div>
+    <div class="post-grid">{latest.map((post) => <PostCard post={post} />)}</div>
+  </section>
+</BaseLayout>
