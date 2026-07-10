@@ -9,7 +9,7 @@ const href = `/posts/${post.id}/`;
 ---
 
 <article class:list={['post-card', `post-card--${data.type}`]}>
-  <div class="eyebrow">{data.type === 'paper' ? '论文介绍' : data.type === 'technical-report' ? '技术报告' : data.type === 'blog' ? data.series === 'daily-brief' ? '每日简报' : '博客' : '随笔'}</div>
+  <div class="eyebrow">{data.type === 'paper' ? 'Paper' : data.type === 'technical-report' ? 'Report' : data.type === 'blog' ? data.series === 'daily-brief' ? 'Daily Brief' : 'Blog' : 'Note'}</div>
   <h2><a href={href}>{data.title}</a></h2>
   {data.type === 'paper' && (
     <div class="paper-meta">

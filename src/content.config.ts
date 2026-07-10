@@ -43,18 +43,4 @@ const posts = defineCollection({
   ]),
 });
 
-const skills = defineCollection({
-  loader: glob({ base: './src/content/skills', pattern: '**/*.md' }),
-  schema: z.object({
-    title: z.string(),
-    description: z.string().max(200),
-    version: z.string(),
-    publishedAt: z.coerce.date(),
-    license: z.string(),
-    downloadUrl: z.string(),
-    sha256: z.string(),
-    draft: z.boolean().default(true),
-  }),
-});
-
-export const collections = { posts, skills };
+export const collections = { posts };

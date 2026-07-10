@@ -9,7 +9,7 @@ AgentPress 是单一站长使用的个人知识中心：以内容质量和可检
 核心目标：
 
 1. 简洁、可信赖地呈现长短技术内容与个人表达。
-2. 首期支持论文介绍、技术报告、随笔和普通博客（包括每日简报）；Skills 指供 Agent 调用或下载的个人技能包，不是专业能力展示。
+2. 首期支持 Paper、Report、Note 和普通博客（包括每日简报）。
 3. 内容以 MDX + Git 历史保存，编辑方式覆盖 IDE、CLI、Decap CMS 和 MCP Agent。
 4. 静态优先、SEO 完整、腾讯云可自动构建部署，并保留评论等动态能力的扩展接口。
 
@@ -21,7 +21,7 @@ AgentPress 是单一站长使用的个人知识中心：以内容质量和可检
 | --- | --- | --- |
 | 站长（白卓新） | 写作、修改、发布、回滚 | Git / CLI / Decap CMS |
 | 读者 | 阅读、按主题或时间查找、分享 | 主页、归档、文章页、分享卡片 |
-| 技术招聘者/合作方 | 了解作者与技能 | 关于页、Skills 页 |
+| 技术招聘者/合作方 | 了解作者与公开内容 | 关于页、归档页 |
 | Agent | 获取内容索引、阅读文章、起草或提交待审稿 | `llms.txt`、JSON API、MCP |
 
 ## 3. 信息架构
@@ -32,8 +32,6 @@ AgentPress 是单一站长使用的个人知识中心：以内容质量和可检
 /
 ├─ /archive/                 按年份、类型、标签浏览
 ├─ /about/                   个人资料、链接、联系与站点说明
-├─ /skills/                  Agent Skills 清单、说明与下载
-│  └─ /skills/[slug]/
 ├─ /posts/[slug]/            通用内容详情页
 ├─ /tags/[tag]/              标签聚合
 ├─ /feed.xml                 RSS
@@ -42,7 +40,7 @@ AgentPress 是单一站长使用的个人知识中心：以内容质量和可检
 └─ /api/content/*.json       面向 Agent/集成的只读、版本化 JSON
 ```
 
-文章以 `type` 区分而非拆分 URL，便于统一阅读体验和长期重分类。首页按“置顶 + 最新”组织，并提供类型和标签入口；首期不做复杂推荐算法。不同内容类型使用不同摘要卡片：论文介绍使用论文卡片；技术报告突出开源项目入口；随笔采用轻量、以正文摘要为主的时间卡片。
+文章以 `type` 区分而非拆分 URL，便于统一阅读体验和长期重分类。首页按“置顶 + 最新”组织，并提供类型和标签入口；首期不做复杂推荐算法。不同内容类型使用不同摘要卡片：Paper 使用论文卡片；Report 突出开源项目入口；Note 采用轻量、以正文摘要为主的时间卡片。
 
 ## 4. 内容模型
 
@@ -66,9 +64,9 @@ series: ""                    # 可选
 updatedAt: 2026-07-10         # 可选
 ```
 
-论文（`paper`）追加 `paperTitle`、`authors`、`affiliations`、`venue`、`publicationDate`、`doi` 和 `paperUrl` 字段；首页以论文卡片展示题目、作者、单位、会议/期刊、发表时间与论文链接。技术报告（`technical-report`）追加 `repository`、`demoUrl`、`projectStatus` 和 `highlights` 字段，在首页卡片展示开源仓库、演示链接和关键结论。随笔（`note`）只保留通用字段，避免过多元信息干扰阅读。
+Paper（`paper`）追加 `paperTitle`、`authors`、`affiliations`、`venue`、`publicationDate`、`doi` 和 `paperUrl` 字段；首页以论文卡片展示题目、作者、单位、会议/期刊、发表时间与论文链接。Report（`technical-report`）追加 `repository`、`demoUrl`、`projectStatus` 和 `highlights` 字段，在首页卡片展示开源仓库、演示链接和关键结论。Note（`note`）只保留通用字段，避免过多元信息干扰阅读。
 
-普通博客（`blog`）以 `series: daily-brief | general` 区分每日简报和一般博客。Skills 独立保存于 `src/content/skills/<slug>/`，是供 Agent 使用、下载或复用的技能包，包含 `SKILL.md`、元数据和可下载附件；它不用于展示作者的专业技能。公开下载须有明确版本号、摘要、许可信息、校验值（SHA-256）和发布日期。涉及私密提示词、密钥或内部资料的 Skill 不进入公开内容目录。
+普通博客（`blog`）以 `series: daily-brief | general` 区分每日简报和一般博客。
 
 文章状态由 Git 分支/PR 与 `draft` 字段共同表达：`draft: true` 不出现在公开列表和 sitemap；合并到 `main` 后才进入生产构建。为避免链接失效，slug 发布后不改；需更名时配置永久重定向。
 
@@ -147,8 +145,6 @@ agentpress init
 agentpress post new
 agentpress post validate [slug]
 agentpress post list
-agentpress skill new
-agentpress skill pack [slug]
 agentpress publish --branch <name>
 ```
 
@@ -160,7 +156,6 @@ MCP 初步工具遵循最小权限原则：
 | `create_draft` / `update_draft` | 写草稿 | 创建或修改草稿文件，强制 schema 校验 |
 | `validate_content` | 只读 | 输出 lint、链接、frontmatter 问题 |
 | `request_publish` | 创建 PR | 提交分支并请求发布，不直接生产发布 |
-| `list_skills` / `get_skill` | 只读 | 提供 Agent 友好的 Skill 描述与下载信息 |
 
 MCP 服务以本地 stdio 为第一实现目标，仅供你的 Agent 使用，使用显式仓库路径与 GitHub token/SSH 凭据；远程 MCP 仅在认证、审计日志、权限隔离设计完成后开放。所有写操作都应留下 Git commit/PR 审计轨迹，并禁止读取 `.env`、Actions secrets 或站外任意路径。
 
@@ -175,7 +170,6 @@ MCP 服务以本地 stdio 为第一实现目标，仅供你的 Agent 使用，�
 - 私有仓库并不等于公开站点内容自动安全：构建前必须仅导出 `draft: false` 且明确位于公开 collection 的文件。
 - 不发布密钥、内部 URL、未授权论文/代码、个人敏感信息；CI 增加 secret 扫描。
 - 互联网的其他 Agent 可匿名读取已发布内容的元数据、HTML 和原始 MDX；公开接口只读、按版本稳定输出，添加速率限制与 `noindex` 边界。任何管理性 API、MCP 工具、草稿和仓库内容均必须经你的身份授权。
-- 下载 Skill 的压缩包由 CI 生成并校验，避免上传任意可执行文件。
 
 ## 13. 交付分期与验收
 
@@ -183,7 +177,7 @@ MCP 服务以本地 stdio 为第一实现目标，仅供你的 Agent 使用，�
 | --- | --- | --- |
 | 0（当前） | 设计确认、Astro+MDX 骨架 | 文档确认；`pnpm build` 通过 |
 | 1 | 视觉基础、首页/归档/关于、三种内容 schema、样稿、SEO/RSS/sitemap、备案页脚 | 能发布并良好阅读一组 MDX 内容 |
-| 2 | Skills 目录与下载、分享卡片、搜索、部署 CI/CD | 可在腾讯云稳定自动发布 |
+| 2 | 分享卡片、搜索、部署 CI/CD | 可在腾讯云稳定自动发布 |
 | 3 | Decap CMS OAuth、CLI、只读 Agent 接口 | 人和本地 Agent 可安全管理草稿 |
 | 4 | MCP 写草稿/PR 流、评论 | 受控 Agent 发布工作流与互动能力 |
 

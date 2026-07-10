@@ -14,13 +14,13 @@ const { data } = post;
 
 <BaseLayout title={data.title} description={data.description}>
   <article class="page-intro prose">
-    <p class="eyebrow">{data.type === 'paper' ? '论文介绍' : data.type === 'technical-report' ? '技术报告' : data.type === 'blog' ? data.series === 'daily-brief' ? '每日简报' : '博客' : '随笔'}</p>
+    <p class="eyebrow">{data.type === 'paper' ? 'Paper' : data.type === 'technical-report' ? 'Report' : data.type === 'blog' ? data.series === 'daily-brief' ? 'Daily Brief' : 'Blog' : 'Note'}</p>
     <h1>{data.title}</h1>
     <p class="lede">{data.description}</p>
     <p>{formatDate(data.publishedAt)} · {data.tags.join(' · ')}</p>
     {data.type === 'paper' && <p><strong>{data.paperTitle}</strong><br />{data.authors.join(', ')}<br />{data.affiliations.join(' · ')} · {data.venue}</p>}
     {data.type === 'technical-report' && data.repository && <p><a href={data.repository}>查看开源仓库 ↗</a></p>}
     <Content />
-    <section class="skill-card"><p class="eyebrow">COMMENTS</p><p>Giscus 评论将在 GitHub Discussions 配置完成后启用。</p></section>
+    <section class="comment-card"><p class="eyebrow">COMMENTS</p><p>Giscus 评论将在 GitHub Discussions 配置完成后启用。</p></section>
   </article>
 </BaseLayout>

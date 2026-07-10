@@ -5,10 +5,5 @@ export const publishedPosts = async () =>
     (a, b) => b.data.publishedAt.valueOf() - a.data.publishedAt.valueOf(),
   );
 
-export const publishedSkills = async () =>
-  (await getCollection('skills', ({ data }) => !data.draft)).sort(
-    (a, b) => b.data.publishedAt.valueOf() - a.data.publishedAt.valueOf(),
-  );
-
 export const formatDate = (date: Date) =>
   new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium' }).format(date);
