@@ -2,6 +2,7 @@
 import { getCollection, render } from 'astro:content';
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import { formatDate, getReadingStats } from '../../lib/content';
+import Giscus from '../../components/Giscus.astro';
 
 export async function getStaticPaths() {
   const posts = await getCollection('posts', ({ data }) => !data.draft);
@@ -31,7 +32,7 @@ const typeLabel = data.type === 'paper' ? 'Paper' : data.type === 'technical-rep
       {data.type === 'paper' && <p><strong>{data.paperTitle}</strong><br />{data.authors.join(', ')}<br />{data.affiliations.join(' · ')} · {data.venue}</p>}
       {data.type === 'technical-report' && data.repository && <p><a href={data.repository}>查看开源仓库 ↗</a></p>}
       <Content />
-      <section class="comment-card"><p class="eyebrow">COMMENTS</p><p>Giscus 评论将在 GitHub Discussions 配置完成后启用。</p></section>
+      <Giscus />
     </article>
     {headings.length > 0 && <aside class="article-side" aria-label="文章大纲">
       <nav class="toc toc-rail">

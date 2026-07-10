@@ -20,6 +20,16 @@ export const siteConfig = {
     { label: '归档', href: '/archive/' },
     { label: '关于', href: '/about/' },
   ],
-  comments: { enabled: false, provider: 'giscus' as const },
+  comments: {
+    enabled: true,
+    provider: 'giscus' as const,
+    giscus: {
+      repo: 'Baizx98/agentpress-comments',
+      repoId: 'R_kgDOTUhmAw',
+      category: 'Announcements',
+      categoryId: 'DIC_kwDOTUhmA84DA56-',
+      mapping: 'pathname',
+    },
+  },
   analytics: { enabled: false },
 } as const;

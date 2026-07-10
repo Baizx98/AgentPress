@@ -1,0 +1,39 @@
+---
+import { siteConfig } from '../config/site';
+const config = siteConfig.comments.giscus;
+---
+
+{siteConfig.comments.enabled && config && <section class="giscus-container" aria-label="评论">
+  <script
+    is:inline
+    src="https://giscus.app/client.js"
+    data-repo={config.repo}
+    data-repo-id={config.repoId}
+    data-category={config.category}
+    data-category-id={config.categoryId}
+    data-mapping={config.mapping}
+    data-strict="0"
+    data-reactions-enabled="1"
+    data-emit-metadata="0"
+    data-input-position="top"
+    data-theme="preferred_color_scheme"
+    data-lang="zh-CN"
+    data-loading="lazy"
+    crossorigin="anonymous"
+    async
+  ></script>
+</section>}
+
+<script is:inline>
+  (() => {
+    const updateTheme = () => {
+      const theme = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+      document.querySelector('iframe.giscus-frame')?.contentWindow?.postMessage(
+        { giscus: { setConfig: { theme } } },
+        'https://giscus.app',
+      );
+    };
+    addEventListener('message', (event) => { if (event.origin === 'https://giscus.app') updateTheme(); });
+    new MutationObserver(updateTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+  })();
+</script>

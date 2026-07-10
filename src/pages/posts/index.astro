@@ -1,6 +1,7 @@
 ---
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import PostCard from '../../components/PostCard.astro';
+import PageHeader from '../../components/PageHeader.astro';
 import { publishedPosts } from '../../lib/content';
 import { contentTypes } from '../../config/content';
 
@@ -12,7 +13,7 @@ const countTag = (tag: string) => posts.filter((post) => post.data.tags.includes
 ---
 
 <BaseLayout title="文章" description="按类别与标签浏览全部文章。">
-  <section class="page-header"><h1>文章</h1><p>按类别与标签浏览全部公开内容。</p></section>
+  <PageHeader title="文章" description="按类别与标签浏览全部公开内容。" />
   <section class="post-browser-filters" aria-label="文章筛选">
     <div class="post-filter-group" role="group" aria-label="类别"><span>类别</span><div>
       <button type="button" data-post-type="" aria-pressed="true">全部 <small>{posts.length}</small></button>
