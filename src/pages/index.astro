@@ -23,6 +23,6 @@ const latest = posts.slice(0, 5);
   </section>
   <section class="home-section">
     <div class="section-heading"><h2>最近文章</h2><a href="/posts/">查看全部 →</a></div>
-    <div class="entry-list entry-list--home">{latest.map((post) => <PostCard post={post} variant="home" />)}</div>
+    <div class="entry-list">{latest.map((post) => <PostCard post={post} />)}</div>
   </section>
 </BaseLayout>
