@@ -13,14 +13,14 @@ const countTag = (tag: string) => posts.filter((post) => post.data.tags.includes
 <BaseLayout title="归档" description="按类型、标签和时间浏览公开内容。">
   <section class="page-header"><h1>归档</h1><p>按类型、标签和时间浏览所有公开内容。</p></section>
   <section class="archive-filters" data-archive-filter-root hidden aria-label="归档筛选">
-    <fieldset><legend>类型</legend><div class="filter-chips">
+    <div class="filter-group" role="group" aria-label="类型"><span class="filter-group-label">类型</span><div class="filter-chips">
       <button type="button" data-filter-kind="type" data-filter-value="" aria-pressed="true">全部 <span>{posts.length}</span></button>
       {types.map(([type, config]) => <button type="button" data-filter-kind="type" data-filter-value={type} aria-pressed="false">{config.label} <span>{countType(type)}</span></button>)}
-    </div></fieldset>
-    <fieldset><legend>标签</legend><div class="filter-chips">
+    </div></div>
+    <div class="filter-group" role="group" aria-label="标签"><span class="filter-group-label">标签</span><div class="filter-chips">
       <button type="button" data-filter-kind="tag" data-filter-value="" aria-pressed="true">全部 <span>{posts.length}</span></button>
       {tags.map((tag) => <button type="button" data-filter-kind="tag" data-filter-value={tag} aria-pressed="false">{tag} <span>{countTag(tag)}</span></button>)}
-    </div></fieldset>
+    </div></div>
     <p class="filter-result">显示 <strong data-filter-count>{posts.length}</strong> 篇内容</p>
   </section>
   <div class="archive-timeline" id="archive-results">
