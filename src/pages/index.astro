@@ -9,17 +9,35 @@ const latest = posts.filter((post) => !post.data.featured).slice(0, 6);
 ---
 
 <BaseLayout title="今夜白的知识宫殿" description="白卓新的 Agent-native 个人知识中心">
-  <section class="hero">
-    <p class="eyebrow">PERSONAL KNOWLEDGE CENTER</p>
-    <h1>记录推理系统，也记录正在形成的想法。</h1>
-    <p class="lede">白卓新的个人知识中心，聚焦 LLM 推理、KV Cache、Agent Memory 与系统优化。</p>
-  </section>
-  {featured.length > 0 && <section>
-    <div class="section-head"><h2>精选内容</h2></div>
-    <div class="post-grid">{featured.map((post) => <PostCard post={post} />)}</div>
-  </section>}
-  <section>
-    <div class="section-head"><h2>最新发布</h2><a href="/archive/">浏览全部 →</a></div>
-    <div class="post-grid">{latest.map((post) => <PostCard post={post} />)}</div>
-  </section>
+  <div class="content-shell home-layout">
+    <aside class="identity-rail">
+      <div class="avatar-placeholder" aria-hidden="true"></div>
+      <p class="identity-name">白卓新</p>
+      <p class="identity-role">LLM Inference Systems<br />Chongqing University</p>
+      <a href="/about/">了解更多 →</a>
+    </aside>
+    <div class="home-feed">
+      <section class="hero">
+        <p class="eyebrow">PERSONAL KNOWLEDGE CENTER</p>
+        <h1>今夜白的<br />知识宫殿</h1>
+        <p class="lede">记录推理系统，也记录正在形成的想法。</p>
+      </section>
+      {featured.length > 0 && <section>
+        <div class="section-head"><h2>Featured</h2></div>
+        <div class="post-list">{featured.map((post) => <PostCard post={post} />)}</div>
+      </section>}
+      <section>
+        <div class="section-head"><h2>Latest</h2><a href="/archive/">全部归档 →</a></div>
+        <div class="post-list">{latest.map((post) => <PostCard post={post} />)}</div>
+      </section>
+    </div>
+    <aside class="context-rail">
+      <p class="eyebrow">FOCUS</p>
+      <p>LLM Inference<br />KV Cache<br />Agent Memory</p>
+      <p class="eyebrow">EXPLORE</p>
+      <a href="/feed.xml">RSS Feed</a>
+      <a href="/llms.txt">For Agents</a>
+      <a href="/preview/">Article Preview</a>
+    </aside>
+  </div>
 </BaseLayout>
