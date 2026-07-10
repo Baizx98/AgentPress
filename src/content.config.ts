@@ -13,6 +13,19 @@ const common = z.object({
   language: z.enum(['zh-CN', 'en']).default('zh-CN'),
   cover: z.string().optional(),
   canonicalUrl: z.string().url().optional(),
+  agent: z.object({
+    summary: z.string().max(500).optional(),
+    sourceQuality: z.enum(['personal', 'curated', 'verified']).default('personal'),
+    reuseLevel: z.enum(['low', 'medium', 'high']).default('medium'),
+    citeAs: z.string().optional(),
+    related: z.array(z.string()).default([]),
+    assets: z.array(z.string()).default([]),
+  }).default({
+    sourceQuality: 'personal',
+    reuseLevel: 'medium',
+    related: [],
+    assets: [],
+  }),
 });
 
 const posts = defineCollection({

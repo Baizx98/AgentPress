@@ -8,6 +8,7 @@ export async function GET({ site }: { site: URL }) {
     description: post.data.description,
     type: post.data.type,
     tags: post.data.tags,
+    agent: post.data.agent,
     publishedAt: post.data.publishedAt.toISOString(),
     updatedAt: post.data.updatedAt?.toISOString(),
     htmlUrl: new URL(`/posts/${post.id}/`, site).toString(),

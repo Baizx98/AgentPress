@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title">
+  <title id="title">Agent Memory architecture placeholder</title>
+  <rect width="1600" height="900" fill="#f7f9fc"/>
+  <g fill="#ffffff" stroke="#0b66d4" stroke-width="4">
+    <rect x="170" y="340" width="300" height="180" rx="28"/>
+    <rect x="650" y="340" width="300" height="180" rx="28"/>
+    <rect x="1130" y="340" width="300" height="180" rx="28"/>
+  </g>
+  <g fill="#172033" font-family="Arial, sans-serif" font-size="40" text-anchor="middle">
+    <text x="320" y="415">Working Memory</text>
+    <text x="800" y="415">Session Summary</text>
+    <text x="1280" y="415">Long-term Index</text>
+  </g>
+  <g stroke="#0b66d4" stroke-width="8" fill="none">
+    <path d="M470 430h150"/>
+    <path d="M950 430h150"/>
+  </g>
+</svg>

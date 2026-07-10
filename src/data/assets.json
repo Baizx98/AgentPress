@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "assets": [
+    {
+      "id": "agent-memory-architecture",
+      "kind": "image",
+      "objectKey": "images/2026/07/agent-memory-architecture-placeholder.svg",
+      "localUrl": "/uploads/agent-memory-architecture-placeholder.svg",
+      "mime": "image/svg+xml",
+      "sha256": "LOCAL-PLACEHOLDER",
+      "width": 1600,
+      "height": 900,
+      "alt": "Agent Memory 的工作记忆、会话摘要与长期索引分层示意图",
+      "caption": "本地开发用占位资源；生产环境将迁移至腾讯云 COS。",
+      "license": "All rights reserved",
+      "usedBy": ["agent-memory-report"]
+    }
+  ]
+}
