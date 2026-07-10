@@ -24,7 +24,7 @@ const themeInit = `(() => { const r = document.documentElement; r.dataset.theme 
   </head>
   <body>
     <main class="site-main" style={`--layout-content-width: ${siteConfig.contentWidth}`}>
-      <Header onlyArchiveAndAbout={homeNavigation} />
+      <Header onlyArchiveAndAbout={homeNavigation} readerWidth={homeNavigation} />
       <slot />
       <Footer />
     </main>

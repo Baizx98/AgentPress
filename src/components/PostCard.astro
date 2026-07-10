@@ -20,15 +20,13 @@ const config = contentTypes[data.type];
     <h2><a href={href}>{data.title}</a></h2>
     {data.type === 'paper' && <div class="paper-meta"><p>{data.authors.join(' · ')}</p><p>{data.affiliations.join(' · ')} · {data.venue}</p></div>}
     <p>{data.description}</p>
-    {(data.type === 'technical-report' || data.type === 'paper') && (
-      <div class="card-links">
+    <div class="card-footer">
+      <time datetime={data.publishedAt.toISOString()}>{formatDate(data.publishedAt)} · {reading.count} 字 · 约 {reading.minutes} 分钟</time>
+      {(data.type === 'technical-report' || data.type === 'paper') && <span class="card-links">
         {data.type === 'technical-report' && data.repository && <a href={data.repository}>开源仓库 ↗</a>}
         {data.type === 'technical-report' && data.demoUrl && <a href={data.demoUrl}>在线演示 ↗</a>}
         {data.type === 'paper' && data.paperUrl && <a href={data.paperUrl}>Paper ↗</a>}
-      </div>
-    )}
-    <div class="card-footer">
-      <time datetime={data.publishedAt.toISOString()}>{formatDate(data.publishedAt)} · {reading.count} 字 · 约 {reading.minutes} 分钟</time>
+      </span>}
       <span class="card-tags">{data.tags.map((tag, index) => <>{index > 0 && ' · '}<a href={`/posts/?tag=${encodeURIComponent(tag)}`}>{tag}</a></>)}</span>
     </div>
   </div>

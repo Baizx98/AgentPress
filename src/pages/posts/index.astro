@@ -23,8 +23,8 @@ const countTag = (tag: string) => posts.filter((post) => post.data.tags.includes
     </div></div>
     <div class="post-filter-summary"><span>显示 <strong data-post-count>{posts.length}</strong> 篇内容</span><button type="button" data-post-reset hidden>重置筛选</button></div>
   </section>
-  <div class="post-browser-list entry-list" data-post-list>
-    {posts.map((post) => <PostCard post={post} />)}
+  <div class="post-browser-list post-list" data-post-list>
+    {posts.map((post) => <PostCard post={post} variant="home" />)}
   </div>
 </BaseLayout>
 
