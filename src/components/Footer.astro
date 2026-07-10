@@ -1,12 +1,10 @@
 ---
 import { siteConfig } from '../config/site';
-interface Props { classic?: boolean; }
-const { classic = false } = Astro.props;
 ---
-<footer class:list={['site-footer', { 'site-footer--classic': classic }]}>
+<footer class="site-footer">
   <div class="footer-line"></div>
   <div class="footer-content">
-    <p>© {new Date().getFullYear()} {classic ? '今夜白 · 个人知识中心' : siteConfig.shortName}</p>
+    <p>© {new Date().getFullYear()} {siteConfig.shortName}</p>
     <p class="filing-placeholder">网站备案号 · 公安备案号</p>
   </div>
 </footer>

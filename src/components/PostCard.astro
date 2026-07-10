@@ -29,7 +29,7 @@ const config = contentTypes[data.type];
     )}
     <div class="card-footer">
       <time datetime={data.publishedAt.toISOString()}>{formatDate(data.publishedAt)} · {reading.count} 字 · 约 {reading.minutes} 分钟</time>
-      <span class="card-tags">{data.tags.map((tag, index) => <>{index > 0 && ' · '}<a href={`/archive/?tag=${encodeURIComponent(tag)}`}>{tag}</a></>)}</span>
+      <span class="card-tags">{data.tags.map((tag, index) => <>{index > 0 && ' · '}<a href="/archive/">{tag}</a></>)}</span>
     </div>
   </div>
   {variant !== 'home' && config.showCover && data.cover && <a class="post-card-cover" href={href}><img src={data.cover} alt="" loading="lazy" /></a>}

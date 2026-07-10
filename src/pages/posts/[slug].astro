@@ -25,7 +25,7 @@ const typeLabel = data.type === 'paper' ? 'Paper' : data.type === 'technical-rep
         <p class="lede">{data.description}</p>
         <p class="article-meta">{formatDate(data.publishedAt)} · {reading.count} 字 · 约 {reading.minutes} 分钟</p>
         {data.tags.length > 0 && <nav class="article-tags" aria-label="文章标签">
-          {data.tags.map((tag) => <a href={`/archive/?tag=${encodeURIComponent(tag)}`}>{tag}</a>)}
+          {data.tags.map((tag) => <a href="/archive/">{tag}</a>)}
         </nav>}
       </header>
       {data.type === 'paper' && <p><strong>{data.paperTitle}</strong><br />{data.authors.join(', ')}<br />{data.affiliations.join(' · ')} · {data.venue}</p>}
