@@ -50,12 +50,10 @@ const tags = [...new Set(posts.flatMap((post) => post.data.tags))].sort((a, b) =
     </section>
 
     <section data-archive-panel="tag" class="archive-panel" hidden>
-      <label class="tag-select">按标签筛选
-        <select data-tag-filter>
-          <option value="all">全部标签</option>
-          {tags.map((tag) => <option value={tag}>{tag}</option>)}
-        </select>
-      </label>
+      <div class="tag-filter-header"><p>选择一个或多个标签</p><button type="button" data-tag-reset>重置</button></div>
+      <div class="tag-filter-list" aria-label="标签筛选">
+        {tags.map((tag) => <button type="button" data-tag-filter={tag}>{tag}</button>)}
+      </div>
       <div class="post-grid archive-filter-grid">
         {posts.map((post) => <PostCard post={post} />)}
       </div>
@@ -69,7 +67,9 @@ const tags = [...new Set(posts.flatMap((post) => post.data.tags))].sort((a, b) =
   const typeButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-type-filter]')];
   const typeCards = [...document.querySelectorAll<HTMLElement>('[data-archive-panel="type"] [data-content-type]')];
   const tagCards = [...document.querySelectorAll<HTMLElement>('[data-archive-panel="tag"] [data-tags]')];
-  const tagFilter = document.querySelector<HTMLSelectElement>('[data-tag-filter]');
+  const tagButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-tag-filter]')];
+  const tagReset = document.querySelector<HTMLButtonElement>('[data-tag-reset]');
+  const selectedTags = new Set<string>();
 
   modeButtons.forEach((button) => button.addEventListener('click', () => {
     const mode = button.dataset.archiveMode;
@@ -83,8 +83,22 @@ const tags = [...new Set(posts.flatMap((post) => post.data.tags))].sort((a, b) =
     typeCards.forEach((card) => { card.hidden = type !== 'all' && card.dataset.contentType !== type; });
   }));
 
-  tagFilter?.addEventListener('change', () => {
-    const tag = tagFilter.value;
-    tagCards.forEach((card) => { card.hidden = tag !== 'all' && !card.dataset.tags?.split('|').includes(tag); });
+  const applyTagFilter = () => tagCards.forEach((card) => {
+    const tags = card.dataset.tags?.split('|') ?? [];
+    card.hidden = selectedTags.size > 0 && !tags.some((tag) => selectedTags.has(tag));
+  });
+
+  tagButtons.forEach((button) => button.addEventListener('click', () => {
+    const tag = button.dataset.tagFilter;
+    if (!tag) return;
+    selectedTags.has(tag) ? selectedTags.delete(tag) : selectedTags.add(tag);
+    button.classList.toggle('is-active', selectedTags.has(tag));
+    applyTagFilter();
+  }));
+
+  tagReset?.addEventListener('click', () => {
+    selectedTags.clear();
+    tagButtons.forEach((button) => button.classList.remove('is-active'));
+    applyTagFilter();
   });
 </script>

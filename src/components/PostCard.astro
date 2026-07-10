@@ -19,10 +19,11 @@ const reading = getReadingStats(post.body ?? '');
     </div>
   )}
   <p>{data.description}</p>
-  {data.type === 'technical-report' && (
+  {(data.type === 'technical-report' || data.type === 'paper') && (
     <div class="card-links">
-      {data.repository && <a href={data.repository}>开源仓库 ↗</a>}
-      {data.demoUrl && <a href={data.demoUrl}>在线演示 ↗</a>}
+      {data.type === 'technical-report' && data.repository && <a href={data.repository}>开源仓库 ↗</a>}
+      {data.type === 'technical-report' && data.demoUrl && <a href={data.demoUrl}>在线演示 ↗</a>}
+      {data.type === 'paper' && data.paperUrl && <a href={data.paperUrl}>Paper ↗</a>}
     </div>
   )}
   <div class="card-footer">

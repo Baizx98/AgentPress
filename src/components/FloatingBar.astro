@@ -1,18 +1,23 @@
 <nav class="floating-bar" aria-label="快捷工具">
-  <a href="/" title="首页">Home</a>
-  <a href="/archive/" title="归档">Archive</a>
-  <a href="/feed.xml" title="RSS">RSS</a>
-  <button type="button" data-theme-toggle title="切换深浅色">Theme</button>
-  <button type="button" data-back-top title="回到顶部">Top ↑</button>
+  <span class="reading-progress" aria-hidden="true"></span>
+  <a href="/" aria-label="首页" title="首页"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z"/></svg></a>
+  <a href="/archive/" aria-label="归档" title="归档"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5ZM8 8h8M8 12h8M8 16h5"/></svg></a>
+  <button type="button" data-accent-toggle aria-label="切换配色" title="切换配色"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-1.1-.9-2-2-2h-1.2a1.8 1.8 0 0 1-1.8-1.8c0-1 .8-1.8 1.8-1.8H19A7 7 0 0 0 12 3Z"/><circle cx="7.5" cy="11" r="1"/><circle cx="10" cy="7.5" r="1"/><circle cx="14" cy="7.5" r="1"/></svg></button>
+  <button type="button" data-theme-toggle aria-label="切换深浅色" title="切换深浅色"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.4A8.4 8.4 0 0 1 8.6 4 8.5 8.5 0 1 0 20 15.4Z"/></svg></button>
+  <button type="button" data-back-top aria-label="回到顶部" title="回到顶部"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 11 6-6 6 6M12 5v14"/></svg></button>
 </nav>
 
 <script>
   const root = document.documentElement;
   const themeButton = document.querySelector<HTMLButtonElement>('[data-theme-toggle]');
+  const accentButton = document.querySelector<HTMLButtonElement>('[data-accent-toggle]');
   const topButton = document.querySelector<HTMLButtonElement>('[data-back-top]');
   const savedTheme = localStorage.getItem('theme');
+  const savedAccent = localStorage.getItem('accent');
+  const accents = ['blue', 'violet', 'emerald', 'amber'];
 
   if (savedTheme) root.dataset.theme = savedTheme;
+  if (savedAccent) root.dataset.accent = savedAccent;
 
   themeButton?.addEventListener('click', () => {
     const theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
@@ -20,5 +25,16 @@
     localStorage.setItem('theme', theme);
   });
 
+  accentButton?.addEventListener('click', () => {
+    const current = root.dataset.accent ?? 'blue';
+    const accent = accents[(accents.indexOf(current) + 1) % accents.length];
+    root.dataset.accent = accent;
+    localStorage.setItem('accent', accent);
+  });
+
   topButton?.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+  addEventListener('scroll', () => {
+    const height = document.documentElement.scrollHeight - innerHeight;
+    root.style.setProperty('--reading-progress', `${height > 0 ? (scrollY / height) * 100 : 0}%`);
+  }, { passive: true });
 </script>

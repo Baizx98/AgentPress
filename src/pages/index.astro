@@ -13,17 +13,17 @@ const latest = posts.filter((post) => !post.data.featured).slice(0, 6);
   <div class="content-shell home-layout">
     <aside class="identity-rail">
       <img class="profile-avatar" src={profile.avatar} alt="白卓新的头像占位图" />
-      <p class="identity-name">{profile.name}</p>
-      <p class="identity-role">{profile.role}<br />{profile.affiliation}</p>
-      <p class="identity-bio">{profile.bio}</p>
-      <div class="profile-links">{profile.links.map((link) => <a href={link.href}>{link.label} ↗</a>)}</div>
-      <a href="/about/">了解更多 →</a>
+      <p class="identity-role">{profile.role}</p>
+      <div class="topic-list"><span>LLM Inference</span><span>KV Cache</span><span>Agent Memory</span><span>Systems</span></div>
+      <div class="profile-links">
+        {profile.links.map((link) => <a href={link.href} aria-label={link.label} title={link.label}><span aria-hidden="true">{link.label === 'GitHub' ? '◖◗' : link.label === 'Email' ? '✉' : link.label === 'Academic Home' ? '⌂' : 'iD'}</span></a>)}
+      </div>
     </aside>
     <div class="home-feed">
       <section class="hero">
-        <p class="eyebrow">PERSONAL KNOWLEDGE CENTER</p>
-        <h1>今夜白的<br />知识宫殿</h1>
-        <p class="lede">记录推理系统，也记录正在形成的想法。</p>
+        <img class="hero-art" src="/uploads/knowledge-palace-hero.png" alt="蓝色透明结构与数据路径构成的抽象知识空间" />
+        <p class="eyebrow">TONIGHT'S THOUGHT</p>
+        <p class="daily-quote"><span data-typewriter data-text="“先把问题写清楚，答案才有可能出现。”"></span><span class="typing-caret" aria-hidden="true"></span></p>
       </section>
       {featured.length > 0 && <section>
         <div class="section-head"><h2>Featured</h2></div>
@@ -35,21 +35,21 @@ const latest = posts.filter((post) => !post.data.featured).slice(0, 6);
       </section>
     </div>
     <aside class="context-rail">
-      <p class="eyebrow">FOCUS</p>
-      <p>LLM Inference<br />KV Cache<br />Agent Memory</p>
       <p class="eyebrow">EXPLORE</p>
       <a href="/feed.xml">RSS Feed</a>
       <a href="/llms.txt">For Agents</a>
-      <a href="/preview/">Article Preview</a>
-      <p class="eyebrow">SERIES</p>
-      <a href="/archive/#paper">Paper</a>
-      <a href="/archive/#report">Report</a>
-      <a href="/archive/#note">Note</a>
-      <a href="/archive/#blog">Blog</a>
-      <p class="eyebrow">TAGS</p>
-      <a href="/tags/LLM%20Inference.json">LLM Inference</a>
-      <a href="/tags/KV%20Cache.json">KV Cache</a>
-      <a href="/tags/Agent%20Memory.json">Agent Memory</a>
     </aside>
   </div>
 </BaseLayout>
+
+<script>
+  const target = document.querySelector<HTMLElement>('[data-typewriter]');
+  const text = target?.dataset.text ?? '';
+  let index = 0;
+  const type = () => {
+    if (!target || index >= text.length) return;
+    target.textContent += text[index++];
+    setTimeout(type, 78);
+  };
+  type();
+</script>
