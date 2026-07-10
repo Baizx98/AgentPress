@@ -1,33 +1,33 @@
 ---
 import { formatDate, getReadingStats } from '../lib/content';
 import type { CollectionEntry } from 'astro:content';
+import { contentTypes } from '../config/content';
 
 interface Props { post: CollectionEntry<'posts'> }
 const { post } = Astro.props;
 const { data } = post;
 const href = `/posts/${post.id}/`;
 const reading = getReadingStats(post.body ?? '');
+const config = contentTypes[data.type];
 ---
 
-<article class:list={['post-card', `post-card--${data.type}`]} data-content-type={data.type} data-tags={data.tags.join('|')}>
+<article class:list={['post-card', `post-card--${data.type}`, `post-card--${config.cardStyle}`]} data-content-type={data.type} data-tags={data.tags.join('|')}>
   <div class="eyebrow">{data.type === 'paper' ? 'Paper' : data.type === 'technical-report' ? 'Report' : data.type === 'blog' ? data.series === 'daily-brief' ? 'Daily Brief' : 'Blog' : 'Note'}</div>
-  <h2><a href={href}>{data.title}</a></h2>
-  {data.type === 'paper' && (
-    <div class="paper-meta">
-      <p>{data.authors.join(' · ')}</p>
-      <p>{data.affiliations.join(' · ')} · {data.venue}</p>
+  <div class="post-card-main">
+    <h2><a href={href}>{data.title}</a></h2>
+    {data.type === 'paper' && <div class="paper-meta"><p>{data.authors.join(' · ')}</p><p>{data.affiliations.join(' · ')} · {data.venue}</p></div>}
+    <p>{data.description}</p>
+    {(data.type === 'technical-report' || data.type === 'paper') && (
+      <div class="card-links">
+        {data.type === 'technical-report' && data.repository && <a href={data.repository}>开源仓库 ↗</a>}
+        {data.type === 'technical-report' && data.demoUrl && <a href={data.demoUrl}>在线演示 ↗</a>}
+        {data.type === 'paper' && data.paperUrl && <a href={data.paperUrl}>Paper ↗</a>}
+      </div>
+    )}
+    <div class="card-footer">
+      <time datetime={data.publishedAt.toISOString()}>{formatDate(data.publishedAt)} · {reading.count} 字 · 约 {reading.minutes} 分钟</time>
+      <span>{data.tags.join(' · ')}</span>
     </div>
-  )}
-  <p>{data.description}</p>
-  {(data.type === 'technical-report' || data.type === 'paper') && (
-    <div class="card-links">
-      {data.type === 'technical-report' && data.repository && <a href={data.repository}>开源仓库 ↗</a>}
-      {data.type === 'technical-report' && data.demoUrl && <a href={data.demoUrl}>在线演示 ↗</a>}
-      {data.type === 'paper' && data.paperUrl && <a href={data.paperUrl}>Paper ↗</a>}
-    </div>
-  )}
-  <div class="card-footer">
-    <time datetime={data.publishedAt.toISOString()}>{formatDate(data.publishedAt)} · {reading.count} 字 · 约 {reading.minutes} 分钟</time>
-    <span>{data.tags.join(' · ')}</span>
   </div>
+  {config.showCover && data.cover && <a class="post-card-cover" href={href}><img src={data.cover} alt="" loading="lazy" /></a>}
 </article>

@@ -1,5 +1,6 @@
-import { defineCollection, z } from 'astro:content';
+import { defineCollection } from 'astro:content';
 import { glob } from 'astro/loaders';
+import { z } from 'astro/zod';
 
 const common = z.object({
   title: z.string(),
@@ -12,7 +13,7 @@ const common = z.object({
   featured: z.boolean().default(false),
   language: z.enum(['zh-CN', 'en']).default('zh-CN'),
   cover: z.string().optional(),
-  canonicalUrl: z.string().url().optional(),
+  canonicalUrl: z.url().optional(),
   agent: z.object({
     summary: z.string().max(500).optional(),
     sourceQuality: z.enum(['personal', 'curated', 'verified']).default('personal'),
@@ -39,12 +40,12 @@ const posts = defineCollection({
       venue: z.string(),
       publicationDate: z.coerce.date(),
       doi: z.string().optional(),
-      paperUrl: z.string().url().optional(),
+      paperUrl: z.url().optional(),
     }),
     common.extend({
       type: z.literal('technical-report'),
-      repository: z.string().url().optional(),
-      demoUrl: z.string().url().optional(),
+      repository: z.url().optional(),
+      demoUrl: z.url().optional(),
       projectStatus: z.enum(['ongoing', 'released', 'archived']).default('ongoing'),
       highlights: z.array(z.string()).max(3).default([]),
     }),

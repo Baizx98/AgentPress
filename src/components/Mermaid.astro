@@ -1,0 +1,19 @@
+---
+interface Props {
+  chart: string;
+  label?: string;
+}
+
+const { chart, label = 'Mermaid diagram' } = Astro.props;
+---
+
+<pre class="mermaid-diagram" aria-label={label} data-mermaid>{chart}</pre>
+
+<script>
+  import mermaid from 'mermaid';
+
+  mermaid.initialize({ startOnLoad: false, theme: 'base' });
+  const render = () => mermaid.run({ nodes: document.querySelectorAll('[data-mermaid]') });
+  render();
+  document.addEventListener('astro:after-swap', render);
+</script>

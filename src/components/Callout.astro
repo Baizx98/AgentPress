@@ -1,0 +1,14 @@
+---
+interface Props {
+  kind?: 'note' | 'tip' | 'warning' | 'important';
+  title?: string;
+}
+
+const { kind = 'note', title } = Astro.props;
+const labels = { note: 'Note', tip: 'Tip', warning: 'Warning', important: 'Important' };
+---
+
+<aside class:list={['mdx-callout', `mdx-callout--${kind}`]}>
+  <strong>{title ?? labels[kind]}</strong>
+  <div><slot /></div>
+</aside>

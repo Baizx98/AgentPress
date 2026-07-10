@@ -1,104 +1,72 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
-import PostCard from '../components/PostCard.astro';
-import { publishedPosts } from '../lib/content';
+import { publishedPosts, formatDate } from '../lib/content';
+import { contentTypes } from '../config/content';
 
 const posts = await publishedPosts();
-const typeSections = [
-  ['paper', 'Paper', '论文与论文解读'],
-  ['technical-report', 'Report', '技术报告与开源观察'],
-  ['blog', 'Blog', '每日简报与一般博客'],
-  ['note', 'Note', '尚未成形的想法与短记'],
-] as const;
-const years = [...new Set(posts.map((post) => post.data.publishedAt.getFullYear()))].sort((a, b) => b - a);
+const types = Object.entries(contentTypes);
 const tags = [...new Set(posts.flatMap((post) => post.data.tags))].sort((a, b) => a.localeCompare(b));
+const years = [...new Set(posts.map((post) => post.data.publishedAt.getFullYear()))].sort((a, b) => b - a);
+const countType = (type: string) => posts.filter((post) => post.data.type === type).length;
+const countTag = (tag: string) => posts.filter((post) => post.data.tags.includes(tag)).length;
 ---
-
-<BaseLayout title="归档" description="按时间、类型或标签浏览白卓新的公开内容。">
-  <div class="content-shell">
-    <section class="page-intro">
-      <p class="eyebrow">ARCHIVE</p>
-      <h1>归档</h1>
-      <p class="lede">同一组内容，提供时间、类型和标签三种阅读路径。</p>
-    </section>
-
-    <div class="archive-switcher" role="tablist" aria-label="归档视图">
-      <button type="button" role="tab" aria-selected="true" data-archive-mode="timeline">Timeline</button>
-      <button type="button" role="tab" aria-selected="false" data-archive-mode="type">Type</button>
-      <button type="button" role="tab" aria-selected="false" data-archive-mode="tag">Tag</button>
-    </div>
-
-    <section data-archive-panel="timeline" class="archive-panel">
-      <div class="timeline">
-        {years.map((year) => (
-          <section class="timeline-section">
-            <p class="eyebrow">{year}</p>
-            <div class="post-grid">{posts.filter((post) => post.data.publishedAt.getFullYear() === year).map((post) => <PostCard post={post} />)}</div>
-          </section>
-        ))}
+<BaseLayout title="归档" description="按类型、标签和时间浏览公开内容。">
+  <section class="page-header"><h1>归档</h1><p>按类型、标签和时间浏览所有公开内容。</p></section>
+  <section class="archive-filters" data-archive-filter-root hidden aria-label="归档筛选">
+    <fieldset><legend>类型</legend><div class="filter-chips">
+      <button type="button" data-filter-kind="type" data-filter-value="" aria-pressed="true">全部 <span>{posts.length}</span></button>
+      {types.map(([type, config]) => <button type="button" data-filter-kind="type" data-filter-value={type} aria-pressed="false">{config.label} <span>{countType(type)}</span></button>)}
+    </div></fieldset>
+    <fieldset><legend>标签</legend><div class="filter-chips">
+      <button type="button" data-filter-kind="tag" data-filter-value="" aria-pressed="true">全部 <span>{posts.length}</span></button>
+      {tags.map((tag) => <button type="button" data-filter-kind="tag" data-filter-value={tag} aria-pressed="false">{tag} <span>{countTag(tag)}</span></button>)}
+    </div></fieldset>
+    <p class="filter-result">显示 <strong data-filter-count>{posts.length}</strong> 篇内容</p>
+  </section>
+  <div class="archive-timeline" id="archive-results">
+    {years.map((year) => <section data-archive-year>
+      <div class="timeline-year">{String(year).slice(2)}</div>
+      <h2>{year}</h2>
+      <div class="timeline-list">
+        {posts.filter((post) => post.data.publishedAt.getFullYear() === year).map((post) => <a href={`/posts/${post.id}/`} data-archive-entry data-type={post.data.type} data-tags={post.data.tags.join('|')}>
+          <time>{formatDate(post.data.publishedAt)}</time><span><strong>{post.data.title}</strong><small>{post.data.description}</small></span>
+        </a>)}
       </div>
-    </section>
-
-    <section data-archive-panel="type" class="archive-panel" hidden>
-      <div class="filter-row" aria-label="文章类型筛选">
-        <button type="button" class="is-active" data-type-filter="all">All</button>
-        {typeSections.map(([type, label]) => <button type="button" data-type-filter={type}>{label}</button>)}
-      </div>
-      <div class="post-grid archive-filter-grid">
-        {posts.map((post) => <PostCard post={post} />)}
-      </div>
-    </section>
-
-    <section data-archive-panel="tag" class="archive-panel" hidden>
-      <div class="tag-filter-header"><p>选择一个或多个标签</p><button type="button" data-tag-reset>重置</button></div>
-      <div class="tag-filter-list" aria-label="标签筛选">
-        {tags.map((tag) => <button type="button" data-tag-filter={tag}>{tag}</button>)}
-      </div>
-      <div class="post-grid archive-filter-grid">
-        {posts.map((post) => <PostCard post={post} />)}
-      </div>
-    </section>
+    </section>)}
   </div>
 </BaseLayout>
 
 <script>
-  const modeButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-archive-mode]')];
-  const panels = [...document.querySelectorAll<HTMLElement>('[data-archive-panel]')];
-  const typeButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-type-filter]')];
-  const typeCards = [...document.querySelectorAll<HTMLElement>('[data-archive-panel="type"] [data-content-type]')];
-  const tagCards = [...document.querySelectorAll<HTMLElement>('[data-archive-panel="tag"] [data-tags]')];
-  const tagButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-tag-filter]')];
-  const tagReset = document.querySelector<HTMLButtonElement>('[data-tag-reset]');
-  const selectedTags = new Set<string>();
-
-  modeButtons.forEach((button) => button.addEventListener('click', () => {
-    const mode = button.dataset.archiveMode;
-    modeButtons.forEach((item) => item.setAttribute('aria-selected', String(item === button)));
-    panels.forEach((panel) => { panel.hidden = panel.dataset.archivePanel !== mode; });
+  const root = document.querySelector<HTMLElement>('[data-archive-filter-root]');
+  const buttons = [...document.querySelectorAll<HTMLButtonElement>('[data-filter-kind]')];
+  const entries = [...document.querySelectorAll<HTMLElement>('[data-archive-entry]')];
+  const years = [...document.querySelectorAll<HTMLElement>('[data-archive-year]')];
+  const count = document.querySelector<HTMLElement>('[data-filter-count]');
+  const state = { type: '', tag: '' };
+  const apply = () => {
+    let visible = 0;
+    entries.forEach((entry) => {
+      const matchesType = !state.type || entry.dataset.type === state.type;
+      const matchesTag = !state.tag || entry.dataset.tags?.split('|').includes(state.tag);
+      entry.hidden = !(matchesType && matchesTag);
+      if (!entry.hidden) visible++;
+    });
+    years.forEach((year) => { year.hidden = !year.querySelector('[data-archive-entry]:not([hidden])'); });
+    buttons.forEach((button) => button.setAttribute('aria-pressed', String(state[button.dataset.filterKind as 'type' | 'tag'] === (button.dataset.filterValue ?? ''))));
+    if (count) count.textContent = String(visible);
+  };
+  buttons.forEach((button) => button.addEventListener('click', () => {
+    const kind = button.dataset.filterKind as 'type' | 'tag';
+    state[kind] = button.dataset.filterValue ?? '';
+    const url = new URL(location.href);
+    state.type ? url.searchParams.set('type', state.type) : url.searchParams.delete('type');
+    state.tag ? url.searchParams.set('tag', state.tag) : url.searchParams.delete('tag');
+    history.pushState({}, '', url);
+    apply();
   }));
-
-  typeButtons.forEach((button) => button.addEventListener('click', () => {
-    const type = button.dataset.typeFilter;
-    typeButtons.forEach((item) => item.classList.toggle('is-active', item === button));
-    typeCards.forEach((card) => { card.hidden = type !== 'all' && card.dataset.contentType !== type; });
-  }));
-
-  const applyTagFilter = () => tagCards.forEach((card) => {
-    const tags = card.dataset.tags?.split('|') ?? [];
-    card.hidden = selectedTags.size > 0 && !tags.some((tag) => selectedTags.has(tag));
-  });
-
-  tagButtons.forEach((button) => button.addEventListener('click', () => {
-    const tag = button.dataset.tagFilter;
-    if (!tag) return;
-    selectedTags.has(tag) ? selectedTags.delete(tag) : selectedTags.add(tag);
-    button.classList.toggle('is-active', selectedTags.has(tag));
-    applyTagFilter();
-  }));
-
-  tagReset?.addEventListener('click', () => {
-    selectedTags.clear();
-    tagButtons.forEach((button) => button.classList.remove('is-active'));
-    applyTagFilter();
-  });
+  const params = new URLSearchParams(location.search);
+  state.type = params.get('type') ?? '';
+  state.tag = params.get('tag') ?? '';
+  apply();
+  if (root) root.hidden = false;
 </script>

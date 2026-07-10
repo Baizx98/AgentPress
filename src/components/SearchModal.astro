@@ -1,0 +1,38 @@
+<div class="search-overlay" data-search-overlay hidden></div>
+<section class="search-modal" data-search-modal hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="搜索">
+  <div class="search-input-row"><span>⌕</span><input data-search-input placeholder="搜索标题、摘要和标签…" /><button type="button" data-search-close aria-label="关闭">×</button></div>
+  <div data-search-results class="search-results"></div>
+</section>
+
+<script>
+  const modal = document.querySelector<HTMLElement>('[data-search-modal]');
+  const overlay = document.querySelector<HTMLElement>('[data-search-overlay]');
+  const input = document.querySelector<HTMLInputElement>('[data-search-input]');
+  const results = document.querySelector<HTMLElement>('[data-search-results]');
+  let index: Array<{ title: string; description: string; tags: string[]; htmlUrl: string }> = [];
+
+  const close = () => {
+    if (!modal || !overlay) return;
+    modal.hidden = true; overlay.hidden = true; modal.setAttribute('aria-hidden', 'true');
+  };
+  const open = async () => {
+    if (!modal || !overlay || !input) return;
+    modal.hidden = false; overlay.hidden = false; modal.setAttribute('aria-hidden', 'false'); input.focus();
+    if (index.length === 0) index = (await fetch('/api/content/index.json').then((response) => response.json())).items;
+  };
+  document.addEventListener('click', (event) => {
+    const target = event.target as HTMLElement;
+    if (target.closest('[data-search-open]')) open();
+    if (target.closest('[data-search-close]') || target === overlay) close();
+  });
+  document.addEventListener('keydown', (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); open(); }
+    if (event.key === 'Escape') close();
+  });
+  input?.addEventListener('input', () => {
+    if (!results) return;
+    const query = input.value.trim().toLowerCase();
+    const matches = index.filter((item) => [item.title, item.description, ...item.tags].join(' ').toLowerCase().includes(query)).slice(0, 8);
+    results.innerHTML = query ? matches.map((item) => `<a href="${item.htmlUrl}"><strong>${item.title}</strong><span>${item.description}</span></a>`).join('') || '<p>没有找到匹配内容。</p>' : '';
+  });
+</script>

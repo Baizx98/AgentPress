@@ -16,8 +16,9 @@ const typeLabel = data.type === 'paper' ? 'Paper' : data.type === 'technical-rep
 ---
 
 <BaseLayout title={data.title} description={data.description}>
-  <div class="content-shell article-layout">
+  <div class="article-layout">
     <article class="article-content prose">
+      {data.cover && <img class="article-cover" src={data.cover} alt={data.title} loading="eager" />}
       <header class="article-header">
         <p class="eyebrow">{typeLabel}</p>
         <h1>{data.title}</h1>
@@ -30,9 +31,8 @@ const typeLabel = data.type === 'paper' ? 'Paper' : data.type === 'technical-rep
       <section class="comment-card"><p class="eyebrow">COMMENTS</p><p>Giscus 评论将在 GitHub Discussions 配置完成后启用。</p></section>
     </article>
     {headings.length > 0 && <aside class="article-side" aria-label="文章大纲">
-      <p class="eyebrow">ON THIS PAGE</p>
-      <nav class="toc">
-        {headings.map((heading) => <a class:list={{ 'toc-sub': heading.depth > 2 }} href={`#${heading.slug}`}>{heading.text}</a>)}
+      <nav class="toc toc-rail">
+        {headings.filter((heading) => heading.depth >= 2 && heading.depth <= 4).map((heading) => <a class:list={{ 'toc-sub': heading.depth > 2 }} href={`#${heading.slug}`} aria-label={heading.text}><span></span><em>{heading.text}</em></a>)}
       </nav>
     </aside>}
   </div>

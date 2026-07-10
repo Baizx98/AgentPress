@@ -1,55 +1,28 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 import PostCard from '../components/PostCard.astro';
+import Icon from '../components/Icon.astro';
 import { publishedPosts } from '../lib/content';
-import { profile } from '../data/profile';
+import { siteConfig } from '../config/site';
 
 const posts = await publishedPosts();
-const featured = posts.filter((post) => post.data.featured);
-const latest = posts.filter((post) => !post.data.featured).slice(0, 6);
+const latest = posts.slice(0, 5);
 ---
-
-<BaseLayout title="今夜白的知识宫殿" description="白卓新的 Agent-native 个人知识中心">
-  <div class="content-shell home-layout">
-    <aside class="identity-rail">
-      <img class="profile-avatar" src={profile.avatar} alt="白卓新的头像占位图" />
-      <p class="identity-role">{profile.role}</p>
-      <div class="topic-list"><span>LLM Inference</span><span>KV Cache</span><span>Agent Memory</span><span>Systems</span></div>
-      <div class="profile-links">
-        {profile.links.map((link) => <a href={link.href} aria-label={link.label} title={link.label}><span aria-hidden="true">{link.label === 'GitHub' ? '◖◗' : link.label === 'Email' ? '✉' : link.label === 'Academic Home' ? '⌂' : 'iD'}</span></a>)}
+<BaseLayout>
+  <section class="profile-card">
+    <img src={siteConfig.author.avatar} alt="头像占位图" />
+    <div>
+      <h1>{siteConfig.shortName}</h1>
+      <p class="profile-title">{siteConfig.author.title}</p>
+      <p class="profile-description">{siteConfig.author.description}</p>
+      <div class="profile-topics">{siteConfig.author.topics.map((topic) => <span>{topic}</span>)}</div>
+      <div class="profile-social">
+        {siteConfig.author.social.map((item) => <a href={item.href} title={item.label} aria-label={item.label}><Icon name={item.icon as 'github' | 'mail' | 'home' | 'orcid'} /><span>{item.label}</span></a>)}
       </div>
-    </aside>
-    <div class="home-feed">
-      <section class="hero">
-        <img class="hero-art" src="/uploads/knowledge-palace-hero.png" alt="蓝色透明结构与数据路径构成的抽象知识空间" />
-        <p class="eyebrow">TONIGHT'S THOUGHT</p>
-        <p class="daily-quote"><span data-typewriter data-text="“先把问题写清楚，答案才有可能出现。”"></span><span class="typing-caret" aria-hidden="true"></span></p>
-      </section>
-      {featured.length > 0 && <section>
-        <div class="section-head"><h2>Featured</h2></div>
-        <div class="post-list">{featured.map((post) => <PostCard post={post} />)}</div>
-      </section>}
-      <section>
-        <div class="section-head"><h2>Latest</h2><a href="/archive/">全部归档 →</a></div>
-        <div class="post-list">{latest.map((post) => <PostCard post={post} />)}</div>
-      </section>
     </div>
-    <aside class="context-rail">
-      <p class="eyebrow">EXPLORE</p>
-      <a href="/feed.xml">RSS Feed</a>
-      <a href="/llms.txt">For Agents</a>
-    </aside>
-  </div>
+  </section>
+  <section class="home-section">
+    <div class="section-heading"><h2>最近文章</h2><a href="/posts/">查看全部 →</a></div>
+    <div class="entry-list">{latest.map((post) => <PostCard post={post} />)}</div>
+  </section>
 </BaseLayout>
-
-<script>
-  const target = document.querySelector<HTMLElement>('[data-typewriter]');
-  const text = target?.dataset.text ?? '';
-  let index = 0;
-  const type = () => {
-    if (!target || index >= text.length) return;
-    target.textContent += text[index++];
-    setTimeout(type, 78);
-  };
-  type();
-</script>
