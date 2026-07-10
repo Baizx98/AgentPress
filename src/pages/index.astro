@@ -6,23 +6,46 @@ import { publishedPosts } from '../lib/content';
 import { siteConfig } from '../config/site';
 
 const posts = await publishedPosts();
-const latest = posts.slice(0, 5);
+const featured = posts.filter((post) => post.data.featured);
+const latest = posts.filter((post) => !post.data.featured).slice(0, 6);
 ---
-<BaseLayout>
-  <section class="profile-card">
-    <img src={siteConfig.author.avatar} alt="头像占位图" />
-    <div class="profile-copy">
-      <h1>{siteConfig.shortName}</h1>
-      <p class="profile-title">{siteConfig.author.title}</p>
-      <p class="profile-description">{siteConfig.author.description}</p>
+<BaseLayout classicHome title={siteConfig.name} description={siteConfig.description}>
+  <div class="home-layout">
+    <aside class="identity-rail">
+      <img class="profile-avatar" src={siteConfig.author.avatar} alt="头像占位图" />
+      <p class="identity-role">{siteConfig.author.title}</p>
+      <div class="topic-list">{siteConfig.author.topics.map((topic) => <span>{topic}</span>)}</div>
+      <div class="profile-links">
+        {siteConfig.author.social.map((item) => <a href={item.href} aria-label={item.label} title={item.label}><Icon name={item.icon as 'github' | 'mail' | 'home' | 'orcid'} /></a>)}
+      </div>
+    </aside>
+    <div class="home-feed">
+      <section class="hero">
+        <img class="hero-art" src="/uploads/knowledge-palace-hero.png" alt="蓝色透明结构与数据路径构成的抽象知识空间" />
+        <p class="eyebrow">TONIGHT'S THOUGHT</p>
+        <p class="daily-quote"><span data-typewriter data-text="“先把问题写清楚，答案才有可能出现。”"></span><span class="typing-caret" aria-hidden="true"></span></p>
+      </section>
+      {featured.length > 0 && <section>
+        <div class="section-head"><h2>Featured</h2></div>
+        <div class="post-list">{featured.map((post) => <PostCard post={post} variant="home" />)}</div>
+      </section>}
+      <section>
+        <div class="section-head"><h2>Latest</h2><a href="/archive/">全部归档 →</a></div>
+        <div class="post-list">{latest.map((post) => <PostCard post={post} variant="home" />)}</div>
+      </section>
     </div>
-    <div class="profile-topics">{siteConfig.author.topics.map((topic) => <span>{topic}</span>)}</div>
-    <div class="profile-social">
-      {siteConfig.author.social.map((item) => <a href={item.href} title={item.label} aria-label={item.label}><Icon name={item.icon as 'github' | 'mail' | 'home' | 'orcid'} /><span>{item.label}</span></a>)}
-    </div>
-  </section>
-  <section class="home-section">
-    <div class="section-heading"><h2>最近文章</h2><a href="/posts/">查看全部 →</a></div>
-    <div class="entry-list entry-list--home">{latest.map((post) => <PostCard post={post} variant="home" />)}</div>
-  </section>
+    <aside class="context-rail"><p class="eyebrow">EXPLORE</p><a href="/feed.xml">RSS Feed</a><a href="/llms.txt">For Agents</a></aside>
+  </div>
 </BaseLayout>
+
+<script>
+  const target = document.querySelector<HTMLElement>('[data-typewriter]');
+  const text = target?.dataset.text ?? '';
+  let index = 0;
+  const type = () => {
+    if (!target || index >= text.length) return;
+    target.textContent += text[index++];
+    setTimeout(type, 78);
+  };
+  type();
+</script>

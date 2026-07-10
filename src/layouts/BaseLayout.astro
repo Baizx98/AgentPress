@@ -6,8 +6,8 @@ import FloatingBar from '../components/FloatingBar.astro';
 import SearchModal from '../components/SearchModal.astro';
 import { siteConfig } from '../config/site';
 
-interface Props { title?: string; description?: string; }
-const { title = siteConfig.name, description = siteConfig.description } = Astro.props;
+interface Props { title?: string; description?: string; classicHome?: boolean; }
+const { title = siteConfig.name, description = siteConfig.description, classicHome = false } = Astro.props;
 const pageTitle = title === siteConfig.name ? title : `${title} · ${siteConfig.name}`;
 const themeInit = `(() => { const r = document.documentElement; r.dataset.theme = localStorage.getItem('theme') || 'default'; if (localStorage.getItem('color-mode') === 'dark' || (!localStorage.getItem('color-mode') && matchMedia('(prefers-color-scheme: dark)').matches)) r.classList.add('dark'); })();`;
 ---
@@ -23,10 +23,10 @@ const themeInit = `(() => { const r = document.documentElement; r.dataset.theme 
     <script is:inline set:html={themeInit}></script>
   </head>
   <body>
-    <main class="site-main" style={`--layout-content-width: ${siteConfig.contentWidth}`}>
-      <Header />
+    <main class:list={['site-main', { 'site-main--classic-home': classicHome }]} style={`--layout-content-width: ${siteConfig.contentWidth}`}>
+      <Header classic={classicHome} />
       <slot />
-      <Footer />
+      <Footer classic={classicHome} />
     </main>
     <FloatingBar />
     <SearchModal />
