@@ -4,21 +4,31 @@ import PostCard from '../components/PostCard.astro';
 import { publishedPosts } from '../lib/content';
 
 const posts = await publishedPosts();
-const groups = posts.reduce((result, post) => {
-  const year = post.data.publishedAt.getFullYear();
-  result.set(year, [...(result.get(year) ?? []), post]);
-  return result;
-}, new Map<number, typeof posts>());
+const sections = [
+  ['paper', 'Paper', '论文与论文解读'],
+  ['technical-report', 'Report', '技术报告与开源观察'],
+  ['blog', 'Blog', '每日简报与一般博客'],
+  ['note', '随笔', '尚未成形的想法与短记'],
+] as const;
 ---
 
-<BaseLayout title="归档" description="按时间浏览白卓新的论文介绍、技术报告与随笔。">
-  <section class="page-intro"><p class="eyebrow">ARCHIVE</p><h1>归档</h1><p class="lede">论文介绍、技术报告与随笔，按时间沉淀。</p></section>
-  <div class="archive-list">
-    {[...groups.entries()].sort(([a], [b]) => b - a).map(([year, entries]) => (
-      <section>
-        <div class="section-head"><h2>{year}</h2></div>
-        <div class="post-grid">{entries.map((post) => <PostCard post={post} />)}</div>
-      </section>
-    ))}
+<BaseLayout title="归档" description="按内容类型与时间浏览白卓新的公开内容。">
+  <div class="content-shell">
+    <section class="page-intro"><p class="eyebrow">ARCHIVE</p><h1>归档</h1><p class="lede">按内容类型梳理长期积累，也保留时间留下的线索。</p></section>
+    <div class="archive-layout">
+      <nav class="archive-nav" aria-label="归档类型">
+        {sections.map(([, label]) => <a href={`#${label.toLowerCase()}`}>{label}</a>)}
+      </nav>
+      <div class="timeline">
+        {sections.map(([type, label, description]) => {
+          const entries = posts.filter((post) => post.data.type === type);
+          return entries.length > 0 && <section id={label.toLowerCase()} class="timeline-section">
+            <p class="eyebrow">{description}</p>
+            <h2>{label}</h2>
+            <div class="post-grid">{entries.map((post) => <PostCard post={post} />)}</div>
+          </section>;
+        })}
+      </div>
+    </div>
   </div>
 </BaseLayout>
