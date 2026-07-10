@@ -3,15 +3,18 @@ import { formatDate, getReadingStats } from '../lib/content';
 import type { CollectionEntry } from 'astro:content';
 import { contentTypes } from '../config/content';
 
-interface Props { post: CollectionEntry<'posts'> }
-const { post } = Astro.props;
+interface Props {
+  post: CollectionEntry<'posts'>;
+  variant?: 'default' | 'home';
+}
+const { post, variant = 'default' } = Astro.props;
 const { data } = post;
 const href = `/posts/${post.id}/`;
 const reading = getReadingStats(post.body ?? '');
 const config = contentTypes[data.type];
 ---
 
-<article class:list={['post-card', `post-card--${data.type}`, `post-card--${config.cardStyle}`]} data-content-type={data.type} data-tags={data.tags.join('|')}>
+<article class:list={['post-card', `post-card--${data.type}`, `post-card--${config.cardStyle}`, `post-card--${variant}`]} data-content-type={data.type} data-tags={data.tags.join('|')}>
   <div class="eyebrow">{data.type === 'paper' ? 'Paper' : data.type === 'technical-report' ? 'Report' : data.type === 'blog' ? data.series === 'daily-brief' ? 'Daily Brief' : 'Blog' : 'Note'}</div>
   <div class="post-card-main">
     <h2><a href={href}>{data.title}</a></h2>
@@ -26,8 +29,8 @@ const config = contentTypes[data.type];
     )}
     <div class="card-footer">
       <time datetime={data.publishedAt.toISOString()}>{formatDate(data.publishedAt)} · {reading.count} 字 · 约 {reading.minutes} 分钟</time>
-      <span>{data.tags.join(' · ')}</span>
+      <span class="card-tags">{data.tags.map((tag, index) => <>{index > 0 && ' · '}<a href={`/archive/?tag=${encodeURIComponent(tag)}`}>{tag}</a></>)}</span>
     </div>
   </div>
-  {config.showCover && data.cover && <a class="post-card-cover" href={href}><img src={data.cover} alt="" loading="lazy" /></a>}
+  {variant !== 'home' && config.showCover && data.cover && <a class="post-card-cover" href={href}><img src={data.cover} alt="" loading="lazy" /></a>}
 </article>
