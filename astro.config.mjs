@@ -7,7 +7,7 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 
 export default defineConfig({
-  site: process.env.PUBLIC_SITE_URL ?? 'https://agentpress.example.com',
+  site: process.env.PUBLIC_SITE_URL ?? 'https://note.baizx.cool',
   integrations: [expressiveCode(), mdx(), sitemap()],
   markdown: unified({
     remarkPlugins: [remarkMath],

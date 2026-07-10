@@ -9,7 +9,7 @@
   const overlay = document.querySelector<HTMLElement>('[data-search-overlay]');
   const input = document.querySelector<HTMLInputElement>('[data-search-input]');
   const results = document.querySelector<HTMLElement>('[data-search-results]');
-  let index: Array<{ title: string; description: string; tags: string[]; htmlUrl: string }> = [];
+  let index: Array<{ title: string; description: string; tags: string[]; htmlPath: string }> = [];
 
   const close = () => {
     if (!modal || !overlay) return;
@@ -18,7 +18,15 @@
   const open = async () => {
     if (!modal || !overlay || !input) return;
     modal.hidden = false; overlay.hidden = false; modal.setAttribute('aria-hidden', 'false'); input.focus();
-    if (index.length === 0) index = (await fetch('/api/content/index.json').then((response) => response.json())).items;
+    if (index.length === 0) {
+      try {
+        const response = await fetch('/api/content/index.json');
+        if (!response.ok) throw new Error('Search index unavailable');
+        index = (await response.json()).items;
+      } catch {
+        if (results) results.textContent = '搜索索引暂时不可用，请稍后重试。';
+      }
+    }
   };
   document.addEventListener('click', (event) => {
     const target = event.target as HTMLElement;
@@ -33,6 +41,18 @@
     if (!results) return;
     const query = input.value.trim().toLowerCase();
     const matches = index.filter((item) => [item.title, item.description, ...item.tags].join(' ').toLowerCase().includes(query)).slice(0, 8);
-    results.innerHTML = query ? matches.map((item) => `<a href="${item.htmlUrl}"><strong>${item.title}</strong><span>${item.description}</span></a>`).join('') || '<p>没有找到匹配内容。</p>' : '';
+    results.replaceChildren();
+    if (!query) return;
+    if (matches.length === 0) { results.textContent = '没有找到匹配内容。'; return; }
+    matches.forEach((item) => {
+      const link = document.createElement('a');
+      const title = document.createElement('strong');
+      const description = document.createElement('span');
+      link.href = item.htmlPath;
+      title.textContent = item.title;
+      description.textContent = item.description;
+      link.append(title, description);
+      results.append(link);
+    });
   });
 </script>

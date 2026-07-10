@@ -10,7 +10,7 @@ export const siteConfig = {
     topics: ['LLM Inference', 'KV Cache', 'Agent Memory', 'Systems'],
     social: [
       { label: 'GitHub', href: 'https://github.com/baizx', icon: 'github' },
-      { label: 'Email', href: 'https://home.baizx.cool/', icon: 'mail' },
+      { label: 'Email', href: 'mailto:baizx98@foxmail.com', icon: 'mail' },
       { label: 'Academic Home', href: 'https://home.baizx.cool/', icon: 'home' },
       { label: 'ORCID', href: 'https://orcid.org/0009-0005-5135-5594', icon: 'orcid' },
     ],

@@ -1,62 +1,79 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 import { publishedPosts, formatDate } from '../lib/content';
-import { contentTypes } from '../config/content';
+import { archivePageSize } from '../config/content';
 
 const posts = await publishedPosts();
-const types = Object.entries(contentTypes);
-const years = [...new Set(posts.map((post) => post.data.publishedAt.getFullYear()))].sort((a, b) => b - a);
-const countType = (type: string) => posts.filter((post) => post.data.type === type).length;
+const initialPosts = posts.slice(0, archivePageSize);
+const years = [...new Set(initialPosts.map((post) => post.data.publishedAt.getFullYear()))].sort((a, b) => b - a);
+const totalPages = Math.ceil(posts.length / archivePageSize);
 ---
-<BaseLayout title="归档" description="按类型和时间浏览公开内容。">
-  <section class="page-header"><h1>归档</h1><p>按类型和时间浏览所有公开内容。</p></section>
-  <section class="archive-filters" data-archive-filter-root hidden aria-label="归档筛选">
-    <div class="filter-group" role="group" aria-label="类型"><span class="filter-group-label">类型</span><div class="filter-chips">
-      <button type="button" data-filter-kind="type" data-filter-value="" aria-pressed="true">全部 <span>{posts.length}</span></button>
-      {types.map(([type, config]) => <button type="button" data-filter-kind="type" data-filter-value={type} aria-pressed="false">{config.label} <span>{countType(type)}</span></button>)}
-    </div></div>
-    <p class="filter-result">显示 <strong data-filter-count>{posts.length}</strong> 篇内容</p>
-  </section>
-  <div class="archive-timeline" id="archive-results">
-    {years.map((year) => <section data-archive-year>
+
+<BaseLayout title="归档" description="按时间浏览全部公开内容。">
+  <section class="page-header"><h1>归档</h1><p>按时间浏览全部公开内容。</p></section>
+  <div class="archive-timeline" id="archive-results" data-page-size={archivePageSize}>
+    {years.map((year) => <section data-archive-year={year}>
       <div class="timeline-year">{String(year).slice(2)}</div>
       <h2>{year}</h2>
       <div class="timeline-list">
-        {posts.filter((post) => post.data.publishedAt.getFullYear() === year).map((post) => <a href={`/posts/${post.id}/`} data-archive-entry data-type={post.data.type}>
+        {initialPosts.filter((post) => post.data.publishedAt.getFullYear() === year).map((post) => <a href={`/posts/${post.id}/`}>
           <time>{formatDate(post.data.publishedAt)}</time><span><strong>{post.data.title}</strong><small>{post.data.description}</small></span>
         </a>)}
       </div>
     </section>)}
   </div>
+  {totalPages > 1 && <div class="archive-load-more"><button type="button" data-load-more data-next-page="2">加载更早的文章</button></div>}
 </BaseLayout>
 
 <script>
-  const root = document.querySelector<HTMLElement>('[data-archive-filter-root]');
-  const buttons = [...document.querySelectorAll<HTMLButtonElement>('[data-filter-kind]')];
-  const entries = [...document.querySelectorAll<HTMLElement>('[data-archive-entry]')];
-  const years = [...document.querySelectorAll<HTMLElement>('[data-archive-year]')];
-  const count = document.querySelector<HTMLElement>('[data-filter-count]');
-  const state = { type: '' };
-  const apply = () => {
-    let visible = 0;
-    entries.forEach((entry) => {
-      const matchesType = !state.type || entry.dataset.type === state.type;
-      entry.hidden = !matchesType;
-      if (!entry.hidden) visible++;
-    });
-    years.forEach((year) => { year.hidden = !year.querySelector('[data-archive-entry]:not([hidden])'); });
-    buttons.forEach((button) => button.setAttribute('aria-pressed', String(state.type === (button.dataset.filterValue ?? ''))));
-    if (count) count.textContent = String(visible);
+  interface ArchiveItem { slug: string; title: string; description: string; publishedAt: string; }
+
+  const timeline = document.querySelector<HTMLElement>('#archive-results');
+  const loadMore = document.querySelector<HTMLButtonElement>('[data-load-more]');
+  const pageSize = Number(timeline?.dataset.pageSize ?? 30);
+  const formatter = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium' });
+
+  const appendItem = (item: ArchiveItem) => {
+    if (!timeline) return;
+    const date = new Date(item.publishedAt);
+    const year = date.getFullYear();
+    let section = timeline.querySelector<HTMLElement>(`[data-archive-year="${year}"]`);
+    let list: HTMLElement;
+    if (!section) {
+      section = document.createElement('section');
+      section.dataset.archiveYear = String(year);
+      const badge = document.createElement('div');
+      const heading = document.createElement('h2');
+      list = document.createElement('div');
+      badge.className = 'timeline-year'; badge.textContent = String(year).slice(2);
+      heading.textContent = String(year); list.className = 'timeline-list';
+      section.append(badge, heading, list); timeline.append(section);
+    } else {
+      list = section.querySelector<HTMLElement>('.timeline-list')!;
+    }
+    const link = document.createElement('a');
+    const time = document.createElement('time');
+    const copy = document.createElement('span');
+    const title = document.createElement('strong');
+    const description = document.createElement('small');
+    link.href = `/posts/${item.slug}/`;
+    time.dateTime = item.publishedAt; time.textContent = formatter.format(date);
+    title.textContent = item.title; description.textContent = item.description;
+    copy.append(title, description); link.append(time, copy); list.append(link);
   };
-  buttons.forEach((button) => button.addEventListener('click', () => {
-    state.type = button.dataset.filterValue ?? '';
-    const url = new URL(location.href);
-    state.type ? url.searchParams.set('type', state.type) : url.searchParams.delete('type');
-    history.pushState({}, '', url);
-    apply();
-  }));
-  const params = new URLSearchParams(location.search);
-  state.type = params.get('type') ?? '';
-  apply();
-  if (root) root.hidden = false;
+
+  loadMore?.addEventListener('click', async () => {
+    const page = Number(loadMore.dataset.nextPage);
+    loadMore.disabled = true; loadMore.textContent = '正在加载…';
+    try {
+      const response = await fetch(`/api/content/pages/${page}.json`);
+      if (!response.ok) throw new Error('Archive page unavailable');
+      const payload: { items: ArchiveItem[] } = await response.json();
+      payload.items.forEach(appendItem);
+      if (payload.items.length < pageSize) loadMore.remove();
+      else { loadMore.dataset.nextPage = String(page + 1); loadMore.disabled = false; loadMore.textContent = '加载更早的文章'; }
+    } catch {
+      loadMore.disabled = false; loadMore.textContent = '加载失败，点击重试';
+    }
+  });
 </script>

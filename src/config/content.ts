@@ -1,5 +1,7 @@
 export type CardStyle = 'article' | 'showcase' | 'compact';
 
+export const archivePageSize = 30;
+
 export const contentTypes = {
   paper: { label: 'Paper', cardStyle: 'article' as CardStyle, listLayout: 'stack' as const, showCover: true },
   'technical-report': { label: 'Report', cardStyle: 'article' as CardStyle, listLayout: 'stack' as const, showCover: true },

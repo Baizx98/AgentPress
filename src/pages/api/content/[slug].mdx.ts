@@ -1,4 +1,6 @@
 import { getCollection } from 'astro:content';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 
 export async function getStaticPaths() {
   const posts = await getCollection('posts', ({ data }) => !data.draft);
@@ -6,7 +8,9 @@ export async function getStaticPaths() {
 }
 
 export async function GET({ props }: { props: { post: Awaited<ReturnType<typeof getCollection<'posts'>>>[number] } }) {
-  return new Response(props.post.body, {
+  if (!props.post.filePath) throw new Error(`Missing source path for ${props.post.id}`);
+  const source = await readFile(resolve(props.post.filePath), 'utf8');
+  return new Response(source, {
     headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
   });
 }

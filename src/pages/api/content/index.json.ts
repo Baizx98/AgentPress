@@ -11,6 +11,7 @@ export async function GET({ site }: { site: URL }) {
     agent: post.data.agent,
     publishedAt: post.data.publishedAt.toISOString(),
     updatedAt: post.data.updatedAt?.toISOString(),
+    htmlPath: `/posts/${post.id}/`,
     htmlUrl: new URL(`/posts/${post.id}/`, site).toString(),
     mdxUrl: new URL(`/api/content/${post.id}.mdx`, site).toString(),
   }));

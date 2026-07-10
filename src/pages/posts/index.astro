@@ -1,0 +1,78 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import PostCard from '../../components/PostCard.astro';
+import { publishedPosts } from '../../lib/content';
+import { contentTypes } from '../../config/content';
+
+const posts = await publishedPosts();
+const types = Object.entries(contentTypes);
+const tags = [...new Set(posts.flatMap((post) => post.data.tags))].sort((a, b) => a.localeCompare(b));
+const countType = (type: string) => posts.filter((post) => post.data.type === type).length;
+const countTag = (tag: string) => posts.filter((post) => post.data.tags.includes(tag)).length;
+---
+
+<BaseLayout title="文章" description="按类别与标签浏览全部文章。">
+  <section class="page-header"><h1>文章</h1><p>按类别与标签浏览全部公开内容。</p></section>
+  <section class="post-browser-filters" aria-label="文章筛选">
+    <div class="post-filter-group" role="group" aria-label="类别"><span>类别</span><div>
+      <button type="button" data-post-type="" aria-pressed="true">全部 <small>{posts.length}</small></button>
+      {types.map(([type, config]) => <button type="button" data-post-type={type} aria-pressed="false">{config.label} <small>{countType(type)}</small></button>)}
+    </div></div>
+    <div class="post-filter-group" role="group" aria-label="标签"><span>标签</span><div>
+      {tags.map((tag) => <button type="button" data-post-tag={tag} aria-pressed="false">{tag} <small>{countTag(tag)}</small></button>)}
+    </div></div>
+    <div class="post-filter-summary"><span>显示 <strong data-post-count>{posts.length}</strong> 篇内容</span><button type="button" data-post-reset hidden>重置筛选</button></div>
+  </section>
+  <div class="post-browser-list entry-list" data-post-list>
+    {posts.map((post) => <PostCard post={post} />)}
+  </div>
+</BaseLayout>
+
+<script>
+  const typeButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-post-type]')];
+  const tagButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-post-tag]')];
+  const entries = [...document.querySelectorAll<HTMLElement>('[data-post-list] .post-card')];
+  const count = document.querySelector<HTMLElement>('[data-post-count]');
+  const reset = document.querySelector<HTMLButtonElement>('[data-post-reset]');
+  const state = { type: '', tags: new Set<string>() };
+
+  const apply = () => {
+    let visible = 0;
+    entries.forEach((entry) => {
+      const matchesType = !state.type || entry.dataset.contentType === state.type;
+      const entryTags = entry.dataset.tags?.split('|') ?? [];
+      const matchesTags = [...state.tags].every((tag) => entryTags.includes(tag));
+      entry.hidden = !(matchesType && matchesTags);
+      if (!entry.hidden) visible++;
+    });
+    typeButtons.forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.postType === state.type)));
+    tagButtons.forEach((button) => button.setAttribute('aria-pressed', String(state.tags.has(button.dataset.postTag ?? ''))));
+    if (count) count.textContent = String(visible);
+    if (reset) reset.hidden = !state.type && state.tags.size === 0;
+  };
+
+  const syncUrl = () => {
+    const url = new URL(location.href);
+    state.type ? url.searchParams.set('type', state.type) : url.searchParams.delete('type');
+    url.searchParams.delete('tag');
+    [...state.tags].forEach((tag) => url.searchParams.append('tag', tag));
+    history.pushState({}, '', url);
+  };
+
+  const loadFromUrl = () => {
+    const params = new URLSearchParams(location.search);
+    state.type = params.get('type') ?? '';
+    state.tags = new Set(params.getAll('tag'));
+    apply();
+  };
+
+  typeButtons.forEach((button) => button.addEventListener('click', () => { state.type = button.dataset.postType ?? ''; syncUrl(); apply(); }));
+  tagButtons.forEach((button) => button.addEventListener('click', () => {
+    const tag = button.dataset.postTag ?? '';
+    state.tags.has(tag) ? state.tags.delete(tag) : state.tags.add(tag);
+    syncUrl(); apply();
+  }));
+  reset?.addEventListener('click', () => { state.type = ''; state.tags.clear(); syncUrl(); apply(); });
+  addEventListener('popstate', loadFromUrl);
+  loadFromUrl();
+</script>
