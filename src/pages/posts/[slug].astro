@@ -1,26 +1,39 @@
 ---
 import { getCollection, render } from 'astro:content';
 import BaseLayout from '../../layouts/BaseLayout.astro';
-import { formatDate } from '../../lib/content';
+import { formatDate, getReadingStats } from '../../lib/content';
 
 export async function getStaticPaths() {
   const posts = await getCollection('posts', ({ data }) => !data.draft);
   return posts.map((post) => ({ params: { slug: post.id }, props: { post } }));
 }
+
 const { post } = Astro.props;
-const { Content } = await render(post);
+const { Content, headings } = await render(post);
 const { data } = post;
+const reading = getReadingStats(post.body ?? '');
+const typeLabel = data.type === 'paper' ? 'Paper' : data.type === 'technical-report' ? 'Report' : data.type === 'blog' ? data.series === 'daily-brief' ? 'Daily Brief' : 'Blog' : 'Note';
 ---
 
 <BaseLayout title={data.title} description={data.description}>
-  <article class="page-intro prose">
-    <p class="eyebrow">{data.type === 'paper' ? 'Paper' : data.type === 'technical-report' ? 'Report' : data.type === 'blog' ? data.series === 'daily-brief' ? 'Daily Brief' : 'Blog' : 'Note'}</p>
-    <h1>{data.title}</h1>
-    <p class="lede">{data.description}</p>
-    <p>{formatDate(data.publishedAt)} · {data.tags.join(' · ')}</p>
-    {data.type === 'paper' && <p><strong>{data.paperTitle}</strong><br />{data.authors.join(', ')}<br />{data.affiliations.join(' · ')} · {data.venue}</p>}
-    {data.type === 'technical-report' && data.repository && <p><a href={data.repository}>查看开源仓库 ↗</a></p>}
-    <Content />
-    <section class="comment-card"><p class="eyebrow">COMMENTS</p><p>Giscus 评论将在 GitHub Discussions 配置完成后启用。</p></section>
-  </article>
+  <div class="content-shell article-layout">
+    <article class="article-content prose">
+      <header class="article-header">
+        <p class="eyebrow">{typeLabel}</p>
+        <h1>{data.title}</h1>
+        <p class="lede">{data.description}</p>
+        <p class="article-meta">{formatDate(data.publishedAt)} · {reading.count} 字 · 约 {reading.minutes} 分钟 · {data.tags.join(' · ')}</p>
+      </header>
+      {data.type === 'paper' && <p><strong>{data.paperTitle}</strong><br />{data.authors.join(', ')}<br />{data.affiliations.join(' · ')} · {data.venue}</p>}
+      {data.type === 'technical-report' && data.repository && <p><a href={data.repository}>查看开源仓库 ↗</a></p>}
+      <Content />
+      <section class="comment-card"><p class="eyebrow">COMMENTS</p><p>Giscus 评论将在 GitHub Discussions 配置完成后启用。</p></section>
+    </article>
+    {headings.length > 0 && <aside class="article-side" aria-label="文章大纲">
+      <p class="eyebrow">ON THIS PAGE</p>
+      <nav class="toc">
+        {headings.map((heading) => <a class:list={{ 'toc-sub': heading.depth > 2 }} href={`#${heading.slug}`}>{heading.text}</a>)}
+      </nav>
+    </aside>}
+  </div>
 </BaseLayout>

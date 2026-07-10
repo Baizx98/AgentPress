@@ -2,6 +2,7 @@
 import BaseLayout from '../layouts/BaseLayout.astro';
 import PostCard from '../components/PostCard.astro';
 import { publishedPosts } from '../lib/content';
+import { profile } from '../data/profile';
 
 const posts = await publishedPosts();
 const featured = posts.filter((post) => post.data.featured);
@@ -11,9 +12,11 @@ const latest = posts.filter((post) => !post.data.featured).slice(0, 6);
 <BaseLayout title="今夜白的知识宫殿" description="白卓新的 Agent-native 个人知识中心">
   <div class="content-shell home-layout">
     <aside class="identity-rail">
-      <div class="avatar-placeholder" aria-hidden="true"></div>
-      <p class="identity-name">白卓新</p>
-      <p class="identity-role">LLM Inference Systems<br />Chongqing University</p>
+      <img class="profile-avatar" src={profile.avatar} alt="白卓新的头像占位图" />
+      <p class="identity-name">{profile.name}</p>
+      <p class="identity-role">{profile.role}<br />{profile.affiliation}</p>
+      <p class="identity-bio">{profile.bio}</p>
+      <div class="profile-links">{profile.links.map((link) => <a href={link.href}>{link.label} ↗</a>)}</div>
       <a href="/about/">了解更多 →</a>
     </aside>
     <div class="home-feed">
@@ -38,6 +41,15 @@ const latest = posts.filter((post) => !post.data.featured).slice(0, 6);
       <a href="/feed.xml">RSS Feed</a>
       <a href="/llms.txt">For Agents</a>
       <a href="/preview/">Article Preview</a>
+      <p class="eyebrow">SERIES</p>
+      <a href="/archive/#paper">Paper</a>
+      <a href="/archive/#report">Report</a>
+      <a href="/archive/#note">Note</a>
+      <a href="/archive/#blog">Blog</a>
+      <p class="eyebrow">TAGS</p>
+      <a href="/tags/LLM%20Inference.json">LLM Inference</a>
+      <a href="/tags/KV%20Cache.json">KV Cache</a>
+      <a href="/tags/Agent%20Memory.json">Agent Memory</a>
     </aside>
   </div>
 </BaseLayout>

@@ -4,31 +4,87 @@ import PostCard from '../components/PostCard.astro';
 import { publishedPosts } from '../lib/content';
 
 const posts = await publishedPosts();
-const sections = [
+const typeSections = [
   ['paper', 'Paper', '论文与论文解读'],
   ['technical-report', 'Report', '技术报告与开源观察'],
   ['blog', 'Blog', '每日简报与一般博客'],
   ['note', 'Note', '尚未成形的想法与短记'],
 ] as const;
+const years = [...new Set(posts.map((post) => post.data.publishedAt.getFullYear()))].sort((a, b) => b - a);
+const tags = [...new Set(posts.flatMap((post) => post.data.tags))].sort((a, b) => a.localeCompare(b));
 ---
 
-<BaseLayout title="归档" description="按内容类型与时间浏览白卓新的公开内容。">
+<BaseLayout title="归档" description="按时间、类型或标签浏览白卓新的公开内容。">
   <div class="content-shell">
-    <section class="page-intro"><p class="eyebrow">ARCHIVE</p><h1>归档</h1><p class="lede">按内容类型梳理长期积累，也保留时间留下的线索。</p></section>
-    <div class="archive-layout">
-      <nav class="archive-nav" aria-label="归档类型">
-        {sections.map(([, label]) => <a href={`#${label.toLowerCase()}`}>{label}</a>)}
-      </nav>
-      <div class="timeline">
-        {sections.map(([type, label, description]) => {
-          const entries = posts.filter((post) => post.data.type === type);
-          return entries.length > 0 && <section id={label.toLowerCase()} class="timeline-section">
-            <p class="eyebrow">{description}</p>
-            <h2>{label}</h2>
-            <div class="post-grid">{entries.map((post) => <PostCard post={post} />)}</div>
-          </section>;
-        })}
-      </div>
+    <section class="page-intro">
+      <p class="eyebrow">ARCHIVE</p>
+      <h1>归档</h1>
+      <p class="lede">同一组内容，提供时间、类型和标签三种阅读路径。</p>
+    </section>
+
+    <div class="archive-switcher" role="tablist" aria-label="归档视图">
+      <button type="button" role="tab" aria-selected="true" data-archive-mode="timeline">Timeline</button>
+      <button type="button" role="tab" aria-selected="false" data-archive-mode="type">Type</button>
+      <button type="button" role="tab" aria-selected="false" data-archive-mode="tag">Tag</button>
     </div>
+
+    <section data-archive-panel="timeline" class="archive-panel">
+      <div class="timeline">
+        {years.map((year) => (
+          <section class="timeline-section">
+            <p class="eyebrow">{year}</p>
+            <div class="post-grid">{posts.filter((post) => post.data.publishedAt.getFullYear() === year).map((post) => <PostCard post={post} />)}</div>
+          </section>
+        ))}
+      </div>
+    </section>
+
+    <section data-archive-panel="type" class="archive-panel" hidden>
+      <div class="filter-row" aria-label="文章类型筛选">
+        <button type="button" class="is-active" data-type-filter="all">All</button>
+        {typeSections.map(([type, label]) => <button type="button" data-type-filter={type}>{label}</button>)}
+      </div>
+      <div class="post-grid archive-filter-grid">
+        {posts.map((post) => <PostCard post={post} />)}
+      </div>
+    </section>
+
+    <section data-archive-panel="tag" class="archive-panel" hidden>
+      <label class="tag-select">按标签筛选
+        <select data-tag-filter>
+          <option value="all">全部标签</option>
+          {tags.map((tag) => <option value={tag}>{tag}</option>)}
+        </select>
+      </label>
+      <div class="post-grid archive-filter-grid">
+        {posts.map((post) => <PostCard post={post} />)}
+      </div>
+    </section>
   </div>
 </BaseLayout>
+
+<script>
+  const modeButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-archive-mode]')];
+  const panels = [...document.querySelectorAll<HTMLElement>('[data-archive-panel]')];
+  const typeButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-type-filter]')];
+  const typeCards = [...document.querySelectorAll<HTMLElement>('[data-archive-panel="type"] [data-content-type]')];
+  const tagCards = [...document.querySelectorAll<HTMLElement>('[data-archive-panel="tag"] [data-tags]')];
+  const tagFilter = document.querySelector<HTMLSelectElement>('[data-tag-filter]');
+
+  modeButtons.forEach((button) => button.addEventListener('click', () => {
+    const mode = button.dataset.archiveMode;
+    modeButtons.forEach((item) => item.setAttribute('aria-selected', String(item === button)));
+    panels.forEach((panel) => { panel.hidden = panel.dataset.archivePanel !== mode; });
+  }));
+
+  typeButtons.forEach((button) => button.addEventListener('click', () => {
+    const type = button.dataset.typeFilter;
+    typeButtons.forEach((item) => item.classList.toggle('is-active', item === button));
+    typeCards.forEach((card) => { card.hidden = type !== 'all' && card.dataset.contentType !== type; });
+  }));
+
+  tagFilter?.addEventListener('change', () => {
+    const tag = tagFilter.value;
+    tagCards.forEach((card) => { card.hidden = tag !== 'all' && !card.dataset.tags?.split('|').includes(tag); });
+  });
+</script>

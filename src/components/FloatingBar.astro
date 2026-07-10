@@ -1,0 +1,24 @@
+<nav class="floating-bar" aria-label="快捷工具">
+  <a href="/" title="首页">Home</a>
+  <a href="/archive/" title="归档">Archive</a>
+  <a href="/feed.xml" title="RSS">RSS</a>
+  <button type="button" data-theme-toggle title="切换深浅色">Theme</button>
+  <button type="button" data-back-top title="回到顶部">Top ↑</button>
+</nav>
+
+<script>
+  const root = document.documentElement;
+  const themeButton = document.querySelector<HTMLButtonElement>('[data-theme-toggle]');
+  const topButton = document.querySelector<HTMLButtonElement>('[data-back-top]');
+  const savedTheme = localStorage.getItem('theme');
+
+  if (savedTheme) root.dataset.theme = savedTheme;
+
+  themeButton?.addEventListener('click', () => {
+    const theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    root.dataset.theme = theme;
+    localStorage.setItem('theme', theme);
+  });
+
+  topButton?.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+</script>

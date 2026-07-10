@@ -1,5 +1,6 @@
 ---
 import '../styles/global.css';
+import FloatingBar from '../components/FloatingBar.astro';
 
 interface Props {
   title?: string;
@@ -40,6 +41,7 @@ const pageTitle = title === '今夜白的知识宫殿' ? title : `${title} · �
       <p>© {new Date().getFullYear()} 白卓新 · 个人知识中心</p>
       <p class="filing-placeholder">网站备案号 · 公安备案号</p>
     </footer>
+    <FloatingBar />
     </div>
   </body>
 </html>
