@@ -36,7 +36,7 @@ const typeLabel = data.type === 'paper' ? 'Paper' : data.type === 'technical-rep
     </article>
     {headings.length > 0 && <aside class="article-side" aria-label="文章大纲">
       <nav class="toc toc-rail">
-        {headings.filter((heading) => heading.depth >= 2 && heading.depth <= 4).map((heading) => <a class:list={{ 'toc-sub': heading.depth > 2 }} href={`#${heading.slug}`} aria-label={heading.text}><span></span><em>{heading.text}</em></a>)}
+        {headings.filter((heading) => heading.depth >= 2 && heading.depth <= 4).map((heading, index) => <a class:list={{ 'toc-sub': heading.depth > 2 }} href={`#${heading.slug}`} aria-label={heading.text} style={`--toc-delay: ${index * 80}ms`}><span></span><em>{heading.text}</em></a>)}
       </nav>
     </aside>}
   </div>

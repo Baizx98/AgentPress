@@ -1,6 +1,6 @@
 export const themes = [
   { id: 'default', name: 'Default' },
-  { id: 'claude', name: 'Claude' },
+  { id: 'cloud', name: 'Cloud' },
   { id: 'bumblebee', name: 'Bumblebee' },
   { id: 'emerald', name: 'Emerald' },
   { id: 'nord', name: 'Nord' },
