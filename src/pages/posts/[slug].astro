@@ -14,10 +14,12 @@ const { Content, headings } = await render(post);
 const { data } = post;
 const reading = getReadingStats(post.body ?? '');
 const typeLabel = data.type === 'paper' ? 'Paper' : data.type === 'technical-report' ? 'Report' : data.type === 'blog' ? data.series === 'daily-brief' ? 'Daily Brief' : 'Blog' : 'Note';
+const tocHeadings = headings.filter((heading) => heading.depth >= 2 && heading.depth <= 4);
+const compactToc = tocHeadings.length > 0 && tocHeadings.length <= 3;
 ---
 
 <BaseLayout title={data.title} description={data.description}>
-  <div class="article-layout">
+  <div class:list={['article-layout', { 'article-layout--compact-toc': compactToc }]}>
     <article class="article-content prose">
       {data.cover && <img class="article-cover" src={data.cover} alt={data.title} loading="eager" />}
       <header class="article-header">
@@ -34,9 +36,9 @@ const typeLabel = data.type === 'paper' ? 'Paper' : data.type === 'technical-rep
       <Content />
       <Giscus />
     </article>
-    {headings.length > 0 && <aside class="article-side" aria-label="文章大纲">
-      <nav class="toc toc-rail">
-        {headings.filter((heading) => heading.depth >= 2 && heading.depth <= 4).map((heading, index) => <a class:list={{ 'toc-sub': heading.depth > 2 }} href={`#${heading.slug}`} aria-label={heading.text} style={`--toc-delay: ${index * 80}ms`}><span></span><em>{heading.text}</em></a>)}
+    {tocHeadings.length > 0 && <aside class:list={['article-side', { 'article-side--compact': compactToc }]} aria-label="文章大纲">
+      <nav class:list={['toc', 'toc-rail', { 'toc-rail--compact': compactToc }]}>
+        {tocHeadings.map((heading, index) => <a class:list={{ 'toc-sub': heading.depth > 2 }} href={`#${heading.slug}`} aria-label={heading.text} style={`--toc-delay: ${index * 80}ms`}><span></span><em>{heading.text}</em></a>)}
       </nav>
     </aside>}
   </div>

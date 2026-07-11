@@ -115,6 +115,7 @@ button, input { font: inherit; }
 .archive-load-more button:disabled { cursor: wait; opacity: .65; }
 
 .article-layout { display: grid; grid-template-columns: minmax(0, 1fr) 42px; gap: 28px; margin: 34px 0 64px; }
+.article-layout--compact-toc { grid-template-columns: minmax(0, 1fr) 156px; }
 .article-cover { display: block; width: 100%; max-height: 60vh; margin-bottom: 32px; border-radius: 14px; object-fit: cover; }
 .article-header { margin-bottom: 40px; padding-bottom: 28px; border-bottom: 1px solid var(--color-border); }
 .article-header .eyebrow { margin: 0 0 9px; color: var(--color-primary); font-size: .7rem; font-weight: 750; letter-spacing: .11em; }
@@ -153,6 +154,14 @@ button, input { font: inherit; }
 .toc-rail a:hover em, .toc-rail a:focus-visible em { transform: translate(0, -50%); opacity: 1; }
 .toc-rail .toc-sub span { width: 8px; opacity: .72; }
 @keyframes toc-wave { 0%, 100% { transform: translateX(0); } 50% { transform: translateX(-3px) scaleX(1.18); } }
+.toc-rail--compact { width: 156px; padding: 5px; border: 1px solid var(--color-border); border-radius: 9px; background: color-mix(in srgb, var(--color-popover), transparent 2%); box-shadow: var(--surface-shadow); }
+.toc-rail--compact a { display: flex; width: 100%; height: auto; min-height: 28px; align-items: center; justify-content: flex-start; gap: 7px; padding: 5px 6px; border-radius: 5px; }
+.toc-rail--compact a span { width: 10px; flex: 0 0 auto; background: var(--color-primary); opacity: .68; }
+.toc-rail--compact a em { position: static; display: block; width: auto; max-width: 118px; padding: 0; transform: none; border: 0; border-radius: 0; background: transparent; box-shadow: none; color: var(--color-muted-foreground); font-size: .72rem; opacity: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toc-rail--compact a:hover { background: var(--color-accent); }
+.toc-rail--compact a:hover span, .toc-rail--compact a:focus-visible span { width: 14px; background: var(--color-primary); opacity: 1; }
+.toc-rail--compact a:hover em, .toc-rail--compact a:focus-visible em { transform: none; color: var(--color-accent-foreground); }
+.toc-rail--compact:hover a span { animation: none; }
 .giscus-container { margin-top: 42px; }
 
 .site-footer { margin: 64px 0 88px; color: var(--color-muted-foreground); font-size: .82rem; }
