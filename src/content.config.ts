@@ -7,7 +7,7 @@ const common = z.object({
   description: z.string().max(200),
   publishedAt: z.coerce.date(),
   updatedAt: z.coerce.date().optional(),
-  author: z.string().default('白卓新'),
+  author: z.string().default('今夜白'),
   tags: z.array(z.string()).default([]),
   draft: z.boolean().default(true),
   featured: z.boolean().default(false),
