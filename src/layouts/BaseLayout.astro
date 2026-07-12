@@ -20,7 +20,7 @@ const themeInit = `(() => { const r = document.documentElement; r.dataset.theme 
     <meta name="description" content={description} />
     <meta name="theme-color" content="#0b66d4" />
     <link rel="canonical" href={new URL(Astro.url.pathname, Astro.site)} />
-    <link rel="sitemap" href="/sitemap.xml" />
+    <link rel="sitemap" href="/sitemap-index.xml" />
     <title>{pageTitle}</title>
     <script is:inline set:html={themeInit}></script>
     <Analytics />
