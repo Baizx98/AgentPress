@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="agentpress-gradient" x1="8" y1="6" x2="56" y2="60" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1683FF"/>
+      <stop offset="1" stop-color="#3158D4"/>
+    </linearGradient>
+    <filter id="agentpress-shadow" x="7" y="6" width="50" height="53" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="3" stdDeviation="2.5" flood-color="#102A62" flood-opacity=".24"/>
+    </filter>
+  </defs>
+  <rect width="64" height="64" rx="17" fill="url(#agentpress-gradient)"/>
+  <g filter="url(#agentpress-shadow)" stroke="#FFF" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18.5 45 31.8 17.5 45.5 45" stroke-width="5.2"/>
+    <path d="M24.5 33.3h14.7" stroke-width="4.8"/>
+    <path d="M43.8 17.8v10.5" stroke-width="3.3" opacity=".58"/>
+  </g>
+</svg>

@@ -3,7 +3,7 @@ import { siteConfig } from '../config/site';
 ---
 <header class="site-header">
   <div class="nav-shell">
-    <a class="brand" href="/"><span class="brand-mark">{siteConfig.shortName.slice(0, 1)}</span><span>{siteConfig.name}</span></a>
+    <a class="brand" href="/"><img class="brand-mark" src="/favicon.svg" alt="" width="30" height="30" /><span>{siteConfig.name}</span></a>
     <nav aria-label="主导航">
       {siteConfig.navigation.map((item) => <a href={item.href}>{item.label}</a>)}
     </nav>

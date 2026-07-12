@@ -5,6 +5,7 @@ import Footer from '../components/Footer.astro';
 import FloatingBar from '../components/FloatingBar.astro';
 import SearchModal from '../components/SearchModal.astro';
 import Analytics from '@vercel/analytics/astro';
+import SpeedInsights from '@vercel/speed-insights/astro';
 import { siteConfig } from '../config/site';
 
 interface Props { title?: string; description?: string; }
@@ -19,11 +20,14 @@ const themeInit = `(() => { const r = document.documentElement; r.dataset.theme 
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content={description} />
     <meta name="theme-color" content="#0b66d4" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="manifest" href="/site.webmanifest" />
     <link rel="canonical" href={new URL(Astro.url.pathname, Astro.site)} />
     <link rel="sitemap" href="/sitemap-index.xml" />
     <title>{pageTitle}</title>
     <script is:inline set:html={themeInit}></script>
     <Analytics />
+    <SpeedInsights />
   </head>
   <body>
     <main class="site-main" style={`--layout-content-width: ${siteConfig.contentWidth}`}>
