@@ -1,0 +1,18 @@
+{
+  "protocolVersion": 1,
+  "repository": {
+    "defaultBranch": "main"
+  },
+  "content": {
+    "directory": "src/content/posts",
+    "extensions": [".md", ".mdx"],
+    "defaultExtension": ".mdx"
+  },
+  "validation": {
+    "command": "pnpm build"
+  },
+  "media": {
+    "manifest": "src/data/assets.json",
+    "publicBaseUrl": "https://media.baizx.cool"
+  }
+}
