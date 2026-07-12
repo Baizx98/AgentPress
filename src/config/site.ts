@@ -6,7 +6,7 @@ export const siteConfig = {
   author: {
     title: '面向大模型推理系统优化的研究者',
     description: '关注 LLM 推理加速、KV Cache、Agent Memory，以及长上下文和高吞吐推理系统。',
-    avatar: '/uploads/avatar-placeholder.svg',
+    avatar: 'https://www.gravatar.com/avatar/47e7a8c0a89c355f876c740c4810565e?s=256&d=identicon',
     topics: ['LLM Inference', 'KV Cache', 'Agent Memory', 'Systems'],
     social: [
       { label: 'GitHub', href: 'https://github.com/baizx', icon: 'github' },

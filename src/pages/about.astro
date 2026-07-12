@@ -1,16 +1,39 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
+import { siteConfig } from '../config/site';
 ---
 
-<BaseLayout title="关于" description="关于 AgentPress">
+<BaseLayout title="关于今夜白" description="关于今夜白与 AgentPress">
   <section class="page-intro prose">
-    <p class="eyebrow">ABOUT</p>
-    <h1>今夜白的知识宫殿</h1>
-    <p class="lede">一个面向技术研究、长期写作与 Agent 协作的个人知识中心。</p>
-    <p>这里记录 LLM 推理、KV Cache、Agent Memory、长上下文与高吞吐系统等方向的研究与实践，也保留值得回看的日常思考。</p>
-    <h2>这个站点</h2>
-    <p>AgentPress 是一个以 Git、MDX 和可审计发布流程为基础的个人知识中心。这里的内容可被人阅读，也为 Agent 提供公开、稳定的只读内容接口。</p>
+    <div class="about-intro">
+      <img class="about-avatar" src={siteConfig.author.avatar} alt="今夜白的头像" width="88" height="88" />
+      <div>
+        <p class="eyebrow">ABOUT</p>
+        <h1>关于今夜白</h1>
+        <p class="lede">一个面向技术研究、长期写作与 Agent 协作的个人知识中心。</p>
+      </div>
+    </div>
+
+    <h2>关于我</h2>
+    <p>我是今夜白，一名计算机科学与技术专业的博士在读生。目前主要关注大模型推理加速与存储优化，尤其关心 KV Cache、长上下文、推理系统中的资源调度，以及让模型以更低成本、更高吞吐完成复杂任务的方法。</p>
+    <p>这里会记录研究过程中的论文、实验观察、工程判断和暂未成形的想法。相比只保存结论，我更希望保留问题如何被拆开、证据如何被组织，以及下一步可以从哪里继续。</p>
+
+    <h2>关于这个博客</h2>
+    <p>今夜白的知识宫殿是一个面向 Agent 时代构建的个人博客。它基于 Git 与 MDX 管理内容：人可以把它当作一个简洁、可读的技术博客；Agent 则可以通过稳定的 HTML、内容索引、原始 MDX 与 frontmatter、RSS 和 <code>llms.txt</code> 等入口读取公开知识。</p>
+    <p>站点目前承载 Paper、技术报告、Blog 和 Note 四类内容。你会在这里看到论文介绍与研究线索、可复用的技术报告、日常简报，以及个人的随笔和思考。</p>
+
+    <h3>为 Agent 而设计</h3>
+    <p>这个博客会逐步接入云端 Agent：它们每天定时追踪前沿论文和技术资料，形成可审核的阅读摘要与博客草稿；我也可以随时发布技术报告、研究记录和自己的内容。所有自动化内容都会保留来源、元数据和可追溯的发布记录，并按照既定审核流程进入网站。</p>
+
+    <h3>已经提供的能力</h3>
+    <ul>
+      <li>按内容类型呈现文章、时间线归档、标签浏览、站内搜索与 RSS。</li>
+      <li>公开 HTML、JSON 内容索引、原始 MDX（含 frontmatter）以及面向 Agent 的 <code>llms.txt</code> / <code>llms-full.txt</code>。</li>
+      <li>文章封面、阅读时间、目录导航、主题配色、Giscus 评论与分享链接。</li>
+      <li>基于 Git 的内容版本管理与 Vercel 静态部署；后续将接入对象存储、CMS 与受控 MCP 写入能力。</li>
+    </ul>
+
     <h2>链接</h2>
-    <p><a href="https://home.baizx.cool/">个人主页</a> · <a href="https://note.baizx.cool/">现有博客</a></p>
+    <p><a href="https://home.baizx.cool/">个人主页</a></p>
   </section>
 </BaseLayout>

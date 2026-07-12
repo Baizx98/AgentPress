@@ -97,6 +97,9 @@ button, input { font: inherit; }
 .page-intro { max-width: 46rem; margin: 42px 0 68px; }
 .page-intro .eyebrow { margin: 0 0 10px; color: var(--color-primary); font-size: .7rem; font-weight: 750; letter-spacing: .11em; }
 .page-intro h1 { margin: 0; font-size: clamp(2.25rem, 5vw, 3.45rem); letter-spacing: -.055em; line-height: 1.12; }
+.about-intro { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 20px; align-items: start; margin-bottom: 30px; }
+.about-avatar { width: 88px; height: 88px; border: 1px solid var(--color-border); border-radius: 22px; background: var(--color-muted); box-shadow: var(--surface-shadow); object-fit: cover; }
+.about-intro .lede { margin-bottom: 0; }
 .archive-timeline { position: relative; margin: 0 0 60px; padding-left: 48px; }
 .archive-timeline::before { position: absolute; top: 8px; bottom: 8px; left: 16px; width: 1px; background: var(--color-border); content: ""; }
 .archive-timeline section { position: relative; margin-bottom: 36px; }
@@ -241,6 +244,8 @@ button, input { font: inherit; }
   .brand span:last-child { display: none; }
   .nav-shell nav a { padding: 6px 7px; font-size: .78rem; }
   .post-card-cover { width: 140px; flex-basis: 140px; }
+  .about-intro { grid-template-columns: 68px minmax(0, 1fr); gap: 15px; }
+  .about-avatar { width: 68px; height: 68px; border-radius: 18px; }
   .card-footer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 10px; align-items: center; }
   .card-footer time { grid-column: 1 / -1; }
   .card-tags { display: flex; min-width: 0; grid-column: 1; grid-row: 2; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; white-space: nowrap; }
