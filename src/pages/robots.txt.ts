@@ -3,7 +3,7 @@ import type { APIRoute } from 'astro';
 export const prerender = true;
 
 export const GET: APIRoute = ({ site }) => {
-  const origin = site ?? new URL('https://blog.bzx.cool');
+  const origin = site ?? new URL('https://blog.baizx.cool');
   const sitemap = new URL('sitemap-index.xml', origin).href;
   const body = `User-agent: *\nAllow: /\n\nSitemap: ${sitemap}\n`;
 
