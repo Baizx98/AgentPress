@@ -35,7 +35,7 @@ button, input { font: inherit; }
 .nav-shell nav a:hover { background: var(--color-accent); color: var(--color-accent-foreground); }
 .home-layout { width: 100%; padding-top: 2.5rem; }
 .hero { padding-bottom: 3rem; }
-.hero-art { display: block; width: 100%; aspect-ratio: 16 / 8; margin-bottom: 1.4rem; border: 1px solid var(--color-border); border-radius: 14px; background: var(--color-card); object-fit: cover; }
+.hero-art { display: block; width: 100%; aspect-ratio: 7 / 2; margin-bottom: 1.4rem; border: 1px solid var(--color-border); border-radius: 14px; background: var(--color-card); object-fit: cover; }
 .daily-quote { min-height: 2.1rem; margin: 0; color: var(--color-foreground); font-size: clamp(1.15rem, 2.3vw, 1.65rem); font-weight: 600; letter-spacing: -.03em; }
 .typing-caret { display: inline-block; height: 1.15em; margin-left: .15rem; border-left: 2px solid var(--color-primary); vertical-align: -.15em; animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
