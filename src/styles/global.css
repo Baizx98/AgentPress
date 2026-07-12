@@ -62,6 +62,7 @@ button, input { font: inherit; }
 .card-links svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .card-footer { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; padding-top: 6px; color: var(--color-muted-foreground); font-size: .74rem; }
 .card-tags a { color: inherit; text-decoration: none; }
+.card-tags a + a::before { margin: 0 4px; color: var(--color-muted-foreground); content: "·"; }
 .card-tags a:hover { color: var(--color-primary); text-decoration: underline; }
 .post-card-cover { width: 210px; flex: 0 0 210px; margin: 12px 12px 12px 0; overflow: hidden; border-radius: 9px; background: var(--color-muted); }
 .post-card-cover img { width: 100%; height: 100%; object-fit: cover; transition: transform .32s ease; }
@@ -240,6 +241,12 @@ button, input { font: inherit; }
   .brand span:last-child { display: none; }
   .nav-shell nav a { padding: 6px 7px; font-size: .78rem; }
   .post-card-cover { width: 140px; flex-basis: 140px; }
+  .card-footer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 10px; align-items: center; }
+  .card-footer time { grid-column: 1 / -1; }
+  .card-tags { display: flex; min-width: 0; grid-column: 1; grid-row: 2; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; white-space: nowrap; }
+  .card-tags::-webkit-scrollbar { display: none; }
+  .card-tags a { flex: 0 0 auto; }
+  .card-links { min-width: 16px; grid-column: 2; grid-row: 2; order: initial; margin-left: 0; align-self: center; }
   .article-layout { grid-template-columns: 1fr; }
   .article-side { display: none; }
   .post-filter-group { grid-template-columns: 1fr; gap: 4px; }

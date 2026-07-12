@@ -28,7 +28,7 @@ const config = contentTypes[data.type];
         {data.type === 'technical-report' && data.demoUrl && <a href={data.demoUrl} aria-label="在线演示" title="在线演示"><Icon name="external" /></a>}
         {data.type === 'paper' && data.paperUrl && <a href={data.paperUrl} aria-label="论文链接" title="论文链接"><Icon name="external" /></a>}
       </span>}
-      <span class="card-tags">{data.tags.map((tag, index) => <>{index > 0 && ' · '}<a href={`/posts/?tag=${encodeURIComponent(tag)}`}>{tag}</a></>)}</span>
+      <span class="card-tags">{data.tags.map((tag) => <a href={`/posts/?tag=${encodeURIComponent(tag)}`}>{tag}</a>)}</span>
     </div>
   </div>
   {variant !== 'home' && config.showCover && data.cover && <a class="post-card-cover" href={href}><img src={data.cover} alt="" loading="lazy" /></a>}
