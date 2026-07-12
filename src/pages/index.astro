@@ -8,7 +8,7 @@ const posts = await publishedPosts();
 const featured = posts.filter((post) => post.data.featured);
 const latest = posts.filter((post) => !post.data.featured).slice(0, 6);
 ---
-<BaseLayout homeNavigation title={siteConfig.name} description={siteConfig.description}>
+<BaseLayout title={siteConfig.name} description={siteConfig.description}>
   <div class="home-layout">
     <div class="home-feed">
       <section class="hero">

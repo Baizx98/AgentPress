@@ -1,16 +1,11 @@
 ---
 import { siteConfig } from '../config/site';
-interface Props { onlyArchiveAndAbout?: boolean; }
-const { onlyArchiveAndAbout = false } = Astro.props;
-const navigation = onlyArchiveAndAbout
-  ? siteConfig.navigation.filter((item) => item.href === '/archive/' || item.href === '/about/')
-  : siteConfig.navigation;
 ---
 <header class="site-header">
   <div class="nav-shell">
     <a class="brand" href="/"><span class="brand-mark">{siteConfig.shortName.slice(0, 1)}</span><span>{siteConfig.name}</span></a>
     <nav aria-label="主导航">
-      {navigation.map((item) => <a href={item.href}>{item.label}</a>)}
+      {siteConfig.navigation.map((item) => <a href={item.href}>{item.label}</a>)}
     </nav>
   </div>
 </header>
