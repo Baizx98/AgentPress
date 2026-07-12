@@ -1,6 +1,9 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
+import Icon from '../components/Icon.astro';
 import { siteConfig } from '../config/site';
+
+const profileLinks = siteConfig.author.social.filter((item) => ['GitHub', 'Academic Home', 'Email'].includes(item.label));
 ---
 
 <BaseLayout title="关于今夜白" description="关于今夜白与 AgentPress">
@@ -34,6 +37,8 @@ import { siteConfig } from '../config/site';
     </ul>
 
     <h2>链接</h2>
-    <p><a href="https://home.baizx.cool/">个人主页</a></p>
+    <div class="about-links" aria-label="个人链接">
+      {profileLinks.map((link) => <a href={link.href} aria-label={link.label} title={link.label} target={link.href.startsWith('http') ? '_blank' : undefined} rel={link.href.startsWith('http') ? 'noopener noreferrer' : undefined} data-icon={link.icon}><Icon name={link.icon} /></a>)}
+    </div>
   </section>
 </BaseLayout>

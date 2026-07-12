@@ -100,6 +100,11 @@ button, input { font: inherit; }
 .about-intro { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 20px; align-items: start; margin-bottom: 30px; }
 .about-avatar { width: 88px; height: 88px; border: 1px solid var(--color-border); border-radius: 22px; background: var(--color-muted); box-shadow: var(--surface-shadow); object-fit: cover; }
 .about-intro .lede { margin-bottom: 0; }
+.about-links { display: flex; align-items: center; gap: 9px; margin-top: 14px; }
+.about-links a { display: grid; width: 39px; height: 39px; place-items: center; border: 1px solid var(--color-border); border-radius: 11px; background: var(--color-card); color: var(--color-muted-foreground); box-shadow: 0 2px 7px rgb(20 30 48 / 4%); text-decoration: none; transition: transform .18s ease, border-color .18s ease, background .18s ease, color .18s ease; }
+.about-links a:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--color-primary), transparent 65%); background: var(--color-accent); color: var(--color-accent-foreground); }
+.about-links svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.about-links a[data-icon="github"] svg { fill: currentColor; stroke: none; }
 .archive-timeline { position: relative; margin: 0 0 60px; padding-left: 48px; }
 .archive-timeline::before { position: absolute; top: 8px; bottom: 8px; left: 16px; width: 1px; background: var(--color-border); content: ""; }
 .archive-timeline section { position: relative; margin-bottom: 36px; }
