@@ -5,6 +5,13 @@ import { siteConfig } from '../config/site';
   <div class="footer-line"></div>
   <div class="footer-content">
     <p>© {new Date().getFullYear()} {siteConfig.shortName}</p>
-    <p class="filing-placeholder">网站备案号 · 公安备案号</p>
+    <div class="filing-links" aria-label="网站备案信息">
+      <a href={siteConfig.filings.publicSecurity.href} target="_blank" rel="noopener noreferrer">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3 19 6v5c0 4.5-2.8 8-7 10-4.2-2-7-5.5-7-10V6l7-3Z"/><path d="m8.8 12 2.1 2.1 4.3-4.3"/></svg>
+        <span>{siteConfig.filings.publicSecurity.label}</span>
+      </a>
+      <span class="filing-separator" aria-hidden="true"></span>
+      <a href={siteConfig.filings.icp.href} target="_blank" rel="noopener noreferrer">{siteConfig.filings.icp.label}</a>
+    </div>
   </div>
 </footer>

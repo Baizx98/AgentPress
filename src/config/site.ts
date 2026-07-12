@@ -31,5 +31,15 @@ export const siteConfig = {
       mapping: 'pathname',
     },
   },
+  filings: {
+    publicSecurity: {
+      label: '渝公网安备50010602503738',
+      href: 'https://beian.mps.gov.cn/#/query/webSearch?code=50010602503738',
+    },
+    icp: {
+      label: '晋ICP备2023022787号-1',
+      href: 'https://beian.miit.gov.cn/',
+    },
+  },
   analytics: { enabled: false },
 } as const;
