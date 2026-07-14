@@ -20,12 +20,10 @@ const common = z.object({
     reuseLevel: z.enum(['low', 'medium', 'high']).default('medium'),
     citeAs: z.string().optional(),
     related: z.array(z.string()).default([]),
-    assets: z.array(z.string()).default([]),
   }).default({
     sourceQuality: 'personal',
     reuseLevel: 'medium',
     related: [],
-    assets: [],
   }),
 });
 

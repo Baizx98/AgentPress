@@ -22,10 +22,10 @@ import Mermaid from '../../components/Mermaid.astro';
 
 <Mermaid chart={`flowchart LR\n  A[Source] --> B[Insight] --> C[Post]`} />
 
-<Figure src="/uploads/example.png" alt="示意图" caption="图片来源与说明。" />
+<Figure src="https://media.baizx.cool/images/.../example.webp" alt="示意图" caption="图片来源与说明。" />
 ```
 
-Mermaid 在浏览器端渲染，静态 HTML 中仍保留图表源码，便于阅读器与 Agent 获取。大型媒体先放入 `public/uploads/`；迁移腾讯云 COS 后仅需把同一资源路径映射到 CDN 域名。
+Mermaid 在浏览器端渲染，静态 HTML 中仍保留图表源码，便于阅读器与 Agent 获取。文章图片和附件必须先通过 AgentPress Control 上传到腾讯云 COS；`public/` 只放 Logo、头像和首页背景等站点固定资源。
 
 ## 写作与展示规则
 

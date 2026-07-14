@@ -41,5 +41,4 @@ export const siteConfig = {
       href: 'https://beian.miit.gov.cn/',
     },
   },
-  analytics: { enabled: false },
 } as const;

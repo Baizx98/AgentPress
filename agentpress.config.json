@@ -10,9 +10,5 @@
   },
   "validation": {
     "command": "pnpm build"
-  },
-  "media": {
-    "manifest": "src/data/assets.json",
-    "publicBaseUrl": "https://media.baizx.cool"
   }
 }
