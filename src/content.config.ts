@@ -14,6 +14,7 @@ const common = z.object({
   language: z.enum(['zh-CN', 'en']).default('zh-CN'),
   cover: z.string().optional(),
   canonicalUrl: z.url().optional(),
+  sourceKey: z.string().max(500).optional(),
   agent: z.object({
     summary: z.string().max(500).optional(),
     sourceQuality: z.enum(['personal', 'curated', 'verified']).default('personal'),
@@ -50,7 +51,7 @@ const posts = defineCollection({
     common.extend({ type: z.literal('note') }),
     common.extend({
       type: z.literal('blog'),
-      series: z.enum(['daily-brief', 'general']).default('general'),
+      series: z.enum(['daily-brief', 'general']).optional(),
     }),
   ]),
 });
