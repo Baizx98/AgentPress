@@ -1,0 +1,128 @@
+---
+title: 通过 ChatGPT 与 MCP 发布 AgentPress 博客
+description: 记录 ChatGPT 通过 OAuth 连接 AgentPress Control，并使用 MCP 创建、校验和提交博客文章的完整过程。
+publishedAt: 2026-07-20T12:25:09.853Z
+author: 今夜白
+tags:
+  - AgentPress
+  - MCP
+  - ChatGPT
+  - Astro
+draft: false
+featured: false
+language: zh-CN
+sourceKey: manual:chatgpt-mcp-publishing-test:2026-07-20
+agent:
+  summary: 记录 ChatGPT 通过 OAuth 授权访问 AgentPress Control，并借助 MCP 完成博客草稿创建、内容编辑、校验以及后续 PR 提交流程的实践。
+  sourceQuality: personal
+  reuseLevel: medium
+  related: []
+type: blog
+---
+
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid.astro';
+
+# 前言
+
+这篇文章用于验证一条面向智能体的博客内容生产链路：ChatGPT 通过 OAuth 获得对 AgentPress Control 的受控访问权限，再借助 MCP 工具读取项目规范、创建文章草稿、完善元数据与正文，并在提交前执行内容校验。
+
+本次测试关注的是“控制面是否可被可靠调用”，而不是展示虚构的性能指标或发布数据。当前轮次会停留在已校验的草稿状态，不调用提交工具，不创建 GitHub Pull Request，也不会触发正式发布。
+
+## 为什么需要 Agent Native 的博客控制面
+
+传统静态博客通常以本地编辑器、Git 命令和持续部署平台为中心。人在固定设备上写作时，这套流程清晰且可靠；但当 ChatGPT、编码智能体或自动化任务参与内容生产后，仅暴露文件系统或仓库写权限会带来三个问题：
+
+1. 智能体难以自动理解内容类型、Frontmatter 字段、标签体系和 MDX 组件约束。
+2. 直接修改仓库容易绕过校验、审阅和分支保护，扩大误操作影响范围。
+3. 多个终端或智能体并行工作时，需要稳定的草稿标识、版本控制和幂等键来避免覆盖。
+
+AgentPress Control 的定位不是替代 Astro、GitHub 或 Vercel，而是在这些组件之前增加一个面向 Agent 的控制面。它把博客能力封装为结构化工具，使调用方可以先读取项目协议，再按 schema 创建内容，并通过 revision 检查、MDX 白名单和发布工作流约束控制变更范围。
+
+## ChatGPT、AgentPress Control、GitHub 和 Vercel 的协作关系
+
+整个系统可以拆分为内容生成、变更控制、版本审阅和站点部署四层。ChatGPT 负责理解意图与组织文章；AgentPress Control 负责将操作约束在项目规则内；GitHub 保存可审计的版本历史并承载 Pull Request；Vercel 根据仓库状态构建和部署 Astro 站点。
+
+<Mermaid chart={`flowchart LR
+  A[ChatGPT] --> B[MCP]
+  B --> C[AgentPress Control]
+  C --> D[GitHub PR]
+  D --> E[Vercel]
+  E --> F[博客]`} />
+
+| 组件 | 主要职责 | 不应承担的职责 |
+| --- | --- | --- |
+| ChatGPT | 理解写作要求、生成内容、调用受控工具 | 直接持有仓库主分支写权限 |
+| AgentPress Control | 暴露内容 schema、管理隔离草稿、校验 MDX、准备 PR | 绕过审阅直接修改生产分支 |
+| GitHub | 保存版本、执行分支保护、承载 PR 与审阅记录 | 决定文章语义和写作质量 |
+| Vercel | 构建 Astro 项目并部署站点 | 代替内容校验和代码审阅 |
+
+## OAuth 与 MCP 授权流程
+
+OAuth 解决的是“谁可以代表用户调用控制面”的问题，MCP 解决的是“模型可以调用哪些结构化能力”的问题。两者结合后，ChatGPT 不需要获取服务器 Shell、GitHub 私钥或数据库凭据，而是使用经过授权的工具接口完成特定操作。
+
+一个合理的授权过程通常包含以下阶段：
+
+1. 用户从 ChatGPT 发起 AgentPress 连接。
+2. OAuth 服务展示授权对象和权限范围，由用户确认。
+3. ChatGPT 获得受范围约束的访问令牌，而不是底层基础设施凭据。
+4. MCP 向模型暴露 AgentPress Control 的工具定义与参数约束。
+5. 每次创建、编辑、校验或提交操作都由 Control 执行，并留下可追踪的草稿与版本状态。
+6. 用户可以撤销授权，使后续工具调用失效，而无需更换 GitHub 或服务器的核心密钥。
+
+这里的关键不是“让模型拥有更多权限”，而是把原本粗粒度的服务器操作收敛为可描述、可校验、可撤销的内容操作。
+
+## 一篇文章从草稿到发布的过程
+
+一篇普通博客文章进入 AgentPress 后，可以经过如下阶段：
+
+1. **读取规范**：调用项目能力、内容 schema、模板列表、分类体系和 MDX 组件目录，确定允许的字段与组件。
+2. **创建草稿**：使用稳定的 slug 和 sourceKey 创建隔离工作树，获得草稿 ID 与初始 revision。
+3. **细粒度编辑**：分别更新元数据和正文；每次写操作都携带 expectedRevision，避免在并发修改时静默覆盖。
+4. **重新读取**：获取最终 Frontmatter 与 MDX，检查标题、摘要、标签、结构和组件引用。
+5. **快速校验**：检查 Frontmatter、语法和安全 MDX；需要时修复后再次校验。
+6. **提交 PR**：只有用户明确要求后，才提交草稿分支并创建 GitHub Pull Request。
+7. **审阅与合并**：在 GitHub 中查看差异、自动检查和预览，确认后合并到 main。
+8. **构建与发布**：Vercel 检测到 main 更新后构建 Astro 站点，成功后文章才对外可见。
+
+<Callout type="info" title="Control 不直接修改 GitHub main">
+AgentPress Control 将内容变更保存在隔离草稿和独立分支中。只有显式提交后才会创建 Pull Request；是否合并到 main，仍由 GitHub 的审阅与分支保护流程决定。
+</Callout>
+
+下面的命令仅用于说明一种概念性的容器部署方式，实际服务名、环境变量和编排文件应以项目配置为准：
+
+```bash
+# 拉取服务镜像并在后台启动
+
+docker compose pull
+docker compose up -d
+
+# 检查当前容器状态
+
+docker compose ps
+```
+
+## 安全边界
+
+Agent Native 控制面的价值取决于边界是否清晰。至少需要控制以下风险：
+
+- **最小权限**：MCP 工具只暴露内容管理所需能力，不向模型提供服务器终端或主分支直接写入能力。
+- **版本保护**：写操作通过 revision 进行并发控制，旧版本请求不能无提示地覆盖新内容。
+- **组件白名单**：正文只能使用项目声明的安全 MDX 组件，避免任意导入或执行未知代码。
+- **发布隔离**：创建草稿、提交 PR、合并 main 和站点部署是不同阶段，不能因为草稿生成成功就视为已经发布。
+- **可撤销授权**：OAuth 访问应可被用户撤销，并避免把长期密钥暴露给对话模型。
+- **可审计性**：草稿、分支、PR 和构建记录共同形成变更链路，便于定位责任和回滚。
+
+这些约束使 AgentPress Control 更接近一个内容领域的事务层，而不是对 Git 仓库进行无条件远程操作的代理。
+
+## 本次连接测试结果
+
+截至本文草稿写入阶段，当前授权会话已经成功完成项目能力读取、博客 schema 查询、模板与分类体系查询、MDX 组件目录读取、草稿创建，以及带 revision 保护的元数据和正文更新。这说明 ChatGPT 可以通过 MCP 调用 AgentPress Control，并按照服务端契约维护一个持久化草稿。
+
+本轮测试明确不执行提交操作。因此，测试结果不包含 GitHub PR 编号、Vercel 构建记录或线上页面地址，也不把“草稿已创建”表述为“文章已发布”。完成重新读取和快速校验后，该草稿将保持在 Control 的 editing 状态，等待用户后续明确授权提交。
+
+## 总结
+
+AgentPress Control 为静态博客补上了适合智能体使用的控制面：ChatGPT 负责内容与意图，MCP 提供标准化工具调用，Control 负责 schema、草稿、校验和权限边界，GitHub 负责版本审阅，Vercel 负责构建部署。
+
+这条链路的核心并不是让智能体跳过传统工程流程，而是让它在传统流程中以更安全、更结构化的方式工作。本次测试只验证到草稿创建、编辑、读取和校验阶段；后续只有在用户明确要求时，才会进入 Pull Request 和正式发布流程。
