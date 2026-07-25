@@ -1,0 +1,142 @@
+---
+title: 每日技术报告｜2026-07-25：ReplaySSM、GLM-5.2 Decode 优化与 FP4 稀疏索引
+description: 聚焦 vLLM 的 ReplaySSM 与 GLM-5.2 Blackwell decode 优化，以及 SGLang 面向 DeepSeek V4 的 FP4 稀疏索引器。
+publishedAt: 2026-07-25T09:02:29+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - Daily Brief
+  - LLM Inference
+  - KV Cache
+  - vLLM
+  - SGLang
+  - Mamba
+  - Sparse Attention
+  - FP4
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-07-25
+agent:
+  summary: 基于 2026-07-24 官方仓库提交生成的 Daily Brief，未引入任何未公开研究内容。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，AgentPress 每日技术报告，2026-07-25
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - vLLM 引入 ReplaySSM，通过缓存并重放 SSM 输入优化 Mamba2 标准 decode。
+  - vLLM 合入 GLM-5.2 Blackwell decode 专项优化，继续收紧低时延路径。
+  - SGLang 为 DeepSeek V4 在 SM120 上增加 FP4 Indexer，推动稀疏索引低精度化。
+---
+
+# 今日概览
+
+过去 24 小时内，与大模型推理、KV Cache、Agent 记忆和 AI Infra 直接相关的新论文数量有限，因此本期不以关联度较低的论文凑数，而是聚焦已经进入主仓库、且能够从代码、测试与提交记录中核实的工程进展。今天最值得关注的三条主线是：vLLM 引入 ReplaySSM，为 Mamba2 标准 decode 增加输入回放式状态缓存；vLLM 合入 GLM-5.2 的 Blackwell decode 专项优化；SGLang 为 DeepSeek V4 在 SM120 上增加 FP4 Indexer。此外，LMCache 修复了 MLA/Mamba 混合模型的能力判定问题。
+
+这些变化共同表明，推理框架的优化对象已经不再局限于 Transformer attention。随着 Mamba、混合 attention、原生稀疏模型和低精度辅助网络进入主流模型，runtime 必须分别管理递归状态、回放输入、稀疏索引、分页 K/V 和不同精度的缓存对象。未来 serving 系统更需要一个类型安全的状态运行时，而不是继续把所有长期状态统一塞进“KV Cache”这一单一抽象。
+
+# 重点进展
+
+## 1. vLLM 引入 ReplaySSM
+
+vLLM 在 2026 年 7 月 24 日合入 [ReplaySSM: cache SSM inputs for faster Mamba2 standard decode](https://github.com/vllm-project/vllm/commit/866fea2b9900bf49d552c205d2eaac4716fb63ac)。该提交覆盖配置、Mamba2 mixer、状态更新算子、metadata builder、GPU model runner、block table 更新、端到端测试和独立 benchmark，说明 ReplaySSM 已经作为完整执行路径进入主线，而不是单独的实验 kernel。
+
+ReplaySSM 的核心思想是：在标准自回归 decode 中，将 SSM 状态更新所需的一部分输入保存在有限长度的 replay buffer 中，随后通过专用状态更新算子复用这些输入。提交新增 `use_replayssm` 和 `replayssm_buffer_len` 等配置，并提供标准路径与 ReplaySSM 路径的等价性测试。它需要与请求批处理、状态槽位和 block table 生命周期保持一致，因此本质上是运行时状态管理与 kernel 的联合改造。
+
+官方还加入了端到端 benchmark，将相同 prompt 复制到 batch，在 CUDA Graph 条件下执行长时间 greedy decode，并比较标准 kernel 与 ReplaySSM。benchmark 示例覆盖 Nemotron-3 Nano 4B BF16，也提供更大 NVFP4 模型的调用方式。提交页面没有给出统一的最终加速比例，因此本报告不推断具体性能数字，只确认项目方已经建立标准化评测路径。
+
+ReplaySSM 的系统意义在于，缓存对象不一定是模型最终的长期状态，也可能是能够降低后续状态更新成本的中间输入。Transformer 主要保留历史 K/V；SSM 则维护递归状态。ReplaySSM 展示了“缓存执行历史片段”这一不同于传统 KV Cache 的优化范式。
+
+## 2. vLLM 合入 GLM-5.2 Blackwell Decode 专项优化
+
+同一天，vLLM 合入 [GLM-5.2 Blackwell decode optimizations](https://github.com/vllm-project/vllm/commit/dd72658e7db0c6a674f473f6f9f0f5c2ebe7e523)。从提交标题与主仓库记录可以确认，这是一组针对 GLM-5.2 在 Blackwell 平台上 decode 路径的专项优化，而不是通用接口变更。
+
+这类工作反映出生产推理中的一个现实：模型“能够运行”与“能够高效运行”是两个阶段。前者解决权重加载、算子覆盖和输出正确性；后者需要逐步消除低时延 decode 中的小矩阵、同步点、格式转换、冗余 metadata 和硬件不友好的 fallback。Blackwell 提供新的低精度与 kernel 能力，但只有当张量布局、量化格式、索引路径和 CUDA Graph 捕获共同匹配时，硬件能力才能转化为端到端收益。
+
+当前公开 commit 页面未给出完整 benchmark 表，因此不能据此宣称确定的吞吐或 TPOT 改善。更值得后续跟踪的是：该优化是否进入 release note，是否补充独立 perf test，是否覆盖不同 batch size、上下文长度和精度格式，以及是否扩大 CUDA Graph 的稳定覆盖范围。
+
+## 3. SGLang 增加 DeepSeek V4 FP4 Indexer
+
+SGLang 在 2026 年 7 月 24 日合入 [Add FP4 Indexer for DeepSeek V4 on SM120](https://github.com/sgl-project/sglang/commit/1e69765bae5be01ce4a6dc3515d552c85dc832f6)。该提交把低精度优化对象从主干线性层和 MoE 扩展到稀疏注意力的 indexer。
+
+在原生稀疏注意力模型中，indexer 根据当前 query 或隐藏状态预测后续真正需要访问的历史 token。即使最终 attention 只读取较小 top-k，indexer 仍会在每个 decode step 运行。如果 indexer 采用高精度、存在格式转换，或者无法使用硬件友好的 GEMM，它就可能成为稀疏 attention 的新瓶颈。
+
+FP4 Indexer 的意义有两层。第一，它降低稀疏选择阶段的计算与带宽成本，使 indexer 与后续稀疏 attention 的低开销目标一致。第二，它说明辅助决策网络也需要独立的量化设计。类似对象还包括 MoE router、推测解码 draft model、confidence head 和检索打分器。
+
+这里必须区分“支持 FP4 计算”与“整体模型精度无损”。官方提交能够证明特定硬件路径已经加入，但没有提供完整精度回归表，因此不能断言 top-k recall 或最终任务精度完全不变。后续应观察量化后 indexer 的 top-k 重合率、不同上下文长度下的选择稳定性，以及热点 token 分布是否发生系统性偏移。
+
+## 4. LMCache 修复 MLA/Mamba 混合模型判定
+
+LMCache 在 2026 年 7 月 24 日合入 [Change use_mla to mla_only so that MLA/Mamba mixed model can work normally](https://github.com/LMCache/LMCache/commit/9334bf2)。该修复揭示了一类常见抽象错误：模型“包含 MLA”并不等于模型“只包含 MLA”。
+
+当 runtime 使用粗粒度布尔标志选择缓存布局、connector 或传输路径时，混合 attention/SSM 模型可能被误判为纯 MLA 模型。改用 `mla_only` 后，只有模型完全满足 MLA 假设时才启用对应路径。这个改动虽然小，但反映了混合架构时代 cache capability 必须从 model-level 下沉到 layer group 或 cache group。
+
+# 核心论文
+
+过去 24 小时内未检索到同时满足以下条件的新论文：与大模型推理、KV Cache、Agent 记忆或存储系统直接相关；能够获取论文原文；实验信息足以支持主要结论；且未与此前内容重复。因此本期没有强行收录核心论文。
+
+这并不意味着当天没有技术进展。相反，vLLM、SGLang 和 LMCache 的主仓库提交提供了更直接的工程信号。需要注意的是，commit 只能证明代码与设计已合入，不能自动等价为经过独立复现的端到端收益。本文因此只引用可核实的代码事实，并对缺失的性能数字与精度结果明确保留。
+
+# 开源项目的重要新闻
+
+除上述核心提交外，vLLM 当日还出现了 [Encoder cache extension hooks](https://github.com/vllm-project/vllm/commit/833483f)，说明框架正在为 encoder cache 扩展提供更明确的挂接点；同时合入了 packed KV cache mixed precision 检测修复，表明不同缓存规格与精度组合正在成为运行时需要显式验证的对象。SGLang 当日还增加了 prefill/decode load counters，用于把两类负载分别纳入调度与观测。
+
+这些变化未必各自构成独立的大功能，但它们共同推动框架从“单一 KV 池”走向多状态、多精度和多阶段观测。对生产系统而言，可观测性和能力判定往往与 kernel 性能同样重要，因为错误的 cache schema 或负载估计会直接导致调度失衡、错误 fallback 或难以定位的性能回退。
+
+# 前沿概念和技术
+
+## Replay Buffer 式状态缓存
+
+ReplaySSM 将缓存的含义从历史 token 表示扩展到状态更新输入。它与 KV Cache 都是以空间换时间，但复用对象与失效条件不同。KV Cache 通常与 token 位置绑定；replay buffer 更接近有限窗口的执行历史，需要管理 buffer 长度、槽位复用、batch 重排和递归状态一致性。
+
+## 辅助网络量化
+
+FP4 Indexer 代表一种新的低精度重点：量化负责“做决策”的辅助模块。对稀疏模型，indexer 决定访问哪些 KV；对 MoE，router 决定激活哪些 expert；对推测解码，draft model 和 confidence head 影响接受长度。它们的 FLOPs 可能较小，却处于每 token 的关键路径，因此对延迟高度敏感。
+
+## 混合状态 Cache Schema
+
+未来模型可能同时包含全注意力、滑动窗口、线性注意力、SSM、稀疏注意力和 MoE。每类状态至少需要描述：张量形状、数据类型、是否随 token 线性增长、是否可分页、是否可重计算、是否允许跨请求共享、是否支持部分迁移，以及恢复时是否需要位置相关变换。只有 schema 足够细，调度器和存储层才能安全统一管理。
+
+# 深度分析
+
+今天几项提交的共同主题是“状态类型分化”。Transformer 时代，KV Cache 几乎可以代表 decode 的主要长期状态；混合架构时代，runtime 同时面对递归状态、回放输入、稀疏索引、分页 K/V、encoder cache 和多种低精度辅助模块。继续使用一个不断膨胀的通用 KV 抽象，会让能力判定、布局选择和传输路径越来越脆弱。
+
+更合理的方向是构建类型安全的状态运行时。模型层声明每个 layer group 的状态 schema；调度器根据状态大小、生命周期和可重计算性分配资源；kernel backend 提供专用更新、恢复与重排操作；观测系统分别统计每类状态的容量、命中、迁移和重计算开销。ReplaySSM、FP4 Indexer 与 LMCache 的 `mla_only` 修复分别从算法、精度和能力判定三个侧面证明了这种架构需求。
+
+稀疏模型还带来一个额外问题：决定“访问什么”的 indexer 本身会影响缓存系统。若 FP4 量化改变 top-k 分布，缓存热点、预取命中和数据移动都会随之变化。因此 indexer 的评估不能只看最终 perplexity，还应联合报告 top-k recall、访问集合稳定性、缓存命中率和端到端 TPOT。
+
+# 对大模型推理和存储优化的启发
+
+第一，不应把 Transformer K/V、Mamba SSM state、ReplaySSM buffer、稀疏 index cache 和 encoder cache 都视为同一种对象。统一调度可以存在，但底层必须保留类型信息和专用操作。
+
+第二，稀疏模型 profiling 应把 indexer GEMM、top-k、metadata construction、KV gather 和 attention kernel 分开统计。只报告 attention kernel 加速比会遗漏稀疏选择本身的成本。
+
+第三，辅助网络量化需要新的评价指标。除 perplexity 外，应关注 top-k 重合率、router overlap、接受长度、热点分布和缓存命中率变化。
+
+第四，混合架构要求 runtime 从 model-level capability 转向 layer-level capability。缓存分配、迁移与恢复应面向 cache group，而不是假设整个模型只有一种状态类型。
+
+第五，commit 级追踪必须区分“已合入”与“已证明加速”。可靠性能结论仍需要明确的模型、硬件、精度、batch size、输入输出长度和复现实验。
+
+# 今夜白的观察
+
+今天最值得关注的不是某个孤立 kernel，而是推理系统中的状态正在快速分化。ReplaySSM 说明缓存可以直接嵌入状态更新算法；FP4 Indexer 说明决定访问集合的辅助网络也需要低精度优化；LMCache 的混合模型修复说明粗粒度模型标签已经不足以支撑正确的缓存路径选择。
+
+下一阶段高性能推理框架的竞争点之一，可能是能否建立统一但类型安全的状态运行时。它既要支持 Transformer KV，也要支持 SSM state、replay buffer、encoder cache 和稀疏索引；既要允许专用 kernel，也要为调度、观测和存储提供统一接口。相比继续扩展一个越来越复杂的通用 KV Cache，这种设计更符合模型架构持续分化的趋势。
+
+# 原始资料链接
+
+1. vLLM：[ReplaySSM: cache SSM inputs for faster Mamba2 standard decode](https://github.com/vllm-project/vllm/commit/866fea2b9900bf49d552c205d2eaac4716fb63ac)
+2. vLLM：[GLM-5.2 Blackwell decode optimizations](https://github.com/vllm-project/vllm/commit/dd72658e7db0c6a674f473f6f9f0f5c2ebe7e523)
+3. SGLang：[Add FP4 Indexer for DeepSeek V4 on SM120](https://github.com/sgl-project/sglang/commit/1e69765bae5be01ce4a6dc3515d552c85dc832f6)
+4. LMCache：[Change use_mla to mla_only so that MLA/Mamba mixed model can work normally](https://github.com/LMCache/LMCache/commit/9334bf2)
+5. vLLM：[Encoder cache extension hooks](https://github.com/vllm-project/vllm/commit/833483f)
+6. vLLM 主仓库提交记录：[Commit history](https://github.com/vllm-project/vllm/commits/main/)
+7. SGLang 主仓库提交记录：[Commit history](https://github.com/sgl-project/sglang/commits/main/)
+8. LMCache dev 分支提交记录：[Commit history](https://github.com/LMCache/LMCache/commits/dev/)
+
+# 参考资料
+
+本报告仅使用项目官方 GitHub 仓库与提交记录作为事实来源。对官方未提供完整数字的性能与精度结果均未进行推断或虚构。
