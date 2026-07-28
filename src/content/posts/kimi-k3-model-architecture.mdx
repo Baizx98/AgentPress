@@ -1,0 +1,302 @@
+---
+title: Kimi K3 模型架构解析：KDA、AttnRes 与 Stable LatentMoE
+description: 从长上下文、深度信息流、稀疏专家和原生多模态四个维度，解析 Kimi K3 的模型架构与推理系统含义。
+author: 今夜白
+tags:
+  - LLM Inference
+  - LLM Architecture
+  - Long Context
+  - MoE
+  - Multimodal
+  - Research
+draft: false
+featured: false
+language: zh-CN
+sourceKey: kimi-k3-model-architecture-2026
+agent:
+  summary: 解析 Kimi K3 如何通过 KDA、Gated MLA、AttnRes、Stable LatentMoE 与 MoonViT-V2，在长上下文、模型深度、参数容量和多模态四个维度扩展模型。
+  sourceQuality: verified
+  reuseLevel: high
+  related:
+    - Kimi Linear
+    - Attention Residuals
+    - KV Cache
+    - MoE Inference
+type: blog
+publishedAt: 2026-07-28T09:52:19.301Z
+---
+
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid.astro';
+
+# Kimi K3 模型架构解析：KDA、AttnRes 与 Stable LatentMoE
+
+Kimi K3 是月之暗面发布的原生多模态、超大规模稀疏模型。它拥有 **2.8T 总参数、104B 单 Token 激活参数、93 层主干网络和 1,048,576 Token 上下文窗口**。与单纯扩大标准 Transformer 不同，K3 分别针对四个扩展瓶颈引入专门设计：
+
+- 使用 **Kimi Delta Attention（KDA）与 Gated MLA** 扩展序列长度；
+- 使用 **Attention Residuals（AttnRes）** 改善超深网络的信息流；
+- 使用 **Stable LatentMoE** 扩展模型容量，同时控制激活计算量；
+- 使用 **MoonViT-V2** 将图像与视频表示接入统一的自回归语言主干。
+
+<Callout type="info" title="核心结论">
+Kimi K3 的关键不是某个孤立模块，而是将“递归状态、周期性全局注意力、跨层路由和极稀疏专家”组合为一个统一架构：KDA 负责低成本连续记忆，MLA 负责精确全局访问，AttnRes 负责跨深度选择，LatentMoE 负责扩展知识容量。
+</Callout>
+
+## 一、整体架构
+
+K3 的文本主干建立在 Kimi Linear 架构之上，是一个 Decoder-only MoE 网络。官方模型卡给出的核心参数如下：
+
+| 项目 | 配置 |
+|---|---:|
+| 总参数量 | 2.8T |
+| 单 Token 激活参数量 | 104B |
+| Transformer 层数 | 93 |
+| Dense FFN 层数 | 1 |
+| 注意力层组成 | 69 KDA + 24 Gated MLA |
+| Hidden Size | 7168 |
+| 注意力头数 | 96 |
+| 路由专家数 | 896 |
+| 每 Token 选择专家数 | 16 |
+| 共享专家数 | 2 |
+| Latent MoE 维度 | 3584 |
+| 单专家 Hidden Size | 3072 |
+| 上下文长度 | 1,048,576 Tokens |
+| 视觉编码器 | MoonViT-V2，约 401M 参数 |
+| 量化格式 | MXFP4 权重 / MXFP8 激活 |
+
+其中“1 个 Dense Layer”表示第一个前馈层采用普通稠密 MLP，后续层主要采用 MoE，并不表示主干只有一层。
+
+K3 的整体数据流可以概括为：
+
+<Mermaid chart={`flowchart LR
+  A[文本 Token] --> C[统一 Token 序列]
+  B[图像/视频] --> V[MoonViT-V2]
+  V --> P[视觉投影器]
+  P --> C
+  C --> H[93 层 Kimi Linear 主干]
+  H --> K[KDA 层]
+  H --> M[Gated MLA 层]
+  H --> R[AttnRes 跨层路由]
+  H --> E[Stable LatentMoE]
+  K --> O[自回归输出]
+  M --> O
+  R --> O
+  E --> O`} />
+
+## 二、KDA 与 Gated MLA：混合长上下文主干
+
+### 1. 3:1 的混合注意力比例
+
+K3 的 93 个注意力层并非全部采用标准全注意力，而是由 **69 个 KDA 层和 24 个 Gated MLA 层**组成。配置文件显示，模型大体按以下节奏交替：
+
+```text
+KDA → KDA → KDA → Gated MLA
+KDA → KDA → KDA → Gated MLA
+...
+```
+
+因此，约四分之三的层使用递归式线性注意力，约四分之一的层保留全局注意力能力。这个比例沿袭了 Kimi Linear 的核心设计思想：
+
+- KDA 承担大多数 Token 的低成本状态更新；
+- Gated MLA 周期性访问完整历史，补充精确检索能力；
+- 两类层组合，避免纯线性注意力受到固定状态容量限制，也避免所有层都维护完整 KV Cache。
+
+### 2. KDA：用递归状态压缩历史
+
+标准注意力在生成第 \(t\) 个 Token 时，需要利用历史序列中的 Key 和 Value：
+
+```text
+o_t = Attention(q_t, K_1:t, V_1:t)
+```
+
+随着序列增长，KV Cache 容量和单步注意力读取量都会增加。KDA 则把历史信息维护在递归状态中：
+
+```text
+S_t = Update(S_{t-1}, k_t, v_t)
+o_t = Read(S_t, q_t)
+```
+
+从推理系统视角看，KDA 层的历史信息主要表现为固定形态的递归状态，而不是长度不断增长的 Token 级 KV 序列。Kimi Linear 的公开结果表明，在 3:1 混合架构中，只有约四分之一的层需要维护全局注意力缓存，因此可显著降低长上下文场景下的 KV Cache 压力。
+
+### 3. Delta Rule：写入新记忆前修正旧映射
+
+普通线性注意力往往持续累加 Key-Value 外积，容易出现键冲突和记忆污染。Delta Rule 的核心思想不是简单累加，而是：
+
+1. 用当前 Key 从状态中读取已有映射；
+2. 计算旧映射与当前 Value 之间的误差；
+3. 只把差值写回状态。
+
+这种更新方式更接近可修正的关联记忆。KDA 又在 Gated DeltaNet 的基础上引入更细粒度的遗忘门，使不同状态通道能够采用不同的保留时间尺度。部分通道可以保存长期信息，另一些通道可以快速响应局部上下文。
+
+官方配置还显示，KDA 使用 96 个头、每头 128 维状态通道，并结合长度为 4 的短卷积，以增强局部 Token 混合能力。
+
+### 4. Gated MLA：保留全局随机访问能力
+
+固定容量状态适合压缩历史，但不擅长从百万 Token 中精确定位一个细节，例如：
+
+- 复制很早出现的代码片段或字符串；
+- 精确召回文档中的某个数字；
+- 对少量关键 Token 进行近似随机访问；
+- 保存难以压缩进有限状态的长尾信息。
+
+因此，K3 周期性插入 Gated MLA。MLA 使用低秩潜变量压缩 Query 与 KV，同时保留对历史序列执行全局注意力的能力。K3 配置中的 `q_lora_rank` 为 1536，`kv_lora_rank` 为 512，并启用输出门控。
+
+可以把两者的分工理解为：
+
+| 模块 | 主要作用 | 推理状态 |
+|---|---|---|
+| KDA | 连续压缩、更新和概括历史 | 固定形态递归状态 |
+| Gated MLA | 周期性全局检索与精确校正 | 随序列增长的 Latent KV Cache |
+
+因此，K3 不是“完全没有 KV Cache”的模型，而是把完整序列级缓存限制在少量 MLA 层中。
+
+## 三、AttnRes：在模型深度方向做注意力
+
+标准 PreNorm Transformer 通常使用固定加法残差：
+
+```text
+h_{l+1} = h_l + F_l(h_l)
+```
+
+随着层数增加，所有历史层输出都以固定权重累积。AttnRes 指出，这种无差别累积会导致隐藏状态幅度随深度增长，并逐渐稀释单层贡献。
+
+AttnRes 将残差连接改为对前序层表示执行 softmax 注意力，让当前层根据输入内容动态选择较早层的信息。这里的注意力不是沿 Token 序列展开，而是沿网络深度展开：
+
+```text
+序列注意力：当前 Token 选择历史 Token
+AttnRes：当前层选择历史层表示
+```
+
+K3 使用 Block AttnRes，将网络按 12 层划分为一个管理块。相较于对所有历史层输出执行完整跨层注意力，块级设计降低了显存、通信和训练调度开销，同时保留跨深度信息选择能力。
+
+这对 K3 尤其重要，因为它的 93 层主干交替使用 KDA、MLA 和 MoE。AttnRes 可以缩短浅层局部特征、周期性全局检索结果与深层输出之间的有效信息路径。
+
+<Callout type="info" title="两个维度不要混淆">
+KDA 和 MLA 解决的是序列维度上的信息交互；AttnRes 解决的是模型深度维度上的信息传递。
+</Callout>
+
+## 四、Stable LatentMoE：用极稀疏路由扩展到 2.8T
+
+### 1. 896 个专家，每个 Token 只选 16 个
+
+K3 配置了 896 个路由专家，但每个 Token 仅激活其中 16 个，路由比例约为：
+
+```text
+16 / 896 ≈ 1.8%
+```
+
+模型还配置了 2 个共享专家，用于承载跨领域、跨 Token 都普遍需要的通用能力。由此形成两条互补路径：
+
+- 共享专家学习通用语言与推理特征；
+- 路由专家学习代码、数学、视觉或特定知识模式；
+- Router 根据当前 Token 动态选择 16 个路由专家。
+
+官方称这一体系为 Stable LatentMoE，并报告相较 Kimi K2 获得约 2.5 倍的整体扩展效率提升。
+
+### 2. 为什么是 Latent MoE
+
+主干 Hidden Size 为 7168，而路由专家工作在 3584 维 Latent 空间中，单专家前馈隐藏维度为 3072。专家计算因此不必始终在完整主干宽度上展开。
+
+这种设计的意义在于：
+
+- 可以增加专家总数，提高参数容量；
+- 每个 Token 只访问极少专家，控制计算量；
+- 通过更窄的 Latent 表示降低单专家成本；
+- 将总参数扩展到 2.8T，同时把激活参数控制在 104B。
+
+需要区分两个概念：**总参数量决定模型可容纳的专家容量，激活参数量更直接决定一次前向计算的成本。**
+
+### 3. 稳定性为什么重要
+
+当专家数量扩展到接近 900 时，MoE 的困难不再只是“如何做 Top-k”，还包括：
+
+- 少数专家长期过载；
+- 部分专家训练不足；
+- Router 分布随训练过程漂移；
+- 极稀疏选择导致路由边界更敏感。
+
+Stable LatentMoE 的目标，就是在高专家数、低激活比例下维持可训练性和负载稳定性。推理时，模型配置体现为 Sigmoid Router、Top-16 路由专家、重新归一化以及两个共享专家路径。
+
+## 五、原生多模态：MoonViT-V2 接入统一主干
+
+K3 使用约 401M 参数的 MoonViT-V2 作为视觉编码器。视觉特征经过 Patch Merge 与 MLP Projector，被映射到语言模型的 7168 维隐藏空间，然后与文本 Token 一同进入 Kimi Linear 主干。
+
+```text
+图像 / 视频
+    ↓
+MoonViT-V2
+    ↓
+Patch Merge + MLP Projector
+    ↓
+视觉 Token
+    ↓
+与文本 Token 拼接
+    ↓
+KDA / MLA / AttnRes / MoE 主干
+```
+
+它没有为视觉信息建立一套完全独立的语言解码分支，而是让视觉 Token 进入统一的自回归计算路径。这样，长上下文、跨层路由和专家选择机制都可以同时作用于文本与视觉表示。
+
+配置文件中的视觉塔包含 27 层、1024 Hidden Size、4096 Intermediate Size、12 个注意力头和 14×14 Patch。视觉输入还保留时间、高度和宽度网格信息，为视频等时序视觉输入提供统一表示基础。
+
+## 六、原生 MXFP4 / MXFP8 量化
+
+K3 从监督微调阶段开始采用量化感知训练，目标格式为：
+
+- 权重使用 MXFP4；
+- 激活使用 MXFP8；
+- 权重分组大小为 32。
+
+这并不是对所有模块无差别做 4-bit 压缩。官方配置明确将注意力模块、共享专家、第一层 Dense MLP、LM Head、视觉编码器和多模态投影器等敏感模块排除在主要 MXFP4 压缩目标之外。
+
+因此，K3 的量化策略更接近“按模块分配精度”：对参数量最大的路由专家进行激进压缩，对精度敏感或占比相对较小的模块保留更高精度。
+
+## 七、从推理系统视角看 K3
+
+K3 的架构会直接改变推理系统对缓存、带宽和并行的假设。
+
+### 1. KV Cache 从单一形态变为混合状态
+
+传统 Transformer 的每一层通常都维护 Token 级 KV Cache。K3 则包含：
+
+- 69 个 KDA 层的递归状态；
+- 24 个 MLA 层的 Latent KV Cache；
+- AttnRes 所需的块级跨层表示；
+- MoE Router 和专家并行所需的 Token Dispatch 状态。
+
+因此，缓存管理器不能再把所有注意力层视为相同的 KV Block 分配对象。
+
+### 2. 长上下文瓶颈仍然存在，但位置发生变化
+
+KDA 显著降低了绝大多数层的序列级 KV 容量和读取压力，但 MLA 层仍需保存随序列增长的缓存。百万 Token 场景下，系统瓶颈可能从“所有层都受 KV 带宽限制”，转变为：
+
+- 少量 MLA 层集中产生大规模 KV 访问；
+- KDA 状态更新更依赖高效递归 Kernel；
+- MoE Expert Parallel 带来更显著的跨设备通信；
+- 视觉 Token 与长文本共同增加 Prefill 调度压力。
+
+### 3. 极稀疏 MoE 将并行效率置于核心位置
+
+896 个专家、每 Token 选择 16 个专家，意味着模型必须依赖高效的 Expert Parallel、Token Dispatch、负载均衡和跨节点 All-to-All。104B 激活参数并不意味着部署成本接近普通 100B Dense 模型，因为完整 2.8T 权重仍需被分布式存放和访问。
+
+## 八、总结
+
+Kimi K3 可以从四个正交的扩展维度理解：
+
+| 扩展维度 | 瓶颈 | K3 的架构选择 |
+|---|---|---|
+| 序列长度 | 全注意力计算和 KV Cache 随长度增长 | KDA + 周期性 Gated MLA |
+| 网络深度 | 固定残差累积导致信息稀释 | Block AttnRes |
+| 参数容量 | Dense 模型计算量随参数同步增长 | Stable LatentMoE |
+| 多模态输入 | 视觉与语言处理路径割裂 | MoonViT-V2 + Token-level Fusion |
+
+K3 最值得关注的地方，是它没有试图用一个机制同时解决所有问题，而是针对不同维度分别设计模块，再把这些模块组合为统一主干。对推理系统研究而言，最重要的变化是：**注意力状态不再等价于每层完整 KV Cache，模型状态开始分化为递归记忆、Latent KV、跨层残差表示和专家路由状态。**
+
+这意味着未来面向 Kimi K3 一类混合架构的推理系统，需要从“统一 KV Block 管理”进一步走向“异构模型状态管理”。
+
+## 参考资料
+
+1. [Kimi K3 官方仓库与模型说明](https://github.com/MoonshotAI/Kimi-K3)
+2. [Kimi K3 Hugging Face 模型配置](https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json)
+3. [Kimi Linear: An Expressive, Efficient Attention Architecture](https://github.com/MoonshotAI/Kimi-Linear)
+4. [Attention Residuals](https://arxiv.org/abs/2603.15031)
