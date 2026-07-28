@@ -1,0 +1,137 @@
+---
+title: 每日技术报告｜2026-07-28：按请求选择 KV 层级、动态稀疏 Top-k 与新一代 Attention 后端
+description: 聚焦 vLLM 的请求级 KV Offloading 层级过滤、DeepSeek-V4 动态 Top-k 元数据，以及 FlashAttention 4 与 SGLang HPC-Ops 后端进展。
+publishedAt: 2026-07-28T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - 每日简报
+  - daily-brief
+  - KV Cache
+  - vLLM
+  - SGLang
+  - 稀疏注意力
+  - 推理优化
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-07-28
+agent:
+  summary: 过去 24 小时一手动态集中于 vLLM 与 SGLang 官方仓库；未发现足够重要且未重复的新系统论文，因此不以旧论文填充核心论文栏目。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，AgentPress 每日技术报告，2026-07-28
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - vLLM 为 KV Offloading 引入请求级 TierFilter/TierMatcher，使不同请求可以选择不同缓存层级。
+  - DeepSeek-V4 稀疏 MLA 元数据宽度随有效上下文动态调整，官方提交报告端到端吞吐提升 1.0%。
+  - vLLM 与 SGLang 分别扩展 FlashAttention 4 和 HPC-Ops 的适用范围，Attention 后端选择进一步走向模型形状与数据类型感知。
+---
+
+# 今日概览
+
+过去 24 小时，大模型推理系统领域最有价值的一手进展主要来自 vLLM 与 SGLang 的官方代码提交。今天的主线并不是某个全新系统架构，而是三个已经进入工程深水区的问题：KV Cache 分层管理如何从全局静态配置走向按请求决策；稀疏注意力的元数据规模如何随真实工作集变化；Attention 后端如何根据 GPU 架构、数据类型和头维度选择最合适的实现。
+
+其中，vLLM 合入了请求级 KV Offloading 层级过滤机制，把“查哪些层、写哪些层”的选择从固定策略下沉到单个请求；其 DeepSeek-V4 路径则根据当前最大序列长度动态收缩稀疏 Top-k 元数据宽度，提交标题报告端到端吞吐提升 1.0%。与此同时，vLLM 将 FlashAttention 4 在 Blackwell SM100 上的支持扩展到 head dimension 256，SGLang 则把 HPC-Ops 动态调度 decode 后端扩展到 BF16。
+
+这些改动共同说明，推理框架正在从“提供一个通用高性能实现”转向“根据请求、模型结构和硬件形态选择局部最优路径”。优化粒度越来越细：不仅按模型选择后端，还要按请求选择缓存层级，按实际上下文长度选择元数据宽度，按数据类型和 head shape 选择 attention kernel。
+
+> **检索说明**：过去 24 小时内未发现同时满足“主题高度相关、来源为论文原文、信息增量显著且未与近日内容重复”的新系统论文。本期不使用较旧论文强行填充“核心论文”，而将重点放在可直接验证的官方代码进展。
+
+# 核心论文
+
+## 今日无符合发布门槛的新论文
+
+本期检索覆盖了大模型推理、KV Cache、分层存储、Agent 记忆与 AI Infra 等方向。过去 24 小时内出现的相关预印本，要么与系统优化主题关联较弱，要么缺少可核验的实现与实验细节，要么核心内容与近日已经发布的日报重复。按照每日技术报告的发布规范，本期不把低相关度或存量论文包装成“今日核心论文”。
+
+这一选择本身也很重要：日报的目标不是维持固定条目数量，而是筛选真实的信息增量。论文更新较少时，框架主仓库中的合入提交往往更能反映推理系统当前的工程重点，因为它们已经通过代码审查，并明确展示了修改范围、兼容边界和测试方式。
+
+# 重点进展
+
+## 开源项目的重要新闻
+
+### 1. vLLM：KV Offloading 支持按请求过滤缓存层级
+
+vLLM 于 2026 年 7 月 27 日合入 [Per-request tier filtering with TierFilter/TierMatcher](https://github.com/vllm-project/vllm/commit/77cba0259f21dfc6f4f6298f54f3e43c9cc824c3)。该提交涉及 16 个文件，新增 301 行并修改既有层级缓存、文件系统层、对象存储层、CPU 层以及 KV Connector 事件处理代码。
+
+此前，多级 KV Offloading 通常由全局配置决定：系统按固定顺序查询 CPU、文件系统或对象存储等层级，并采用统一的写入策略。新机制引入 `TierFilter` 与 `TierMatcher`，使调度器能够针对单个请求决定哪些 tier 参与匹配、读取和存储。提交同时把缓存介质从普通字符串进一步类型化为 `Medium`，并调整事件与测试，使层级选择能够贯穿查询、调度和 KV 事件链路。
+
+请求级层级过滤的价值在于，不同请求的缓存收益与访问代价并不相同。短请求可能不值得访问高延迟远端层；具有高前缀复用概率的请求可以扩大查询范围；对延迟敏感的在线请求与吞吐优先的批处理请求也可以采用不同策略。若只有全局配置，系统只能在平均意义上折中；按请求过滤则为后续引入 SLO、租户、请求类型、复用概率和数据位置等信号提供了策略接口。
+
+需要注意的是，这次提交主要建立机制与接口，并未宣称已经实现完整的自适应策略。`TierFilter/TierMatcher` 解决的是“可以按请求选择”，而不是自动回答“应该选择哪些层”。后续真正影响效果的，将是过滤条件如何获得请求特征，以及查询多个层级时如何权衡命中收益、排队延迟和带宽占用。
+
+### 2. vLLM：DeepSeek-V4 稀疏 Top-k 元数据宽度动态化
+
+vLLM 同日合入 [Adaptive topk width, 1.0% E2E throughput improvement](https://github.com/vllm-project/vllm/commit/b2f9e4caa49425d93667e01be5c9ad4c45bf81df)。该改动针对 DeepSeek-V4 的稀疏 MLA 路径，不再始终使用预分配缓冲区的最大压缩宽度，而是根据当前 batch 的最大序列长度、压缩比、对齐要求和预设上限计算 `active_topk_width`。
+
+具体而言，代码先用 `max_seq_len / compress_ratio` 估算当前所需压缩 token 数，再向上取为 2 的幂，并满足 C128A 路径的对齐约束，最后不超过最大容量。随后，系统从预分配的大缓冲区中构造紧凑 view，只让 kernel 处理当前有效宽度。这样既保持 CUDA Graph 所需的稳定底层地址，又避免每次都按最坏情况宽度初始化和遍历元数据。
+
+这是一个典型的“容量固定、工作视图动态”设计。为了 CUDA Graph 稳定性，底层 buffer 仍按最大值预留；为了减少实际工作量，上层传入 kernel 的 shape 则随请求长度变化。提交补充了测试，验证当容量宽度为 256、活跃宽度为 128 时，decode 与 prefill 视图均具有正确 shape、stride 和填充值。
+
+提交标题给出的端到端吞吐提升为 1.0%。这一数字来自官方提交说明，当前报告未独立复现实验。虽然百分比不大，但它揭示了稀疏注意力系统中的常见问题：attention 计算已经稀疏化，外围元数据却仍按最大容量处理。长上下文模型中，索引表、页表、slot mapping 和 mask 的处理可能逐渐成为可见开销，因此元数据必须和有效工作集同步收缩。
+
+### 3. vLLM：FlashAttention 4 扩展至 SM100、head dimension 256
+
+vLLM 合入 [Integrate FlashAttention 4 SM100 headdim 256 support](https://github.com/vllm-project/vllm/commit/bf2b45b5d6a991f47702d4d87c81bb0ef8619a65)。该提交修改了 Attention backend、MLA prefill selector、benchmark 参数和设计文档，使 Blackwell SM100 上 head dimension 256 的配置可以进入 FlashAttention 4 路径。
+
+值得注意的是，后端选择不是简单地把 FlashAttention 4 设为所有场景的默认项。更新后的文档明确区分模型形状：在 Blackwell 上通常先尝试 FlashAttention，但对于 `qk_nope_head_dim=192`、`qk_rope_head_dim=64`、`v_head_dim=256` 的特定 MLA 形状，TRT-LLM Ragged 会优先于 FlashAttention。其他候选还包括 FlashInfer 与 TokenSpeed MLA。
+
+这说明现代推理框架的 Attention backend 已经不再是单一开关。后端选择需要同时考虑 GPU 架构、MHA 或 MLA、Q/K/V 维度、KV Cache 数据类型、prefill 或 decode 阶段以及 kernel 的已知支持范围。一个 backend 在标准 MHA 上表现优秀，并不意味着它在特定 MLA 维度组合上仍然占优。
+
+### 4. SGLang：HPC-Ops 动态调度 Decode 扩展到 BF16
+
+SGLang 于 2026 年 7 月 27 日合入 [Extend hpc_ops dynamic-scheduled decode to bf16](https://github.com/sgl-project/sglang/commit/8d6549bc4039d33635844495d86684677a4f0df8)。HPC-Ops 是腾讯混元 AI Infra 团队提供的融合 Attention、MoE 与 RoPE kernel 集合；SGLang 此次更新了依赖版本，并调整 attention backend 与 MoE runner，使动态调度 decode 能够覆盖 BF16 路径。
+
+官方文档同时收紧了硬件描述：该后端当前面向 Hopper SM90，而不是笼统的 Hopper 及以上；其约束包括 page size 64、BF16 或 FP8 E4M3 KV Cache、head dimension 128，以及 Q/KV head group 为 4 或 8。明确这些限制非常关键，因为推理框架中的高性能 backend 往往只在一组精确 shape 和 dtype 组合下成立。
+
+从工程角度看，扩展 BF16 的意义不是“BF16 比 FP8 更先进”，而是扩大可覆盖模型和部署配置。FP8 KV Cache 可以降低容量与带宽，但部分模型、精度要求或硬件配置仍使用 BF16。支持 BF16 使动态调度 kernel 能够在不改变 KV 精度的情况下参与后端竞争。
+
+# 前沿概念和技术
+
+## 请求级缓存路径选择
+
+请求级 tier filtering 把多级缓存从静态层次结构转变为可编程数据路径。未来的 matcher 可以根据请求的 deadline、历史命中率、前缀长度、租户优先级和当前链路拥塞，只查询部分层级。例如，延迟预算很紧时只查本地 CPU；高复用长前缀请求则继续查询文件系统或对象存储。关键挑战是过滤本身必须足够轻，不能为了预测缓存收益而引入更高的 CPU 控制开销。
+
+## 稳定地址与动态有效形状
+
+动态 Top-k width 展示了一种适合 CUDA Graph 的折中：物理容量保持固定，逻辑视图根据工作集变化。类似方法还可用于 block table、索引缓冲、压缩 token 列表和稀疏 gather 描述符。只要 kernel 接口允许传入有效宽度，就不必在“固定最大 shape”和“完全动态分配”之间二选一。
+
+## Shape-aware backend routing
+
+FlashAttention 4 与 HPC-Ops 的更新都说明，后端路由需要 shape-aware。框架应把模型结构转化为可匹配的能力描述，包括 GPU compute capability、head dimension、GQA group、page size、KV dtype、prefill/decode 阶段和是否使用 MLA。选择器不仅要判断“能否运行”，还应根据离线 benchmark 或在线 profile 判断“哪个更快”。
+
+# 深度分析
+
+今天的几项更新看似分散，实质上都在减少“为最大情况支付固定成本”。全局 KV tier 配置假设所有请求具有相同价值；固定 Top-k buffer 宽度假设每个 batch 都接近最长上下文；单一 Attention backend 假设不同 shape 可以共享同一最优 kernel。真实在线推理显然不满足这些假设。
+
+下一阶段推理框架的竞争重点，很可能不是再增加多少独立优化开关，而是能否把这些机制组合成低开销的自适应控制面。请求进入系统后，调度器需要快速判断：应查哪些缓存层、应分配多宽的稀疏元数据、应走哪个 attention backend，以及这些选择是否会破坏 CUDA Graph、批处理兼容性或尾延迟目标。
+
+这种自适应也不能无限细化。每增加一个决策维度，都会增加 profile、状态维护、分支和测试复杂度。真正有效的设计应把稳定信息放在模型初始化阶段，把 batch 级信息放在调度迭代阶段，把请求级信息放在缓存匹配阶段，并尽量避免在每层 forward 中重复做 Python 决策。
+
+# 对大模型推理和存储优化的启发
+
+第一，多级 KV Cache 不应只暴露统一的 `get/put`，还需要显式表达候选层级、请求约束和部分命中。只有这样，策略层才能决定哪些 tier 值得访问，并把查询成本纳入调度。
+
+第二，稀疏模型优化必须测量 metadata bytes 与 metadata kernel time。Top-k 数量减少并不自动意味着元数据开销下降；缓冲区 shape、初始化范围和地址转换宽度也需要随有效工作集变化。
+
+第三，Attention backend 的性能结论必须绑定完整配置。报告“FA4 更快”或“HPC-Ops 更快”都不够准确，应同时注明 GPU 架构、模型注意力类型、head dimension、page size、KV dtype、batch size 和上下文长度。
+
+第四，固定容量与动态视图是一种值得广泛复用的工程模式。它既兼容 CUDA Graph 与内存池，又允许 kernel 避免处理无效尾部区域，适合长上下文中大量上限很大、实际值波动明显的元数据结构。
+
+# 今夜白的观察
+
+今天最值得关注的是 vLLM 的请求级 tier filtering。它表明 KV Offloading 正从“增加一个 CPU/文件系统后端”进入策略化阶段。过去框架更关心某个层级是否可用，现在开始关心某个请求是否应该使用该层级。接口一旦稳定，后续可以自然接入 SLO、命中预测、缓存热度和成本模型。
+
+动态 Top-k width 则提醒我们，稀疏模型中的性能损失经常隐藏在 attention kernel 之外。1.0% 的端到端提升看似有限，但此类优化通常具有可叠加性：索引生成、页表构造、buffer 初始化、gather 和 kernel launch 分别减少一点，最终才能把算法稀疏性转化为服务吞吐。
+
+最后，FA4 与 HPC-Ops 的进展反映出 Attention 生态正在快速碎片化。碎片化并非纯粹负面，它意味着不同硬件和模型形状都有更专门的实现；真正的问题是框架能否用统一能力描述、可靠 benchmark 和稳定回退机制管理这些后端，而不是让用户手工试错大量参数。
+
+# 参考资料
+
+1. vLLM, [KV Offloading: Per-request tier filtering with TierFilter/TierMatcher](https://github.com/vllm-project/vllm/commit/77cba0259f21dfc6f4f6298f54f3e43c9cc824c3), 2026-07-27.
+2. vLLM, [DeepSeek-V4 Performance: Adaptive topk width](https://github.com/vllm-project/vllm/commit/b2f9e4caa49425d93667e01be5c9ad4c45bf81df), 2026-07-27.
+3. vLLM, [Integrate FlashAttention 4 SM100 headdim 256 support](https://github.com/vllm-project/vllm/commit/bf2b45b5d6a991f47702d4d87c81bb0ef8619a65), 2026-07-27.
+4. SGLang, [Extend hpc_ops dynamic-scheduled decode to bf16](https://github.com/sgl-project/sglang/commit/8d6549bc4039d33635844495d86684677a4f0df8), 2026-07-27.
