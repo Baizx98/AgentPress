@@ -1,0 +1,133 @@
+---
+title: 每日技术报告｜2026-08-01：选择性 KV 传输、语义位置无关缓存与动态宽度推理
+description: 聚焦 SmartGen、SemPIC、WIDE、MemHarness 与 Qwen-UI-Agent，分析 KV 数据路径、可复用表示、动态稀疏和 Agent 记忆重构。
+publishedAt: 2026-08-01T09:03:59+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - Daily Brief
+  - KV Cache
+  - LLM Inference
+  - Agent Memory
+  - Sparse Inference
+  - Qwen
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-08-01
+agent:
+  summary: 本期围绕五项新近一手成果展开：SmartGen 的选择性 KV 传输、SemPIC 的语义位置无关 KV、WIDE 的 token 级动态宽度剪枝、MemHarness 的 Agent 记忆重构，以及 Qwen-UI-Agent 的真实设备长程执行与大规模在线强化学习体系。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，AgentPress 每日技术报告，2026-08-01
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - SmartGen 以主动、按需和推测三条路径实现选择性 KV 传输，作者报告第二 token 延迟最高降低 4.3 倍。
+  - SemPIC 通过离线 Writer 学习可复用文档 KV，将位置无关缓存的平均 micro-F1 从 0.53 提升至 0.60。
+  - WIDE 将动态稀疏细化到 token 级 attention head group 与 FFN channel group，并进行稀疏模式与内核协同设计。
+---
+
+# 今日概览
+
+过去 24 小时内，一手材料主要来自 arXiv 新提交和研究团队技术报告。严格限定 24 小时后，足以支撑完整技术报告的高质量论文数量不足，因此依照 AgentPress 的 daily-technical-report 规范，将论文窗口回退到过去 72 小时。本文只选取 2026 年 7 月 30 日提交、并在 7 月 31 日 recent 列表中出现的成果，同时与最近十期 Daily Brief 比对，排除了此前已经介绍的 C²KV、HyMCache、ReplaySSM、MemTX、DIRECT 等内容。
+
+今天的主线可以概括为四个问题：推理系统究竟需要计算什么、跨节点传输什么、长期缓存什么，以及 Agent 应怎样使用历史经验。SmartGen 将 Prefill–Decode 之间的完整 KV 搬运拆成主动、按需和推测三条路径；SemPIC 通过离线训练让文档 KV 更适合在不同指令和顺序下复用；WIDE 把动态剪枝细化到 token 级 attention head group 与 FFN channel group；MemHarness 则主张历史经验必须结合当前状态重构，而不能原样回放。
+
+公司侧最重要的一手材料是 Qwen-UI-Agent 技术报告。它把 GUI、CLI、真实移动设备、沙箱、长轨迹在线强化学习和数据飞轮放入同一套系统，说明真实设备 Agent 的竞争已经扩展到环境调度、状态维护、轨迹存储和失败诊断。
+
+# 重点进展
+
+## 核心论文
+
+### SmartGen：以三条数据路径实现选择性 KV 传输
+
+[SmartGen: Seamless Disaggregated LLM Inference with Selective KV Cache Transfer](https://arxiv.org/abs/2607.28150) 研究 Prefill–Decode 分离中的网络瓶颈。论文指出，在带宽有限的租用云实例上，完整 KV Cache 迁移可能占满节点间网络，并使 Decode 节点在开始生成前长期等待。
+
+SmartGen 设计三条互补路径。profile-based proactive transfer 在 Prefill 阶段根据 profile 提前发送重要 KV；parallel on-demand transfer 在 Decode 阶段并行访问本地 KV 与远端缺失 KV；speculative transfer 则在后台继续补齐剩余缓存，使后续 decoding 最终恢复到完整 KV。作者报告，相比典型完整迁移，time-to-second-token 最高降低 4.3 倍，同时保持后续 decoding 性能和精度可比。该数字来自论文实验，本文未独立复现。
+
+这项工作的关键不是永久丢弃 KV，而是优先保障关键路径：先让最早几步 decode 可执行，再利用计算窗口完成后台补齐。其收益仍依赖 profile 稳定性、远端按需读取延迟，以及后台传输是否与正常推理争抢带宽。
+
+### SemPIC：学习面向未来上下文的文档 KV
+
+[SemPIC: Learning Semantic Position-Independent KV Caches](https://arxiv.org/abs/2607.28069) 面向长上下文检索和 Agent 中重复使用同一文档的场景。Prefix Cache 要求 token 前缀完全一致；传统 position-independent cache 虽然允许文档顺序变化，但独立生成的 KV 不知道未来会被放入什么指令和历史中，因此存在边界与语义偏差。
+
+SemPIC 使用带 LoRA 的 Writer，在离线阶段通过行为蒸馏生成每层文档 KV，同时保持预训练 Reader 不变。适配发生在缓存构建侧，在线命中仍使用标准 KV 接口。论文还提出 KV Gradient Checkpointing，以降低训练峰值显存并保留经过缓存 KV 的梯度。
+
+作者在三个模型和四个任务上报告，SemPIC 将相对 KV Packet 的平均 micro-F1 从 0.53 提升到 0.60，接近完整重计算的 0.62。这表明位置无关 KV 的误差不仅来自块边界；仅修正边界仍不足以消除块内部和任务层面的残差。
+
+系统上，SemPIC 把文档 KV 变成需要编译和版本管理的派生资产。未来部署需要处理 Writer 与 Reader 的版本绑定、文档更新后的增量重建、跨任务泛化以及大规模缓存索引。现有结果证明可学习缓存具有潜力，但尚不能据摘要判断它能直接替代通用 Prefix Cache。
+
+### WIDE：token 级动态宽度剪枝与内核协同
+
+[WIDE: Boosting Adaptive LLM Inference via Token-level Dynamic Width Pruning](https://arxiv.org/abs/2607.28418) 试图解决动态稀疏难以获得真实系统加速的问题。静态结构化剪枝硬件友好，但无法按输入分配计算；动态方法质量保持更好，却常停留在层级选择，细粒度不规则性难以被 GPU kernel 高效执行。
+
+WIDE 允许每个 token 动态选择 attention head group 和 FFN channel group，把自适应计算推进到神经元块级。执行侧将优化拆为 mask 重排、硬件无关的 block-level skipping 和硬件相关的 intra-block skipping。换言之，算法产生的稀疏 mask 还要被重新组织成硬件可执行的规则块。
+
+论文报告，在 50% 稀疏度与 calibration-only 设置下，WIDE 相比动态深度剪枝获得 55.1% 性能提升；Prefill 和 Decode 的 kernel 级最高加速分别为 1.98 倍和 4.95 倍，端到端加速分别为 1.68 倍和 1.55 倍。代码入口已经由论文页面公开。kernel 峰值显著高于端到端收益，也说明路由、重排、未裁剪算子和 serving 调度仍有明显成本。
+
+### MemHarness：记忆读取应包含批判与重构
+
+[MemHarness: Memory Is Reconstructed, Not Replayed](https://arxiv.org/abs/2607.28272) 针对 memory-augmented Agent 的负迁移。许多系统把历史经验当作静态记录，检索后直接拼入当前上下文；但过去经验通常较抽象，当前状态则具体且不断变化，原样回放可能形成错误指导。
+
+MemHarness 在每个决策步骤中，让统一策略模型先批判并重构检索到的经验，再形成与当前状态匹配的指导。该能力通过端到端 GRPO 训练获得。作者报告其在 ALFWorld 和 WebShop 上优于纯强化学习与静态记忆增强基线，并在分布外场景中更稳健。摘要没有给出具体提升幅度，因此本文不补充未经确认的数字。
+
+该思路把 Agent Memory 的读接口从“检索并拼接”改成“检索、批判、重构、执行”。系统需要进一步决定重构结果是否缓存、何时失效、如何保留原始证据，以及额外模型调用能否由小模型或批处理摊薄。
+
+## 开源项目的重要新闻
+
+WIDE 论文已给出官方代码仓库入口，使 token 级动态宽度剪枝的 mask 重排和跳过机制可以被复现。当前可确认的是代码已公开；论文摘要并未证明其已经达到生产可用状态。后续应重点观察连续批处理、CUDA Graph、不同 GPU 架构和动态 shape 下的稳定性。
+
+[Qwen-UI-Agent Technical Report](https://arxiv.org/abs/2607.28227) 是本期最重要的前沿公司动态。系统覆盖移动端、桌面、网页与 DeepSearch，统一动作空间可以交错执行 GUI 操作和 CLI 命令，并在一次模型调用中生成批量动作。训练环境同时包含沙箱和大规模真实移动设备运行时，AutoResearch 风格的数据飞轮负责构建任务、生成环境、诊断失败并规划下一轮迭代。
+
+报告披露，在线强化学习支持超过 100 轮的轨迹，并使用超过 10,000 个并发环境加速 rollout。轻量 harness 层负责主动发起服务和维护跨移动端、计算机的有状态工作流。作者报告 MobileWorld 82.1%、MobileWorld-Real 92.2%、AndroidDaily 97.5%、OSWorld-Verified 79.5%、OSWorld-v2 partial-progress 40.0%、WebArena 73.6% 和 ScreenSpot-Pro 81.5%。这些均为技术报告自述结果，跨模型比较仍需结合权限、工具和评测协议审视。
+
+# 前沿概念和技术
+
+**关键路径优先的 KV 迁移。** SmartGen 将目标从“尽快搬完全部 KV”改为“尽快提供第一批可用 KV”。主动发送、按需补取和后台完整化分别对应启动、缺失处理和长期稳定。
+
+**可学习的缓存构建器。** SemPIC 将 Writer 与 Reader 分离：Writer 可训练，Reader 保持不变。缓存由请求副产物变成可编译资产，同时也带来版本绑定和离线构建成本。
+
+**token 级宽度路由。** WIDE 不仅决定是否跳过整层，还决定每个 token 使用哪些 attention head group 与 FFN channel group。其难点是将高度动态的选择转换成规则、连续的硬件执行块。
+
+**重构式记忆读取。** MemHarness 把记忆系统从数据库式检索器改成带策略的状态适配器。检索结果只是证据，不是可以直接执行的指令。
+
+**环境规模成为 Agent Infra 的关键指标。** Qwen-UI-Agent 的万级并发环境和百步轨迹表明，真实 Agent 的能力上限越来越受环境生产、状态快照、失败重放和轨迹存储约束。
+
+# 对大模型推理与存储优化的启发
+
+第一，KV Cache 的管理状态不能只有命中与未命中。选择性迁移需要明确区分本地可用、远端可读、后台迁移中和已经完整化，并让调度器根据这些状态决定请求何时进入 Decode。
+
+第二，缓存价值不能只用命中率衡量。SemPIC 的缓存内容经过离线学习，评测应同时考虑任务质量、构建成本、版本兼容性、更新代价和在线时延。
+
+第三，动态稀疏必须与批调度共同设计。不同请求具有不同 token mask 时，批内碎片、分支和重排可能吞噬 FLOPs 节省。WIDE 的端到端数字低于 kernel 峰值，正体现了这一差距。
+
+第四，Agent Memory 应区分原始证据、派生表示和当前状态下的重构结果。重构结果不应覆盖原始经验，学习型 KV 也不应替代源文档；三类对象需要不同的版本、缓存和失效规则。
+
+第五，长程 Agent 必须把轨迹作为一等数据对象。超过 100 步的交互包含环境状态、截图、命令、工具输出、失败原因和奖励信号，只保存最终文本无法支持可靠回放和持续训练。
+
+# 深度分析
+
+本期工作的共同点，是不再把中间状态当作透明副产物。KV Cache 被拆成可分阶段迁移的数据对象；文档 KV 被当作可离线训练的语义资产；动态稀疏 mask 成为 kernel 的显式输入；历史经验在执行前必须结合当前状态重新解释；GUI Agent 的轨迹则由大规模环境系统持续生产和诊断。
+
+因此，下一阶段 AI Infra 的竞争点很可能落在“状态管理平面”。模型权重相对稳定，而 KV、稀疏路由、环境快照、记忆文档和工具状态生命周期更短、请求相关性更强、一致性要求更复杂。系统需要同时管理不可变原始数据、可重建派生数据和请求临时状态，并为它们采用不同的传输、缓存和失效策略。
+
+还需要警惕局部性能数字与 serving 收益之间的差距。WIDE 的 kernel 峰值与端到端结果并不相同；SmartGen 的收益也会受到网络竞争与后台补齐流量影响。评价此类系统时，应优先检查关键路径、并发争用、状态转换和回退机制，而不能只比较理论 FLOPs 或传输字节。
+
+# 今夜白的观察
+
+本期最重要的判断是：KV 与 Agent Memory 正从“缓存旧结果”演化为“编译、迁移并重构状态”。缓存可能由专门的 Writer 生成，先以不完整形式到达 Decode 节点，在运行中继续补齐，或者在 Agent 行动前根据当前环境重新解释。缓存不再天然正确，也不再只有一个固定位置。
+
+这类系统的核心难点将是可验证性。选择性迁移必须说明缺失 KV 不会在关键阶段破坏质量；学习型 KV 必须证明跨上下文复用保持行为一致；记忆重构必须能够追溯原始证据；动态剪枝必须在不同 batch 和硬件上维持稳定收益。未来高质量系统论文需要把正确性边界、失效条件和回退路径写得与性能优化同样清楚。
+
+Qwen-UI-Agent 进一步说明，当 Agent 进入真实设备，模型推理只是完整系统的一部分。环境创建、设备状态、服务主动触发、长轨迹训练和失败诊断会成为主要工程投入。能够稳定管理这些状态和数据流的基础设施，可能比单项 benchmark 的提升更有长期价值。
+
+# 参考资料
+
+1. Xuchuan Luo, Jiacheng Shen, Xin Wang, Yangfan Zhou. [SmartGen: Seamless Disaggregated LLM Inference with Selective KV Cache Transfer](https://arxiv.org/abs/2607.28150), arXiv:2607.28150, 2026-07-30.
+2. Hui Xie, Peng Xiao, Yutong Deng, Shuoran Dou, Jian Yang, Jinyang Guo. [SemPIC: Learning Semantic Position-Independent KV Caches](https://arxiv.org/abs/2607.28069), arXiv:2607.28069, 2026-07-30.
+3. Haozhe Hu, Hao Wu, Peiran Yin, Chao Han, Yunpu Ma, Xiaoyu Shen. [WIDE: Boosting Adaptive LLM Inference via Token-level Dynamic Width Pruning](https://arxiv.org/abs/2607.28418), arXiv:2607.28418, 2026-07-30.
+4. Rong Wu et al. [MemHarness: Memory Is Reconstructed, Not Replayed](https://arxiv.org/abs/2607.28272), arXiv:2607.28272, 2026-07-30.
+5. Hanzhang Zhou et al. [Qwen-UI-Agent Technical Report: Toward Next-Generation Real-World Centric Foundation GUI Agents](https://arxiv.org/abs/2607.28227), arXiv:2607.28227, 2026-07-30.
