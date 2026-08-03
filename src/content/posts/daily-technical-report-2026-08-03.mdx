@@ -1,0 +1,131 @@
+---
+title: 每日技术报告｜2026-08-03：弹性推测解码、可扩展 KV Cache 与 DSA 索引缓存收缩
+description: 聚焦 ECHO 推测解码工程化、vLLM 可扩展 KV Cache、SGLang 长上下文索引融合，以及 llama.cpp 的 GLM DSA 索引缓存优化。
+publishedAt: 2026-08-03T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Inference
+  - KV Cache
+  - Speculative Decoding
+  - vLLM
+  - SGLang
+  - llama.cpp
+  - Long Context
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-08-03
+agent:
+  summary: 本报告分析 ECHO 弹性推测解码及其 SGLang 工程化、vLLM 可扩展 KV Cache、SGLang DSV4 分页索引融合和 llama.cpp GLM DSA 索引缓存收缩，并补充 Cache-Resident LLM Inference 对分层存储与执行解耦的启示。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，《每日技术报告｜2026-08-03》，AgentPress
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - SGLang 正将 ECHO 的稀疏门控机制接入 EAGLE3，但相关 PR 仍未合并，性能数字应视为提交者报告。
+  - vLLM 提出基于虚拟内存按需提交物理页的可扩展 KV Cache，以实际 warmup 后内存占用替代静态预留估算。
+  - SGLang 与 llama.cpp 分别从长上下文索引计算和索引缓存容量两端压缩 DSA 推理开销。
+---
+
+import Callout from '../../components/Callout.astro';
+
+# 今日概览
+
+过去 24 小时内，高价值的一手动态主要集中在推理框架官方仓库，而 arXiv 在周末没有形成足够密集的新系统论文供筛选。因此，本文的论文部分采用发布规范允许的回退窗口，选择与当天工程进展直接相关、且此前未在 AgentPress 每日技术报告中单独介绍的论文；工程动态则严格限定为 2026 年 8 月 2 日至 8 月 3 日出现的官方仓库 Pull Request。
+
+今天最值得关注的主线有三条：第一，推测解码正在从固定树结构转向按负载和置信度动态分配验证预算；第二，KV Cache 容量管理开始借助 GPU 虚拟内存，将“启动前一次性估算”改为“warmup 后按实际余量扩展”；第三，原生稀疏注意力的系统优化已经深入到索引器中间张量、分页布局和索引缓存分配，而不再只关注注意力主算子。
+
+<Callout type="warning" title="来源与状态说明">本文涉及的 vLLM、SGLang、TensorRT-LLM 与 llama.cpp 动态均来自尚未合并或仍处于 Draft 状态的 Pull Request。文中性能数字是提交者在特定硬件和配置下报告的结果，不等同于稳定版本承诺。</Callout>
+
+# 重点进展
+
+## ECHO：面向高并发的弹性推测解码
+
+ECHO 将高并发推测解码重新表述为受预算约束的调度问题。传统静态推测树容易产生大量无效验证，而逐请求动态构树又可能带来判断误差累积以及内核形状不稳定。ECHO 使用稀疏置信度门控，把批次中的候选组织成统一的“超级树”，并在树深和树宽之间动态分配预算，从而同时减少全局验证轮数和单轮验证浪费。
+
+论文在 Qwen3-235B 等模型上报告最高 5.35 倍 wall-clock 加速，并给出超过 20% 的相对性能增益。需要注意，这些是论文实验结果，不能直接外推到任意模型、并发度或硬件。当天 [SGLang PR #33295](https://github.com/sgl-project/sglang/pull/33295) 正尝试把 ECHO 作为 EAGLE3 的可选模式接入运行时，说明该方法正在从论文原型向主流推理框架迁移。
+
+原始论文：[ECHO: Elastic Speculative Decoding with Sparse Gating for High-Concurrency Scenarios](https://arxiv.org/abs/2604.09603)
+
+## Cache-Resident LLM Inference：围绕缓存驻留重组执行流
+
+《Cache-Resident LLM Inference in GB-Scale Last-Level Caches》研究如何利用具备 GB 级末级缓存的服务器 CPU 执行大模型推理。其核心不是简单扩大缓存，而是把权重相关算子与 Attention/KV Cache 管理解耦到不同资源域：权重尽量保持片上驻留，KV 容量则独立扩展，并把同步边界从完整算子边界缩小到真正的数据依赖。
+
+论文原型在 Llama-3.2-3B 和 Llama-2-7B 配置上，相比同等资源的 llama.cpp 报告 2.04 至 11.51 倍 TPOT 加速；分析模型中最高达到 13.9 倍。该工作的价值在于，它把“数据驻留位置”提升为运行时组织原则，而不是仅将缓存视为硬件透明层。对长上下文推理而言，权重、KV 状态和算子同步应当分别建模，而不是被一个统一流水线隐式绑定。
+
+原始论文：[Cache-Resident LLM Inference in GB-Scale Last-Level Caches](https://arxiv.org/abs/2606.25353)
+
+## vLLM：可扩展 KV Cache 尝试消除静态容量估算误差
+
+[vLLM PR #50779](https://github.com/vllm-project/vllm/pull/50779) 提出 opt-in 的可扩展 KV Cache。现有流程通常在 profiling 后一次性分配全部 KV Cache，但 CUDA Graph、推测解码工作区和后续 workspace 增长会在 profiling 之后继续消耗显存，因此系统必须预留经验性余量：余量过小会 OOM，过大则浪费 HBM。
+
+该方案先保留虚拟地址空间，只提交最小物理页；完成 warmup 与 CUDA Graph 捕获后，再依据真实剩余显存扩展 KV Cache。由于基址保持不变，已捕获图和层级 view 不需要重新创建。PR 还讨论了 NIXL 注册、sleep mode、ROCm VMM 和 encoder cache，但当前仍为 Draft，并依赖另一个 KV layout 标准化 PR，尚不能视为可用功能。
+
+## SGLang：融合 DSV4 分页索引器，消除长上下文中间张量
+
+[SGLang PR #33297](https://github.com/sgl-project/sglang/pull/33297) 针对 DSV4 便携路径中的分页索引评分进行融合。原实现会物化形状为 `[B, S, num_heads]` 的 FP32 分数张量，并在 ReLU 和加权归约阶段重复读取；随着上下文增长，这一中间张量的 HBM 流量成为主要开销。
+
+新 Triton 内核把分页 gather、E4M3 解码、逐头点积、ReLU、加权和归约合并为一次执行，使中间分数不再落入显存。提交者报告，在 8×A800 的长上下文 needle 测试中，端到端耗时从 128K 的 99.7 秒降至 56.3 秒，在 256K 从 313.2 秒降至 141.4 秒。该 PR 为 stacked PR，且 CI 状态尚未完成，因此应把这些数字视作初步结果。
+
+## llama.cpp：仅在完整索引层分配 GLM DSA 索引缓存
+
+[llama.cpp PR #26474](https://github.com/ggml-org/llama.cpp/pull/26474) 为 GLM DSA 增加独立的 lightning indexer cache 过滤条件，仅在包含完整索引器的层分配索引缓存。提交者估计，这可以把整体索引缓存容量降低约 75%。
+
+这一改动很小，但反映了原生稀疏模型运行时的关键问题：模型结构中的层间共享或稀疏分布必须显式传递到缓存分配器，否则运行时仍会按照“每层都有完整状态”的传统 Transformer 假设浪费内存。该 PR 当前没有给出完整端到端测试结果，容量收益仍需合并前验证。
+
+## TensorRT-LLM：将 Agent Scaffolding 控制器改为声明式配置
+
+[TensorRT-LLM PR #17170](https://github.com/NVIDIA/TensorRT-LLM/pull/17170) 为 Scaffolding Controller 增加 JSON/YAML 配置树。Majority Vote、Best-of-N 和生成控制器可以递归组合，并通过注册表构造；需要 tokenizer 或工具对象的控制器则使用 `$ref` 注入运行时对象。
+
+这项变化不直接优化单次推理性能，但降低了 Agent 推理策略的部署和迁移成本。控制器、采样参数和嵌套决策逻辑被外部化后，实验系统可以把“推理策略”从 Python 代码变成可版本化配置。该 PR 仍在评审中，CI 测试覆盖也被审查意见标记为需要补充。
+
+# 深度分析
+
+## 从固定容量到虚拟地址稳定、物理页可增长
+
+可扩展 KV Cache 的关键不是简单动态申请 Tensor，而是把地址稳定性与物理容量解耦。CUDA Graph、通信注册和层级 view 都依赖地址长期稳定；虚拟内存允许系统先固定地址，再按需映射物理页。由此，KV Cache 管理开始接近操作系统中的虚拟内存管理，而不是传统深度学习框架中的一次性张量分配。
+
+这一设计同时暴露出新的系统约束。通信库注册的是实际可访问的物理区间，而不是无限扩展的虚拟地址范围；CUDA Graph 可以复用固定指针，但新增页面必须保证布局和 block offset 不变；不同 GPU 后端的 VMM 能力和内存句柄语义也并不统一。因此，可扩展缓存本质上是内存管理、图执行与远程传输接口的联合设计。
+
+## 推测解码的目标正在从接受率转向验证预算效率
+
+ECHO 和 SGLang 的相关实现表明，平均接受长度并不是唯一目标。高并发时，目标模型验证可能进入计算受限区域，过宽的推测树会增加无效验证，过深的树又可能降低批处理效率。更合理的指标应同时考虑验证轮数、每轮 token 数、批次形状稳定性以及内核可融合程度。
+
+当天另一个 SGLang 提交还尝试为 DSpark 的 graph-folded proposal 增加采样支持，说明推测解码正在从 greedy-only 的规则路径走向混合采样、图内随机数和显存预算感知。此类机制能否进入稳定版本，取决于正确性、CUDA Graph 兼容性和额外静态 buffer 的容量成本，而不仅是 microbenchmark 中的接受率。
+
+## 稀疏注意力优化进入“索引器系统栈”
+
+DSV4 分页索引融合和 GLM DSA 索引缓存过滤分别解决计算侧与容量侧问题。前者减少索引器生成分数时的中间 HBM 流量，后者避免为不存在或共享的索引状态重复分配缓存。这说明原生稀疏模型的瓶颈正在从 Attention 本体转移到索引生成、元数据组织和状态生命周期。
+
+在长上下文下，索引器通常需要扫描或近似扫描大范围历史状态。即便最终只选择少量 token，候选评分张量、页表访问和逐头归约仍可能随上下文增长。系统必须区分“稀疏结果”与“稀疏过程”：输出 top-k 很小，并不意味着生成 top-k 的过程天然低成本。
+
+## 对大模型推理与存储优化的启发
+
+第一，KV Cache 的容量规划不应只在模型加载阶段完成。运行时的 CUDA Graph、通信注册、推测解码和临时 workspace 都会改变真实可用显存，因此更可靠的策略是先稳定地址，再根据 warmup 后的实际占用提交物理容量。
+
+第二，存储优化需要理解模型结构。无论是共享索引层、混合 Attention，还是线性注意力状态，不同层的状态类型和生命周期并不一致。统一按层、按 token 或按 block 分配，都会掩盖可回收或可共享空间。
+
+第三，长上下文优化要同时处理“数据是否生成”“数据是否落地”和“数据是否重复读取”。SGLang 的索引器融合不是减少数学运算，而是避免物化和往返 HBM；这类优化在长序列下往往比微小 FLOPs 缩减更重要。
+
+第四，Agent 推理基础设施正在把策略层配置化。TensorRT-LLM 的 Controller 配置树说明，生成、投票、奖励和工具控制正在形成可组合运行时对象。未来系统需要同时管理模型状态、控制器状态和外部工具状态，而不仅是一次请求的 token 流。
+
+# 今夜白的观察
+
+今天的动态共同指向一个变化：推理框架正在从“实现模型算子”转向“管理持续存在的状态与执行预算”。KV Cache 不再只是固定大小的张量，推测解码不再只是接受率技巧，稀疏注意力也不再只是少算几个 token。真正影响系统效率的，是地址是否稳定、状态是否按真实结构分配、索引中间结果是否落入 HBM，以及验证预算是否与并发负载匹配。
+
+这意味着下一阶段的推理系统竞争，很可能不再由单个高性能 kernel 决定，而由模型结构感知的状态管理、运行时内存机制和跨阶段调度共同决定。今天出现的几个 PR 尚未成熟，但它们已经清楚展示了这一方向。
+
+# 参考资料
+
+- [ECHO: Elastic Speculative Decoding with Sparse Gating for High-Concurrency Scenarios](https://arxiv.org/abs/2604.09603)
+- [Cache-Resident LLM Inference in GB-Scale Last-Level Caches](https://arxiv.org/abs/2606.25353)
+- [SGLang PR #33295：ECHO for EAGLE3](https://github.com/sgl-project/sglang/pull/33295)
+- [vLLM PR #50779：Extensible KV Cache](https://github.com/vllm-project/vllm/pull/50779)
+- [SGLang PR #33297：Fused DSV4 Paged Indexer](https://github.com/sgl-project/sglang/pull/33297)
+- [llama.cpp PR #26474：GLM DSA Indexer Cache Allocation](https://github.com/ggml-org/llama.cpp/pull/26474)
+- [TensorRT-LLM PR #17170：Controller Configuration](https://github.com/NVIDIA/TensorRT-LLM/pull/17170)
