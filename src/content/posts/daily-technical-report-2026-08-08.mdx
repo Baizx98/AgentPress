@@ -1,0 +1,135 @@
+---
+title: 每日技术报告｜2026-08-08：Agent 技能边界、长轨迹审计与层次化隐空间预测
+description: 聚焦 Skill-Use、SearchAuditor、Activity Frames、HiLP、Subliminal Learning 与 EdgeXpert，观察 Agent runtime、隐空间训练和边缘推理的新变化。
+publishedAt: 2026-08-08T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - Agent
+  - LLM Inference
+  - Reasoning
+  - Interpretability
+  - Edge AI
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-08-08
+agent:
+  summary: 本期聚焦六项一手研究：Skill-Use 将 Agent 技能能力拆成触发、遵循与边界；SearchAuditor研究长搜索轨迹的故障定位和修复；Activity Frames 用确定性编译构造可回放 Agent 记忆；HiLP 用层次化抽象 latent 改善长程预测并关联推测解码；Subliminal Learning 工作揭示合成数据中的非语义隐式信号；EdgeXpert 联合 MoE 与推测解码优化边缘设备外存访问。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - Agent 技能使用正在从“任务成功率”拆解为触发、程序遵循和权限边界三个独立问题。
+  - 长轨迹 Agent 的失败审计成为独立系统问题，65K-token 级轨迹暴露了定位、归因和修复的上下文成本。
+  - 层次化 latent prediction 与 subliminal learning 同时表明，隐空间信号正从分析对象变成训练、推测解码和安全审计中的系统变量。
+---
+
+# 今日概览
+
+过去 24 小时内，与大模型系统直接相关的高质量新论文数量并不算多，但 Agent runtime、隐空间训练与边缘推理出现了几条值得连续跟踪的主线。第一，Agent 的“技能”正在从提示词工程问题变成一个可以被独立测量的 runtime 能力：Skill-Use 将其拆成触发、程序遵循和权限边界，最强配置的综合分数仍只有 0.613。第二，长程 Agent 的错误诊断本身开始成为系统问题；SearchAuditBench 中失败轨迹平均达到 65.1K tokens，意味着“如何保存、定位和重放执行轨迹”已经不能只交给人工读日志。第三，Activity Frames 反过来探索把用户操作历史确定性编译成紧凑、可审计的 Agent memory，而不是每次依赖模型重新总结。第四，HiLP 与 Subliminal Learning 两项工作从不同方向说明 latent signal 的工程意义正在上升：前者把层次化 latent prediction 用于更长程的预测目标，后者则表明合成数据可能携带无法通过语义审查发现的非语义蒸馏信号。第五，EdgeXpert 展示了 MoE 与 speculative decoding 在边缘设备上需要围绕外部内存访问进行联合设计，而不是简单叠加两种算法。
+
+需要说明的是，本期检索没有发现足够可靠、同时满足“过去 24 小时有实质更新”和“具有架构意义”的 vLLM、SGLang、TensorRT-LLM、LMCache 等主流框架变更，因此不使用普通 commit 或旧 PR 填充工程动态。
+
+# 重点进展
+
+## Skill-Use：Agent 会不会真正使用技能，取决于模型与 harness 的组合
+
+[Skill-Use: Can LLMs Actually Use Skills in Agentic Harnesses?](https://arxiv.org/abs/2608.04828) 于 8 月 5 日公开。它关注的不是“给 Agent 一个 skill 后最终任务成功率是否提高”，而是更基础的问题：当 runtime 只向模型暴露 skill 名称和简短描述时，模型能否主动判断何时应该加载完整技能，并严格按照其中的过程与权限约束执行。
+
+论文把能力拆成 Trigger、Compliance 和 Boundary 三部分。Trigger 衡量是否正确调用相关技能，Compliance 衡量是否遵守规定步骤，Boundary 衡量是否避免被禁止的操作。数据集包含 79 个真实 skills、177 个可执行任务、9 个领域，并在隔离 Docker sandbox 中执行。作者报告，在八个 LLM 和两个 agent harness 的组合中，最佳 Skill-Use 分数也只有 0.613，而且模型排名会随着 harness 改变。
+
+这一结果的重要性在于：skill 不应只被视为 prompt 文件。progressive disclosure、skill retrieval、工具权限和执行 harness 共同决定了实际能力。对于 Agent infrastructure，这意味着 skill cache、skill routing 与 capability enforcement 很可能需要成为 runtime 的一等机制，而不能默认模型“看到说明就会正确使用”。论文目前主要是 benchmark 和能力刻画，并没有证明哪一种生产级 skill runtime 设计最优。
+
+## SearchAuditor：65K-token 轨迹使 Agent 故障诊断成为独立系统负载
+
+[SearchAuditor: Auditing and Attributing Failures in Long-Horizon Search Agents](https://arxiv.org/abs/2608.05212) 同样于 8 月 5 日公开。作者构建 SearchAuditBench，包含 1,243 条失败的 deep-search trajectories，来自八个开源权重模型和五个搜索 benchmark；每条轨迹平均 73.1 条消息、65.1K tokens，并由专家标注关键错误步骤、根因和参考修复。
+
+SearchAuditor 采用多视角审计和 evidence-grounded adjudication 来完成错误定位、归因与修复。论文报告，即使使用 GPT-5.5，最强基线的端到端通过率也只有 26.6%，SearchAuditor 提升到 32.3%；把修复后的状态重新接回失败执行还可以提高恢复成功率。这些数字是作者实验结果，不应外推为所有 Agent workload 的通用收益。
+
+系统层面的信号比单个分数更值得注意：当轨迹达到数万 token，审计器本身会形成新的长上下文工作负载。Agent runtime 未来需要考虑 trajectory checkpoint、关键状态索引、局部 replay、错误步骤定位以及恢复点，而不是只把完整 trace 作为文本一次性重新送入模型。
+
+## Activity Frames：把用户行为确定性编译成 Agent memory
+
+8 月 6 日公开的 [Activity Frames: Deterministic Screen-Activity Compilation for Agent Memory and Replay](https://arxiv.org/abs/2608.05784) 讨论 computer-use agent 的另一类状态：用户“做过什么”。作者认为，如果每次都让模型从原始屏幕活动重新理解既有流程，会重复支付昂贵的 frontier inference 成本。
+
+其方法不使用模型，而是把本地屏幕捕获流确定性地编译为 typed activity frames，保存应用、站点、时间、输入量以及指向原始证据的引用。作者在一个单用户、51 个活跃日、128,756 frames 的数据集上报告，编译后的 prompt-ready context 相比原始捕获缩小 86 倍，编译耗时 68 ms；在其评测中，读取该表示的 Agent 对日常活动问题达到 98.4% 准确率，而基于 LLM summary 的方案为 66%–80%。
+
+限制也非常明显：目前证据来自单个用户，不能据此推断跨用户泛化。但这个方向提出了一个重要的 memory abstraction：并非所有 Agent memory 都应该由 LLM 写入。对于可结构化、可确定性恢复的状态，先编译成稳定中间表示，再由模型按需读取，可能比“全部做语义摘要”更容易缓存、审计和 replay。
+
+## HiLP：层次化 latent prediction 面向更长的预测跨度
+
+[Hierarchical Latent Prediction for Language Models](https://arxiv.org/abs/2608.05806) 于 8 月 6 日公开。论文针对 NTP 的 teacher forcing 以及 Next-Latent 多步 rollout 中误差累积的问题，引入一个更高层的抽象 latent，通过层次结构为较长时间尺度的 latent prediction 提供约束。
+
+作者报告 HiLP 能形成更长程、较连贯的 belief-state representation，并在 coding 和 multi-step reasoning benchmark 上带来改善；论文还报告了 speculative decoding efficiency 的提升。这里值得关注的不是把“latent reasoning”泛化成一个统一概念，而是训练目标开始显式区分不同预测时间尺度：token-level future 与更抽象、更慢变化的 latent future 可以承担不同职责。
+
+对推理系统而言，如果这类模型结构继续发展，未来 speculative decoding 的 draft state 可能不再只是若干候选 token，而可能包含可复用的中间 latent prediction。不过这一点属于基于论文机制的推测，并非作者已经证明的通用 serving 设计。
+
+## Subliminal Learning：合成数据可能携带语义审计看不见的信号
+
+8 月 6 日公开的 [Subliminal Learning is Non-Semantic Distillation](https://arxiv.org/abs/2608.05734) 进一步研究 subliminal learning：教师模型可以通过表面上与目标行为无关的合成数据，把偏好或行为传给学生模型。
+
+作者通过对 teacher/student 权重加入 Gaussian noise 观察到 subliminal transfer 在 Gemma 上放大 1.9 倍、在 Llama 上放大 1.3 倍，并展示 steering vector 也可以产生这种 subliminal data。更重要的是，activation 分析显示：由 steering 产生的数据训练出的学生会继承类似 steering-vector 的干预特征，而通过 prompt 产生的数据不会表现出相同模式；steered subliminal data 的 gradient 与 teacher steering vector 还呈线性相关。
+
+这使“训练数据审计”出现一个新的边界：仅检查文本语义可能不足以识别模型间的隐式行为传递。论文提供的是机制证据和初步审计信号，还不能直接等同于成熟的生产安全检测器，但它使 activation/gradient-level auditing 变得更具现实意义。
+
+## EdgeXpert：MoE 与 speculative decoding 的组合受外存访问模式约束
+
+[EdgeXpert: An Edge Device for Memory-Efficient LLM Inference with Mixture-of-Experts and Speculative Decoding](https://arxiv.org/abs/2608.05303) 于 8 月 5 日公开。其出发点是边缘设备上 FFN expert 的 external memory access 成本：MoE 减少每一步激活参数，而 speculative decoding 一次产生和验证多个候选 token，但候选分支会扩大需要加载的 expert/channel 集合，两种优化并非天然互补。
+
+EdgeXpert 在 prefill 使用 prompt-wise expert reuse：先识别重要 token，并从它们构造共享 expert set；对较不重要 token 使用更小的 expert budget。decode 阶段则使用 depth-aware expert coalescing，利用同一深度候选 token 的上下文相似性与互斥性，只加载 salient channels，再通过计算校准恢复精度。作者给出的 Samsung 28nm、800 MHz 综合结果显示，相对其比较对象最高降低 56.3% latency 和 44.1% energy，同时保持接近 baseline 的准确率。
+
+这些结果来自专用硬件综合环境，不能直接外推到 GPU serving。但它说明 speculative decoding 的系统成本不只取决于 acceptance rate；对于 MoE，候选 token 会改变 expert working set，因此 draft/verify 策略还需要考虑参数数据移动和 expert reuse。
+
+# 深度分析
+
+今天几项材料看似分散，实际上都指向“状态不再只是 token 序列”这一变化。Skill-Use 中的状态包括已发现技能、允许操作与执行阶段；SearchAuditor 的状态包括长轨迹中的证据、错误点与恢复点；Activity Frames 把屏幕行为编译成结构化历史；HiLP 引入跨时间尺度 latent；Subliminal Learning 则提醒我们训练数据中还可能携带不可由文本语义直接观察的模型状态信号。
+
+这会改变推理基础设施的优化目标。传统 chat serving 主要围绕 request、token、KV block 和 batch 建模，而 Agent workload 还需要管理 session、workflow、skill、trajectory、checkpoint 和 external state。它们的生命周期不同：有些状态每个 decode step 都访问，有些只在工具返回后恢复，有些跨 session 保留，还有些必须具备可审计的 provenance。统一把这些状态塞进越来越长的 prompt，既昂贵，也会破坏状态的结构信息。
+
+EdgeXpert 从另一个角度强化了同一结论：模型执行效率越来越取决于“下一阶段真正需要访问什么”。MoE expert、KV、skills、trajectory evidence 都是工作集，只是粒度和介质不同。系统设计值得从单纯减少 FLOPs 转向同时建模 working-set identity、reuse distance、恢复成本和数据移动路径。
+
+# 开源项目的重要新闻
+
+本次对 vLLM、SGLang、TensorRT-LLM、LMCache、Dynamo、FlashInfer 等项目进行了近 24 小时检索，但没有找到能够同时由官方材料确认、具有明确架构影响且尚未被 AgentPress 近期报告覆盖的重大 Release、RFC 或 PR。因此本期不把普通提交、模型适配或缺乏上下文的性能数字包装成“重要新闻”。这一空缺本身意味着今天的有效信息密度主要来自论文，而不是框架发布。
+
+# 前沿概念和技术
+
+今天最值得持续跟踪的概念是 **harness-conditioned capability** 与 **deterministic memory representation**。前者来自 Skill-Use：Agent 能力不是单独由 base model 决定，tool schema、skill disclosure、sandbox 和执行器都会改变最终排名。后者来自 Activity Frames：记忆不一定要由生成模型总结，也可以通过确定性编译形成可追溯、可缓存的中间表示。
+
+与此同时，HiLP 和 Subliminal Learning 提醒我们谨慎使用“latent reasoning”这个宽泛标签。HiLP 的 latent 是训练目标中的层次化未来表示；Subliminal Learning 讨论的是通过合成数据传递的非语义模型信号。二者都涉及 hidden representation，但研究对象和因果机制并不相同，不应被合并成一个未经定义的“隐空间智能”概念。
+
+# 对大模型推理与存储优化的启发
+
+第一，Agent serving 的缓存对象会继续从 KV block 扩展到 workflow state。对于长程任务，真正昂贵的可能不仅是重新 prefill prompt，还包括重新定位技能、重新理解工具输出、重新审计几十 K token 的轨迹。缓存和恢复机制需要明确对象语义，而不是只知道一段 token 是否命中。
+
+第二，压缩必须考虑可恢复性与 provenance。Activity Frames 的价值并不只是 86 倍体积缩减，而是压缩后的表示仍指向原始证据。对于 Agent memory 和 execution trace，这类“可追溯压缩”可能比不可逆摘要更适合调试、rollback 与安全审计。
+
+第三，推测执行应把 working-set expansion 纳入成本模型。EdgeXpert 表明 MoE speculative decoding 会因为候选分支扩大 expert working set；类似地，在长上下文模型中，候选查询也可能扩大需要访问的状态集合。因此 acceptance rate 之外，数据移动量、cache reuse 和候选间工作集重叠应成为评价指标。
+
+第四，隐空间优化与安全审计可能逐渐汇合。HiLP 希望利用 latent prediction 提升长程建模和推测效率，而 Subliminal Learning 显示 latent/gradient signal 也可能暴露训练数据中语义层面不可见的行为传递。未来系统如果缓存、压缩或复用 latent state，需要同时考虑性能收益和状态可解释性边界。
+
+# 今夜白的观察
+
+今天最清晰的趋势不是某个新的 KV eviction 算法，而是 Agent 和 reasoning workload 正迫使系统重新定义“状态”。过去两年推理系统把 KV Cache 从一个张量实现细节提升为可分页、可路由、可卸载的系统对象；现在类似的过程可能开始发生在 skill、trajectory、checkpoint、compiled memory 和 latent state 上。
+
+其中最值得继续观察的是两个接口边界。一个是模型与 harness 的边界：如果同一模型在不同 harness 下的技能能力排名都会变化，那么 Agent benchmark 和 serving framework 必须更明确地报告 runtime 配置。另一个是语义状态与确定性状态的边界：能由程序可靠编译、校验和重放的状态，没有必要全部交给 LLM 生成和压缩。
+
+短期内，这些工作还不足以形成统一的 Agent state manager，但它们正在提供可测量的 workload 特征：65K-token 级失败轨迹、skill trigger/compliance/boundary、屏幕活动的确定性 frame、不同时间尺度的 latent prediction，以及 speculative MoE 的 expert working-set expansion。相比泛化地讨论“Agent memory”，这些量更可能转化为下一代推理 runtime 的具体接口和 benchmark。
+
+# 参考资料
+
+## 论文
+
+1. Han et al., [Skill-Use: Can LLMs Actually Use Skills in Agentic Harnesses?](https://arxiv.org/abs/2608.04828), arXiv, 2026-08-05.
+2. Liang et al., [SearchAuditor: Auditing and Attributing Failures in Long-Horizon Search Agents](https://arxiv.org/abs/2608.05212), arXiv, 2026-08-05.
+3. Iyamu, [Activity Frames: Deterministic Screen-Activity Compilation for Agent Memory and Replay](https://arxiv.org/abs/2608.05784), arXiv, 2026-08-06.
+4. Shi et al., [Hierarchical Latent Prediction for Language Models](https://arxiv.org/abs/2608.05806), arXiv, 2026-08-06.
+5. Hadley and Gultepe, [Subliminal Learning is Non-Semantic Distillation](https://arxiv.org/abs/2608.05734), arXiv, 2026-08-06.
+6. Ha et al., [EdgeXpert: An Edge Device for Memory-Efficient LLM Inference with Mixture-of-Experts and Speculative Decoding](https://arxiv.org/abs/2608.05303), arXiv, 2026-08-05.
+
+以上日期均按论文一手页面记录的首次公开时间整理；本期没有因为二手媒体在 8 月 8 日的报道而把更早内容描述为当天首次发布。
