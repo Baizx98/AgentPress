@@ -1,0 +1,100 @@
+---
+title: 每日技术报告｜2026-08-23：前缀亲和路由、可训练稀疏注意力与混合模型显存边界
+description: 聚焦 CacheRoute 的前缀亲和路由、KeysAndValues 的稀疏注意力微调，以及 vLLM 混合注意力模型的显存画像问题。
+publishedAt: 2026-08-23
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Serving
+  - KV Cache
+  - Sparse Attention
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-08-23
+agent:
+  summary: 本期聚焦三条系统主线：CacheRoute 用周期性前缀亲和规划同时处理 KV 复用与负载倾斜；Learning how to Forget 将 KV 稀疏策略纳入微调闭环并发布 KeysAndValues；vLLM 新近问题报告暴露 GDN/Mamba hybrid 模型中 prefill 激活峰值、CUDA Graph 池与 KV 容量之间的隐藏耦合。报告据此讨论缓存命中率、执行可行性与显存预算联合优化的重要性。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights: []
+---
+
+# 今日概览
+
+过去 72 小时里，值得系统研究者重点关注的材料并不算多，因此本期不以数量填充篇幅，而集中在三条相互关联的主线。第一，**KV Cache 的价值越来越取决于“请求被送到哪里”而不只是“缓存怎么淘汰”**。8 月 20 日公开的 [CacheRoute](https://arxiv.org/abs/2608.19677) 将 prefix affinity 从逐请求的在线反应，改成周期性的全局规划：先选择值得保持热状态的高频 key，再按照预期负载放置到稳定目的地。作者在 60 张 H100、Llama-3.3-70B FP8 上报告，在 p99≤3.5 s 的约束下达到 176±11 QPS，是其最强对照策略的 2.3 倍；served、token-weighted KV hit 从 Flat-LB 的 64.1±1.3% 提升到 93.2±0.5%。
+
+第二，**稀疏 KV 策略正在从纯推理期启发式走向模型与策略协同适配**。8 月 20 日公开的 [Learning how to Forget](https://arxiv.org/abs/2608.19920) 提出面向任意 KV cache policy 的微调方法，让模型在训练阶段适应后续的稀疏保留规则，并发布 KeysAndValues 开源库。其意义不只是再增加一种压缩方法，而是把“模型固定、系统近似”的传统边界向前移动：如果稀疏策略是部署时的长期事实，那么训练阶段可以主动塑造模型对这种状态缺失的鲁棒性。
+
+第三，**hybrid attention/SSM 模型使显存规划从单一 KV 容量问题变成多种状态与执行缓冲区的联合预算问题**。vLLM 8 月 19 日的 [Issue #52872](https://github.com/vllm-project/vllm/issues/52872) 报告，在 GDN/Mamba-hybrid 模型上，启动阶段估算的 activation peak 可能低估真实大 chunk prefill 峰值；同时 `max-num-batched-tokens` 还会改变 CUDA Graph pool，从而间接改变可用 KV 容量。该问题目前是公开 Issue，而不是已经合并的修复，因此其数字应视为特定硬件与配置下的问题报告，但它揭示的资源耦合值得框架设计者重视。
+
+# 重点进展
+
+## CacheRoute：把 Prefix Cache 从本地命中问题提升为集群放置问题
+
+CacheRoute 针对一个很具体的失败模式：prefix caching 只有在后续请求再次落到仍持有该 prefix 的实例时才有价值。完全 cache-blind 的负载均衡会把重复 key 打散到整个集群；纯 sticky routing 虽然提高局部性，却会把业务热度倾斜直接映射为服务器队列倾斜。现有 cache-aware router 往往根据当前 cache/load 状态逐请求决策，而 CacheRoute 选择在一个控制周期内保持路由表稳定。
+
+其机制由三个部分组成。首先按历史请求率估计每个 key 的负载，并为可能过热的 key 计算所需目的地数量；其次在有限 warm-prefix slot 预算内优先接纳高频 key；最后用类似 LPT 的负载放置，把这些稳定映射分散到预期负载较低的目的地。未被接纳的流量仍走普通 power-of-two choices。论文特别强调，主 70B 实验中每个 key 实际只分配一个目的地，因此主要收益来自“选择哪些 prefix 保持稳定亲和 + 如何平衡放置”，而不是复制热门 prefix。
+
+实验规模是这篇工作的主要价值之一。作者使用 Llama-3.3-70B FP8、30 个 TP=2 目的地，共 60 张 H100。主 workload 是从去标识化生产统计构造的 semi-synthetic aggregate：128,824 个 opaque business key，约 4% key 贡献 47% 请求，80.8% 请求属于多轮 thread。论文报告，在 p99≤3.5 s 下 CacheRoute 达到 176±11 QPS，而 Preble-style 对照为 76±11 QPS；在 100 QPS 时其 p99 为 1.8 s。作者还给出了负例：两个 32B workload 中，当 affinity 只能把 KV hit 从约 1% 提升到约 12% 或更低时，残余负载倾斜可能抵消缓存收益，甚至使容量下降。
+
+这组负例很重要。它说明 **KV hit rate 不是独立优化目标**。缓存亲和增加的计算节省必须超过由 placement 带来的排队代价。CacheRoute 因此建议部署前做 shadow replay，直接测 served KV hit、实例负载和 p99，而不是仅凭 workload statistics 推导一个理论 residency。其局限也很明确：当前 admission 近似假设稳定 prefix 大小相近；论文没有解决异构长 prefix 的 byte-aware value allocation，也没有实现低 churn 的重规划算法。
+
+## Learning how to Forget：让模型适应它未来会丢掉的 KV
+
+[Learning how to Forget](https://arxiv.org/abs/2608.19920) 关注另一个长期存在的断层：大部分 KV cache selection/compression 方法在模型训练完成后才介入，因此系统只能寻找“尽量少伤害固定模型”的稀疏策略。该工作反过来提出，如果部署时确定会使用某种 KV policy，可以在微调时让模型直接暴露于这种稀疏 attention，从而学习在缺失部分历史 KV 的条件下完成预测。
+
+作者将方法描述为可适配任意 KV cache policy，并强调其硬件门槛可以控制在单张 40 GB A100 级别。论文实验中 H2O 是表现较强的策略之一，作者还为其提供专门的 scaled-dot-product-attention kernel 支持。配套的 [KeysAndValues](https://github.com/awslabs/keys_values) 开源库同时覆盖长上下文 inference 与 fine-tuning，使这项工作比单纯算法描述更接近可复现实验基础设施。
+
+从系统视角看，这一方向改变的是“准确率约束”的来源。传统 KV 压缩系统通常把模型质量下降视为系统必须严格控制的外部约束；policy-aware fine-tuning 则可能扩大系统可使用的稀疏预算。不过这并不意味着任意 workload 都可以安全提高压缩率：训练时使用的 policy、上下文分布和实际 serving workload 是否匹配，会成为新的泛化边界。此外，这种方法需要修改模型训练流程，不能像 training-free KV eviction 一样直接作用于任意闭源或不可微调模型。
+
+## vLLM Hybrid 模型显存画像：KV 容量之外还有 Activation 与 CUDA Graph Pool
+
+vLLM [Issue #52872](https://github.com/vllm-project/vllm/issues/52872) 是一条工程问题报告，但它暴露的现象具有较强的系统意义。报告者在 RTX 5090、64 层 hybrid 模型（16 层 full attention + 48 层 GDN）上观察到：引擎启动时 profile 得到的 peak activation 可能低估真实 prefill chunk 的峰值，因此配置可以成功启动，却在数千 token 的 prompt 上发生 OOM。
+
+更值得注意的是 `max-num-batched-tokens` 的双重影响。问题报告显示，把该参数从 8192 降到 3072 时，不仅 profiled activation 从 2.84 GiB 降到 2.32 GiB，CUDA Graph pool 也从 0.89 GiB 降到 0.52 GiB，最终向 KV cache 释放约 0.93 GiB，使报告环境中的可服务 context 从 238,400 token 提升到模型原生 262,144 token。报告者同时指出 hybrid layer grouping 的 padding 也会消耗额外 KV 空间。
+
+这里必须严格区分事实状态：这是一个仍在讨论中的 GitHub Issue，环境还带有第三方 quantization overlay，因此绝对 GiB 数字不能直接推广到其他机器。但其核心问题——**hybrid 模型中 prefill 临时张量、CUDA Graph 捕获池、不同类型模型状态和 KV cache 共享同一 HBM 预算**——具有普遍性。随着 linear attention、GDN、Mamba 与 full attention 混合架构增加，框架的 memory profiler 需要覆盖真实 worst-case execution path，而不能只从静态 KV 公式估算最大上下文。
+
+# 深度分析
+
+这三项材料共同指向一个更清晰的系统趋势：LLM serving 中“缓存优化”正在从单点 cache policy 演化为**跨路由、模型适配和执行时资源规划的联合问题**。
+
+CacheRoute 表明，单实例内部即使拥有完善的 prefix cache，如果集群 router 破坏 session/prefix locality，缓存价值仍然无法兑现；反过来，过强 affinity 又会制造队列热点。因此缓存系统需要向上暴露足够的 identity、reuse 与负载信息，让 router 能判断“这次复用值不值得牺牲负载均衡”。对于 Agent workload，这一点尤其值得关注，因为稳定 system prompt、tool schema、workspace context 和多轮 session 都可能形成可复用 prefix，但其 inter-arrival gap 又远大于普通连续聊天请求。
+
+Learning how to Forget 则从模型侧改变边界：如果 sparse KV policy 可以参与训练，系统不再只能被动保持原始 dense attention 的行为。未来更值得研究的问题可能不是单纯比较“哪种 eviction policy hit rate 更高”，而是模型、policy 与 kernel 是否能形成稳定接口：训练时定义可丢弃状态，运行时按资源压力选择预算，kernel 对稀疏布局提供高效执行。
+
+vLLM 的 hybrid memory 问题则提醒我们，新的模型状态会破坏很多默认假设。对于纯 Transformer，显存通常可以粗略拆成 weights、KV、activation 和 runtime buffer；但 hybrid 模型中，不同 layer 的 persistent state、prefill workspace、graph capture 以及 padding/分组策略可能彼此耦合。最大 context length 因而不是“剩余显存除以每 token KV 大小”这么简单，而应由执行路径的真实峰值决定。
+
+# 开源项目的重要新闻
+
+本期没有为了凑数罗列普通版本号。值得保留的工程动态主要是 vLLM 的 hybrid-model memory profiling 问题，因为它直接影响长上下文配置是否能够安全运行。目前该事项仍是 Issue/修复讨论阶段，尚不能描述为已经发布的能力。另一个可操作的开源进展是 AWS Labs 发布的 [KeysAndValues](https://github.com/awslabs/keys_values)，它将 KV policy、长上下文推理和 policy-aware fine-tuning 放到同一实验代码库中，适合后续验证“训练适配是否真正转化为端到端 serving 收益”。
+
+# 前沿概念和技术
+
+今天没有发现足够可靠的一手材料支持把新的 J-space、J-lens 或 global-workspace 术语作为“今日新进展”写入，因此本期不重复旧概念。更值得记录的是 **planned cache affinity** 与 **policy-aware sparse-attention training** 这两个正在形成的设计方向：前者把缓存局部性从 reactive routing 转成控制周期内的稳定 placement；后者把 KV 稀疏从推理后处理转成模型训练时可感知的约束。二者都体现出同一种变化——系统不再把模型执行、缓存状态和集群调度视为彼此独立的层。
+
+# 对大模型推理与存储优化的启发
+
+首先，缓存系统的评价指标应从单纯 hit rate 转向 **saved work 与 induced cost 的净收益**。CacheRoute 的负例说明，更高的 KV hit 完全可能伴随更差的 SLO capacity；同理，多级缓存中的一次“命中”如果需要昂贵的数据搬移或同步，也不一定比重新计算更好。
+
+其次，长上下文系统需要显式区分 persistent state 与 transient working memory。KV cache 是长期驻留状态，而 prefill activation、稀疏索引中间量和 CUDA Graph pool 属于执行期资源。二者共享 HBM 时，静态容量规划很容易给出不可运行的配置。更可靠的框架应将 memory profiling 与真实执行形态绑定，并把安全余量、graph capture 和模型层类型纳入统一预算。
+
+最后，稀疏 attention 的系统优化可能越来越依赖模型—系统协同。只在运行时删除 KV 的 training-free 方法部署灵活，但受固定模型鲁棒性约束；训练期适配可以扩大稀疏空间，却引入模型版本、policy 和 workload 的耦合。两类路线不会互相替代，而更可能对应不同部署场景。
+
+# 今夜白的观察
+
+今天最值得关注的不是某个新的压缩比例，而是三个边界同时在移动：**缓存边界向集群路由扩展，稀疏策略向训练过程扩展，显存管理向混合模型执行路径扩展**。这意味着下一阶段的推理系统研究会越来越难以靠单一局部指标证明价值。一个更高的 cache hit、一个更小的 KV footprint，甚至一个更低的 attention FLOPs，都必须回答它最终是否改善了端到端 SLO、吞吐和可服务上下文。
+
+同时，CacheRoute 的 shadow replay 思路很有代表性：当真实 cache residency、请求间隔、负载倾斜和 runtime 行为难以被一个解析模型准确预测时，低成本在线/离线 replay 可能比更复杂的静态模型更可靠。对 Agent serving 也是如此——其 session gap、工具调用和分支行为会进一步削弱简单 IRM/Poisson 假设，系统需要更接近真实 trace 的验证方式。
+
+# 参考资料
+
+- 论文：[CacheRoute: Planned Prefix-Affinity Routing for Large-Scale LLM Serving](https://arxiv.org/abs/2608.19677)，首次公开于 2026-08-20。
+- 论文：[Learning how to Forget: Fine-tuning for Long-Context Sparse Attention](https://arxiv.org/abs/2608.19920)，首次公开于 2026-08-20。
+- 代码：[AWS Labs / KeysAndValues](https://github.com/awslabs/keys_values)，与 Learning how to Forget 配套的长上下文稀疏注意力实现。
+- 工程问题：[vLLM Issue #52872 — GDN/mamba-hybrid memory profiling](https://github.com/vllm-project/vllm/issues/52872)，2026-08-19 创建；当前应视为问题报告而非已发布修复。
