@@ -1,0 +1,132 @@
+---
+title: 每日技术报告｜2026-09-01：上下文开始由 Agent 主动管理，KV 驱逐走向概率化，Harness 进入系统抽象层
+description: 聚焦 ContextPilot、概率化 KV Cache 驱逐、Logos 跨进程 Agent Harness、CrabOS、工具调用隐藏状态审计与 Sliding-Window Attention 等近期一手进展。
+publishedAt: 2026-09-01T09:03:24+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Serving
+  - KV Cache
+  - Agent Systems
+  - Context Management
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-01
+agent:
+  summary: 本期聚焦状态管理成为 LLM serving 与 Agent runtime 的共同主线：ContextPilot 用细粒度 RL 训练 Agent 主动规划、记忆与卸载上下文；概率化 KV Cache eviction 将驱逐统一为期望估计并讨论 decode-time correction；Logos 将 Agent harness 拆分到跨进程故障域，CrabOS探索人机共享工作状态；另介绍隐藏状态 probe 对错误工具调用的检测，以及 Sliding-Window Attention 对 post-trained linear attention 的强基线挑战。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - ContextPilot 将上下文管理从固定规则推进为带细粒度 credit assignment 的可学习 Agent 策略。
+  - KV Cache eviction 被形式化为概率期望估计问题，并引入 decode-time correction 视角。
+  - Logos、CrabOS 与隐藏状态 probe 显示 Agent runtime 正走向显式状态、故障隔离和内部审计。
+---
+
+# 今日概览
+
+今天值得关注的主线不是某一个模型参数继续变大，而是**状态管理正在同时进入推理系统和 Agent runtime 的核心设计**。arXiv 在 8 月 31 日集中展示的一批新工作里，一端是 KV Cache 驱逐开始从经验启发式走向概率推断，另一端是 Agent 不再被动携带不断增长的对话历史，而是主动编辑上下文、显式管理工作状态，甚至把 harness 本身提升为跨进程系统抽象。
+
+第一，**KV Cache eviction 正在被重新形式化**。Renato Geh 等人的工作不再只问“哪些 token 可以删”，而是把驱逐解释为概率期望估计，并进一步讨论驱逐后 decode 阶段如何校正被删除条目造成的偏差。这一点重要，因为它把大量依赖 attention score、位置或启发式规则的方法放进了一个统一的统计视角。
+
+第二，**Agent context management 从规则触发走向模型主动决策**。腾讯优图、清华与上海 AI Lab 的 ContextPilot 将 planning、long-term memory 和 soft context offloading 都纳入可学习的上下文管理动作，并针对这些高影响动作设计细粒度 RL credit assignment。它意味着“上下文怎么留、什么时候压缩、什么信息移出工作集”正在成为模型可学习的策略，而不只是 runtime 的固定阈值。
+
+第三，**Agent harness 正在变成真正的系统研究对象**。Logos 用跨进程 bus 将插件拆到不同故障域；CrabOS 则尝试把人和 Agent 共同操作的任务状态提升到 OS 级共享对象。两者虽然目标不同，却都在挑战“Agent = 单进程模型循环 + 一段 conversation history”的默认实现。
+
+第四，**隐藏状态监控开始进入工具调用安全链路**。针对 18 个 tool-calling LLM 的研究表明，线性 probe 可以从模型内部状态检测多类错误工具调用，包括常规日志未必能识别的“参数类型正确但值错误”。这为 Agent runtime 增加了一个区别于文本输出校验的新审计面。
+
+# 重点进展
+
+## ContextPilot：让 Agent 学会主动管理自己的工作上下文
+
+[ContextPilot](https://arxiv.org/abs/2608.28476) 于 8 月 28 日提交，并进入 8 月 31 日 arXiv recent 列表；论文已被 EMNLP 2026 Main Track 接收，代码也已公开。作者指出，现有 proactive context management 虽然允许模型调用 search、delete、summarize 等工具，但工具集合仍偏窄，而且传统 RL 往往把最终轨迹奖励粗粒度地分配给所有中间上下文编辑动作。
+
+ContextPilot 的核心改动有两层。第一层是把 **planning、long-term memory 和 soft context offloading** 加入上下文工具集，使 Agent 不只是“删历史”，还可以主动构造长期状态和调整当前工作集。第二层是专门面向 context editing 的 RL：系统根据 context variation 与 entropy variation 找出关键编辑动作，对这些节点进行 partial rollout，并利用所有经过该动作的后续分支估计 action-level advantage。换言之，训练过程开始区分“普通一步工具调用”和“会改变后续整个信息环境的上下文操作”。
+
+论文在 long-context QA 与 deep search 上报告了更紧凑的工作上下文和更高任务性能。需要注意的是，当前证据主要来自论文设定中的长程信息任务；这种策略在代码 Agent、GUI Agent 以及强环境状态任务中能否保持收益，还需要进一步验证。但它给出了一个明确趋势：**context lifecycle 本身正在从 runtime policy 变成 learned policy**。
+
+## A Probabilistic Interpretation of KV Cache Eviction：把 KV 驱逐从启发式变成估计问题
+
+[A Probabilistic Interpretation of KV Cache Eviction](https://arxiv.org/abs/2608.28293) 由 Renato Geh、Alex Chen、Daniel Israel、Aditya Grover 和 Guy Van den Broeck 提出。作者首先形式化 KV eviction，并证明一般问题具有计算困难性；随后从概率推理角度将其转化为 expectation estimation，再用 sampling 近似。
+
+更值得关注的是论文对现有 eviction 方法的重新解释：作者认为一批既有方法可以视为**零方差但有偏的估计器**。在这个框架下，过去经常被忽略的问题——“KV 已经删掉以后，decode 时如何修正其缺失造成的估计偏差”——变成可以显式处理的对象。论文报告称，在相同压缩预算下，加入 decode-time correction 的概率化方案对不同任务表现得更稳健，并保持有竞争力的性能。
+
+这项工作的价值不只是多一个 eviction policy。KV 压缩长期存在一个结构性问题：选择阶段往往使用局部 attention 或统计信号，但最终优化目标是未来 token 的输出质量。概率化表述至少提供了一条把“选择误差”和“输出误差校正”连接起来的路径。其限制也很清楚：通用形式计算困难，实际系统仍必须依赖近似采样；因此最终能否进入高吞吐 serving，还取决于 estimator 和 correction 的额外计算是否能够被严格控制。
+
+## Logos：把 Agent 插件从单进程拆成跨进程故障域
+
+[Logos: An Agent Harness on a Cross-Process Bus](https://arxiv.org/abs/2608.28553) 是 8 月 31 日 arXiv 新近出现的 Agent systems 工作。论文关注一个很系统的问题：现代 Agent 会动态装配 memory、tool、planner、skill 等能力，但许多 harness 最终仍把它们放在同一个进程和上下文中，因此一个插件故障可能同时中断所有共驻 session。
+
+Logos 构造了一个类似 ROS 的 cross-process harness：插件本身成为独立进程，跨组件共享的核心状态收敛为 append-only transcript。作者报告，在 80 个 session 上，于 tool-call cycle 的四个边界注入 kill 后，session 能恢复且不重复产生 effect；与单进程参考配置相比，单个故障不再天然扩散到全部共驻 session。
+
+这项工作当前更像系统抽象与故障恢复原型，而不是成熟生产 runtime benchmark，但它指出了 Agent 基础设施正在出现的新边界：随着 Agent 执行时间增长、工具副作用增加、插件数量增多，**故障隔离、effect exactly-once、session recovery** 会逐渐成为和模型推理同样实际的问题。
+
+## CrabOS：把人和 Agent 的工作交接提升到 OS 级共享状态
+
+[CrabOS](https://arxiv.org/abs/2608.28165) 提出 Human-AI Co-inhabitation：不是让 Agent 通过截图、文本描述或每个应用单独设计的接口去“理解用户正在做什么”，而是让人和 AI 在同一个可审计工作状态上交替执行。
+
+其核心设计是把 work state 表示为人和 AI 都可以直接访问和修改的 natural-language-readable text objects，从而减少任务交接时额外构造 bridge 的需要。论文目前主要以 case study 展示复杂任务交替执行，因此不能据此推断它已经解决真实桌面环境中的性能、权限、并发一致性或兼容性问题。但这个方向值得关注：Agent runtime 的长期状态可能不应永远被压在 prompt、截图和应用 API 三者之间，而需要更原生的系统级表示。
+
+## 隐藏状态 Probe：在模型内部检测错误工具调用
+
+[The Calls are Coming from Inside the Model](https://arxiv.org/abs/2608.27750) 在 18 个 tool-calling LLM 上、结合 Berkeley Function Calling Leaderboard，研究线性 probe 是否能够识别错误工具调用。作者报告，probe 可以检测多类错误，包括“argument 类型正确但具体值错误”这类仅依赖常规调用日志不容易发现的问题，并且对未见错误类型具有一定泛化能力。
+
+论文同时指出，检测效果明显依赖模型规模、probe 所在层以及 post-training 类型。因此它并不能简单推出“给所有 Agent 加一个 probe 就能解决工具安全”。更准确的理解是：**模型内部状态提供了一个与输出日志互补的 runtime observability channel**。如果后续研究能证明这种信号在量化模型、不同 tool schema 和在线 serving 下仍稳定，它可能成为 Agent 审计的重要基础设施接口。
+
+## Sliding-window beats linear attention：简单局部注意力重新成为强基线
+
+[Sliding-window beats linear attention](https://arxiv.org/abs/2608.28444) 对“把已有 Transformer post-train 成 linear attention 就能低成本解决长上下文问题”提出了直接质疑。作者比较多个模型和任务后报告，带 attention sinks 的 Sliding Window Attention（SWA）能够达到或超过 post-trained linear attention；在 Needle-in-a-Haystack 和 BABILong 等长上下文任务中，论文报告 SWA 的结果可高出 2–10 倍。
+
+作者强调 SWA 不需要额外 post-training，内存需求受窗口限制，实现路径也成熟。因此，这篇论文真正有价值的地方不是宣布 linear attention 无效，而是提醒系统研究者：**新的状态压缩机制必须与足够强、足够便宜的有限窗口基线比较**。论文结论针对的是 post-trained linear attention；对于从头训练的线性/混合架构，作者自己也保留了空间，因此不能把结果外推为对所有 linear attention 的否定。
+
+# 深度分析
+
+今天几项工作放在一起看，会出现一个很清晰的共同变化：大模型系统正在从“尽量保留全部状态”转向“把状态变成可选择、可编辑、可恢复、可审计的对象”。KV eviction 处理的是模型内部历史状态的选择；ContextPilot 处理的是 Agent 工作上下文的主动编辑；Logos 与 CrabOS 处理的是执行状态如何跨进程、跨人机边界存在；hidden-state probe 则处理状态如何被用于在线审计。
+
+这意味着未来 serving 系统里的“state”可能至少分成三类：模型执行状态（KV、recurrent state、draft state）、Agent 工作状态（计划、memory、tool result、checkpoint）以及外部世界状态（文件、应用对象、工具副作用）。它们的生命周期和一致性要求完全不同。单纯把所有东西都序列化回 prompt，虽然接口统一，却会带来上下文膨胀、重复计算和恢复语义模糊；反过来，把状态完全隐藏在 runtime 中，又会造成模型缺少必要可见性。
+
+另一个值得重视的信号是**简单基线正在变强**。SWA 对 post-trained linear attention 的比较，以及概率化 KV eviction 对启发式方法的重新解释，都要求系统论文更严格地回答：收益究竟来自新的算法结构，还是来自更合理的预算、窗口、校正或调度？对于长上下文系统，仅比较 full attention 往往已经不够；固定窗口、sink token、不同压缩预算以及质量校正都应该进入标准 baseline 集合。
+
+# 开源项目的重要新闻
+
+今天没有发现满足“近 24 小时、已经合并或正式发布、同时具有足够架构影响”的 vLLM、SGLang、TensorRT-LLM 等重大 Release，因此不使用较早版本更新补篇幅。值得记录的是 vLLM 与 SGLang 当天仍有围绕 speculative decoding、dual-batch overlap、新模型兼容和数据并行启动路径的活跃 issue，但 issue 本身不能等同于已落地能力，故本期不将其作为核心工程进展。
+
+ContextPilot 已公开[官方代码仓库](https://github.com/Tencent/ContextPilot)和模型集合，这使其相比只有论文描述的 context-management 方法更容易复现实验。Logos、CrabOS 等工作当前的工程成熟度则应以各自论文公开材料为准，本期不把未核实的仓库状态写成已发布实现。
+
+# 前沿概念和技术
+
+今天最值得单独提出的概念是 **proactive context management**。它与传统 context compression 的区别，不只是“压缩算法由模型执行”：更关键的是模型开始决定**什么时候管理、管理哪部分、选择什么状态操作，以及操作之后如何继续任务**。ContextPilot 进一步把这些决策纳入 RL credit assignment，使 context management 从一个外围工具逐渐接近 Agent policy 的组成部分。
+
+第二个概念是 **cross-process agent harness**。过去 harness 更多指 prompt loop、tool dispatcher、memory 和 middleware 的组合；Logos 把进程边界、故障域和恢复语义引入 harness 定义后，Agent runtime 开始更接近传统操作系统与分布式系统讨论的问题空间。这类工作是否形成稳定范式仍需观察，但其问题本身已经足够具体。
+
+# 对大模型推理与存储优化的启发
+
+首先，缓存与状态管理的评价指标需要从“命中率/压缩率”继续向**错误代价**扩展。概率化 KV eviction 表明，被删除状态并不一定只能接受不可逆质量损失；如果能够描述误差，就可能设计 correction。类似思想也适用于更广义的模型状态管理：系统不仅要预测“什么重要”，还应量化预测错误之后是否存在低成本补偿路径。
+
+其次，Agent workload 的上下文不应被视为均匀增长的 token 序列。ContextPilot 的 partial rollout 结果所依赖的基本观察是，不同 context-editing action 对后续轨迹影响不同。对 serving 而言，这意味着同样长度的历史片段可能具有完全不同的未来价值，固定 TTL、纯 recency 或单一 token budget 很难完整描述这种生命周期。
+
+最后，状态恢复会成为 Agent infrastructure 的关键约束。Logos 强调跨进程故障隔离，CrabOS强调跨人机工作交接，两者共同说明：当任务持续数十分钟甚至更久时，优化单次模型调用延迟只是系统问题的一部分。checkpoint、side effect、恢复边界和可审计状态将直接影响 runtime 能否真正支持长程任务。
+
+# 今夜白的观察
+
+今天的材料让我更倾向于把 2026 年 Agent systems 的变化概括为：**Agent 正在从“一个会调用工具的 LLM 会话”变成“一个拥有显式状态生命周期的长期运行计算实体”**。这个判断不是因为某篇论文提出了新名词，而是因为 context editing、跨进程 harness、共享 work state、recoverability 和内部行为监控正在同时出现。
+
+对于推理系统，另一个趋势同样明显：KV Cache 研究正在越过“找一个更好的 importance score”的阶段。未来更有价值的问题可能是如何建立可解释的状态价值模型、如何处理预测错误，以及算法如何与真实 serving 的数据移动和调度开销共同优化。概率化 eviction 只是其中一种形式，但它提供了比单纯 heuristic ranking 更容易讨论误差和校正的理论语言。
+
+本期没有为了凑数量加入超过时间窗口的框架 Release。相较于每天罗列版本号，更值得持续跟踪的是上述概念什么时候真正进入 vLLM、SGLang 或 Agent runtime 的稳定接口：当“上下文编辑”“状态恢复”“内部监控”开始成为标准 runtime primitive 时，才意味着这些研究方向完成了从论文机制到基础设施能力的迁移。
+
+# 参考资料
+
+- 论文：[ContextPilot: Teaching Agents for Proactive Context Management via Fine-grained RL](https://arxiv.org/abs/2608.28476)，arXiv v1 提交于 2026-08-28，8 月 31 日进入 recent 列表；EMNLP 2026 Main Track。
+- 代码：[Tencent/ContextPilot](https://github.com/Tencent/ContextPilot)。
+- 论文：[A Probabilistic Interpretation of KV Cache Eviction](https://arxiv.org/abs/2608.28293)，arXiv v1 提交于 2026-08-28。
+- 论文：[Logos: An Agent Harness on a Cross-Process Bus](https://arxiv.org/abs/2608.28553)，2026-08-31 arXiv recent 新近工作。
+- 论文：[CrabOS: An Operating System for Human-AI Co-inhabitation](https://arxiv.org/abs/2608.28165)，arXiv v1 提交于 2026-08-28。
+- 论文：[The Calls are Coming from Inside the Model: Investigating Probe-based Detection of Tool-Calling Errors in LLMs](https://arxiv.org/abs/2608.27750)，arXiv v1 提交于 2026-08-27。
+- 论文：[Sliding-window beats linear attention](https://arxiv.org/abs/2608.28444)，arXiv v1 提交于 2026-08-28，8 月 31 日进入 cs.CL recent 列表。
+- 一手索引：[arXiv cs.CL recent](https://arxiv.org/list/cs.CL/recent) 与 [arXiv cs.AI recent](https://arxiv.org/list/cs.AI/recent)，用于核验 2026-08-31 新近条目。
