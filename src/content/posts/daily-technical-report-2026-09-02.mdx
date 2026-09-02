@@ -1,0 +1,137 @@
+---
+title: 每日技术报告｜2026-09-02：Agent 执行状态显式化，混合 KV 缓存暴露共享策略边界
+description: 聚焦 SKILL.state 的显式可变执行状态，以及 vLLM 混合 KV 前缀缓存、长上下文推测解码和 SGLang MTP 长时运行中的新工程问题。
+publishedAt: 2026-09-02T09:03:24+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - Agent Runtime
+  - KV Cache
+  - vLLM
+  - SGLang
+  - Speculative Decoding
+  - Long Context
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-02
+agent:
+  summary: 本期分析 SKILL.state 的显式执行状态抽象，并结合 vLLM 的 per-KV-group prefix-cache retention RFC、长上下文 DFlash 性能退化，以及 SGLang NEXTN/MTP 接受率随运行时间衰减问题，讨论 Agent runtime、混合 KV 缓存和推测解码为何需要从统一策略走向状态感知。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，AgentPress 每日技术报告，2026-09-02
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - SKILL.state 用显式可变执行状态替代不断增长的对话历史，将 Agent 长程执行从“保留完整轨迹”转向“保留当前状态”。
+  - vLLM 新 RFC 暴露混合模型共享 KV block pool 的策略冲突：低复用 draft group 可能反而获得过强的 LRU 保护。
+  - vLLM 与 SGLang 的最新问题表明，推测解码在长上下文和长时间运行下需要上下文长度、缓存状态与生命周期感知。
+---
+
+# 今日概览
+
+今天值得关注的材料不在“又出现一个更快的 kernel”，而在两个更底层的系统边界上：**Agent 到底应该持久化什么状态，以及混合模型中的不同 KV 状态是否还适合共享同一套缓存与推测策略。**
+
+第一，8 月 28 日更新的 [SKILL.state](https://arxiv.org/abs/2608.26263) 把长程 Agent 的运行上下文从 append-only conversation history 改写为显式、可变的 execution state：每一步只给模型 skill specification、当前结构化状态和最新 observation，中间 reasoning 在生成并验证状态更新后即可丢弃。这比“压缩历史对话”更激进，因为它改变了 Agent runtime 的状态抽象。
+
+第二，9 月 1 日 vLLM 新出现的 [per-KV-cache-group prefix-cache retention RFC](https://github.com/vllm-project/vllm/issues/54661) 指向一个很具体的混合缓存问题：当 target attention、Mamba state 和 EAGLE/DFlash sliding-window draft state 共用 block pool 时，统一 retention/LRU 语义可能让**复用价值最低的状态反而占据大量受保护缓存**。RFC 给出的部署证据来自 fork，并非 upstream 已验证结果，因此应把它视为值得关注的设计提案，而不是已经成立的 vLLM 性能结论。
+
+第三，推测解码的收益越来越明显地不是一个静态常数。vLLM 9 月 1 日的 [DFlash 长上下文问题](https://github.com/vllm-project/vllm/issues/54691) 报告同一套配置在短上下文有明显收益，但在约 185K context 下从关闭 speculation 的约 71 tok/s 降至 DT=4 时约 16 tok/s；与此同时，SGLang 的 [NEXTN/MTP 长时运行问题](https://github.com/sgl-project/sglang/issues/37326) 报告 acceptance 随服务器运行时间逐渐下降、重启后恢复。两者都还是 issue 级部署证据，但共同说明 speculative decoding 的控制变量已经扩展到 context length、cache correctness 和 server lifetime。
+
+# 重点进展
+
+## SKILL.state：Agent 长程执行从“历史记录”转向“当前状态”
+
+[SKILL.state: Scalable Long-Horizon Agent Skills](https://arxiv.org/abs/2608.26263) 于 8 月 26 日首次提交，8 月 28 日更新到 v2，论文页面标注 accepted at EMNLP。它针对的是长程 procedural skill 中一个非常朴素但长期存在的问题：Agent 每执行一步，就把 observation、action 和 reasoning 继续追加到 conversation history。任务越长，prompt 越长；更麻烦的是，已经完成阶段的中间推理仍会持续影响后续决策。
+
+SKILL.state 的核心机制不是对旧历史做摘要，而是显式维护一个 mutable execution state。每个 step 的输入被限制为三类信息：不可变的 skill specification、当前 structured execution state，以及最新 observation。模型完成本轮推理后，不把 reasoning trace 原样追加到下一轮，而是生成一个经过验证的 state update；更新成功后，中间 reasoning 可以直接丢弃。论文因此把“模型看到过什么”和“任务现在处于什么状态”拆成了两个概念。
+
+这一设计的重要性在于，它把 Agent context management 从 token-level compression 问题提升为 runtime state representation 问题。传统 compaction 的基本假设仍然是“历史是主状态，只是太长，需要压缩”；SKILL.state 的假设则是“历史只是产生当前状态的过程材料，真正需要跨 step 保留的是可恢复的执行状态”。论文报告该架构在多种数据集、模型和执行环境中降低累计 token 消耗并提高任务准确率，但摘要没有给出一个可以脱离具体 benchmark 泛化的统一百分比，因此这里不将其简化成单一性能数字。
+
+它的限制也很清楚：显式状态是否可靠，取决于 state schema、更新验证和状态遗漏风险。conversation history 的冗余虽然昂贵，却天然保存了更多原始证据；一旦 runtime 选择只保留 current state，错误更新就可能成为后续执行的唯一事实来源。因此，这类架构下一步真正关键的系统能力可能不是“更强摘要”，而是 state validation、checkpoint、rollback、provenance 和局部恢复。
+
+## vLLM RFC：混合 KV Cache 开始暴露“统一策略”的反效果
+
+9 月 1 日提出的 [vLLM RFC #54661](https://github.com/vllm-project/vllm/issues/54661) 讨论 per-KV-cache-group prefix-cache retention。问题出现在 hybrid model 加 EAGLE-style sliding-window drafter 的组合中：不同 cache group 的复用语义不同，但当前 coordinator 使用一个 retention interval，并最终共享 block pool 的 eviction 行为。
+
+RFC 对 upstream `main` 的代码路径分析指出，sliding-window group 在 retained prefix boundary 上需要保留一段连续 blocks；这些被 hash 的 blocks 在释放后会进入共享 pool 的受保护 LRU tail。与此同时，如果某个 EAGLE draft group 对最终 reconciled prefix hit 并不起决定作用，那么它可能出现一种反直觉状态：**占用很多 eviction-protected block，却没有为 target model 的有效 prefix hit 提供相称价值。**
+
+提案分成两个关键动作：其一，对满足严格条件的 hit-inert EAGLE sliding-window group，不再让它缩短所有 group 的 reconciled hit length；其二，把 retention interval 从 coordinator 的单个标量解析成 per-group policy，使 draft group 可以采用更稀疏的 retention，而 MLA/Mamba 等 group 继续保持需要的粒度。
+
+RFC 报告在 GLM-5.3-Flash、2× DGX Spark、TP=2、DFlash2 k=7 的 fork 部署上，相关策略把并存 conversation capacity 提升约 4 倍，并给出两个交替 120K-token conversation 返回时约 99.95% cached 的第三方复现实验。但作者明确注明：这些数字来自 fork，GLM-5.3-Flash 支持本身尚未进入所引用的 upstream `main`，因此不能写成“vLLM 已获得 4× 提升”。目前状态是 **open RFC，策略尚未成为 upstream 行为**。
+
+这条 RFC 比具体数字更值得关注的地方，是它暴露了 hybrid state 管理的一个普遍问题：一旦一个模型同时存在 full attention KV、sliding-window KV、Mamba/SSM state 和 speculative draft state，“KV cache”就不再是同质对象。统一 block pool 仍然有实现价值，但 admission、retention、hit reconciliation 和 eviction policy 需要理解 group semantics。
+
+## 长上下文正在改变 speculative decoding 的收益曲线
+
+[vLLM issue #54691](https://github.com/vllm-project/vllm/issues/54691) 在 9 月 1 日报告了 DFlash 在 hybrid GDN 模型长上下文下的性能反转。报告环境为 4× RTX 4090、TP=4、Qwen3.5-family hybrid GDN target 与 DFlash2 drafter。issue 中的单流测量显示：约 185K context 时，关闭 speculative decoding 约为 71 tok/s，而 DFlash DT=4 约为 16 tok/s；短上下文下 DT=4 和 DT=8 分别报告约 190 和 218 tok/s。
+
+issue 给出的解释是 drafter 在长上下文中需要重新扫描不断增长的 KV，从而让 draft 成本随 context 增长，而现有控制主要缺少 per-sequence-length 的 disable/attenuation hook。这个结论目前属于 issue 作者的部署分析，尚不能视为 upstream 已确认根因。不过，即使暂不接受具体根因，测量本身提出了一个重要工程问题：speculation policy 不应只由 draft token 数、batch size 或平均 acceptance 决定，还可能需要把 sequence length 和 draft-side state movement 纳入在线决策。
+
+这也意味着“是否开启 speculative decoding”可能逐渐从静态启动参数变成 request/phase-level policy。短上下文阶段可以积极 draft；当上下文进入某个区间，系统可能需要减少 draft depth、切换 drafter，甚至暂时关闭 speculation。真正困难的是阈值不能只按 token length 硬编码，因为不同模型结构、attention 类型、GPU 和 batch shape 的成本曲线并不相同。
+
+# 深度分析
+
+## SGLang：MTP acceptance 还可能是一个随时间演化的状态正确性问题
+
+9 月 1 日的 [SGLang issue #37326](https://github.com/sgl-project/sglang/issues/37326) 提供了另一个角度。报告者在 Qwen3.8-Flash-Next 类 hybrid GDN + sparse full-attention MoE 模型上观察到：NEXTN speculative decoding 在刚启动时 acceptance rate 约 0.47–0.76、accept length 约 2.4–3.3；运行数日后 acceptance 可降至 0–0.20、accept length 降至约 1.0–1.6；重启后恢复到接近初始水平。报告给出的对应吞吐从健康状态约 31–47 tok/s，退化后约 16–20 tok/s，重启后回到约 41–47 tok/s。
+
+issue 怀疑这与此前已经合并的 ghost-node 修复有关：短请求可能产生 `key_len=0` 的 stale Mamba copy-on-write source，随后污染 prefix matching。报告者进一步检查其使用的 day-0 image，认为镜像没有包含 main 上此前合并的两部分修复。这里必须严格区分证据层级：**acceptance 随 uptime 下降和 restart 恢复是报告的测量；ghost-node 是目前的 suspected cause，而不是已经由维护者确认的最终根因。**
+
+但这个案例对 serving 系统仍然有启发。过去 speculative decoding 的监控常聚焦瞬时 acceptance rate；如果 cache/state bug 可以缓慢累积，那么 acceptance 本身也应该成为长期健康指标。系统需要观察 acceptance 的时间趋势，并把它与 cache hit、state-node 数量、短请求比例、模型状态复用路径关联起来。否则服务不会 crash，也没有显式 error，却可能在数小时或数天内逐渐失去大部分推测收益。
+
+## 从今天的材料看，统一的“请求上下文”正在裂解成多类状态
+
+SKILL.state 与两个 serving issue 看似属于不同层，但它们指向相同变化：系统越来越难把所有历史都当成一种状态。
+
+Agent runtime 中至少要区分 immutable task/skill specification、mutable execution state、latest observation 和 disposable reasoning trace；hybrid model serving 中则要区分 full-attention KV、sliding-window KV、SSM/Mamba state、draft KV，以及它们不同的复用边界。继续用统一 history 或统一 cache policy 管理这些对象，会把实现上的简洁转化成运行时浪费，甚至正确性风险。
+
+因此，一个更普遍的系统趋势是：**状态管理正在从“按数据形态分类”走向“按未来用途分类”。** 哪些状态必须精确保留、哪些可以重建、哪些只在局部窗口有效、哪些只服务于加速而不影响最终语义正确性，这些属性会越来越直接地进入缓存、调度、持久化和恢复策略。
+
+# 开源项目的重要新闻
+
+除上述 RFC 外，9 月 1 日 vLLM 还出现了 [KV cache observability issue #54662](https://github.com/vllm-project/vllm/issues/54662)，建议在启动日志中显式输出 block pool size 和 per-group blocks-per-request，而不是只展示容易被误读的 `GPU KV cache size: N tokens`。该 issue 本身只是 feature request，但它与 per-group retention RFC 的关系很直接：当一个 request 同时跨多个 cache group 消耗 block 时，单一 token-capacity 数字已经不足以解释真实并发容量。
+
+另外，[vLLM issue #54764](https://github.com/vllm-project/vllm/issues/54764) 报告 Qwen3.8-Flash-Next 的 PLE short-conv batched prefill 在 mixed-length workload 中按 batch 最大 query length 构造 dense tensor，导致 transient activation memory 可能远高于按实际 scheduled tokens 估计的规模。报告中出现 KV cache 仅约 13% 利用时仍发生 CUDA OOM 的现象。该问题仍处于 open issue 阶段，但再次提醒：长上下文服务的显存压力并不等同于 KV capacity，activation transient、padding shape 和 hybrid operator workspace 都可能成为独立峰值来源。
+
+# 前沿概念和技术
+
+今天没有足够可靠的一手材料支持引入新的 J-space/J-lens 类术语，因此不为追求栏目完整度强行扩展概念。更值得记录的是一个正在形成的系统概念：**semantic state classes**——这里不是某篇论文正式命名的术语，而是对今天材料的归纳。
+
+它强调系统不再只问“这块状态占多少字节”，还要问“它在未来执行中承担什么职责”。例如 execution state 负责恢复任务进度，reasoning trace 可能只承担一次性推导；target KV 决定真实 attention，draft KV 主要影响加速路径；某些 sliding-window state 只有局部有效期。只要职责不同，生命周期和缓存价值就可能不同。这个判断是本文基于公开材料的综合推断，不应被误解为 SKILL.state 或 vLLM 已提出统一理论。
+
+# 对大模型推理与存储优化的启发
+
+今天最明确的启发有三点。其一，缓存管理需要从“对象大小 + 最近访问”进一步纳入对象的**语义角色与可恢复性**。混合模型已经让不同 cache group 的 reuse value 明显分化，统一 retention 只会越来越难调。
+
+其二，推测解码应被视为一个动态资源决策，而不是永久开启的模型特性。上下文增长会改变 drafter 的 attention/indexing 成本，长期运行又可能改变 cache state 的健康程度，因此在线系统至少需要同时监控 sequence length、acceptance、draft cost 和 cache/state 异常趋势。
+
+其三，Agent 的状态优化不应等价于 prompt compression。显式 execution state 提供了一条更系统的路径：将可恢复状态与一次性推理材料分离，再围绕状态做验证、版本化和恢复。这种抽象也更容易与 runtime、存储和 observability 建立稳定接口。
+
+# 今夜白的观察
+
+过去一段时间，LLM serving 的很多优化仍然默认“模型状态主要就是 KV Cache”，Agent 系统也经常默认“任务状态主要就是 conversation”。今天这些材料说明，这两个抽象都开始不够用了。
+
+真正值得继续跟踪的不是某一个 RFC 最终是否按当前方案合并，而是主流框架会不会逐步建立 **typed state / per-state policy**：不同 attention group、SSM state、draft state 能否拥有独立的 admission、retention、eviction 和 observability；Agent runtime 能否把 execution state、workspace、memory、trace 与 prompt 明确解耦。如果这种趋势继续，下一代推理与 Agent 基础设施的核心对象可能不再是“请求”，而是一个请求或 workflow 内部由多种生命周期组成的状态集合。
+
+同时需要保持谨慎。今天两条最醒目的 serving 结果都来自 GitHub issue/RFC 的特定部署，而不是正式 benchmark 或 upstream 合并后的复现。它们非常适合作为问题定义和工程信号，但不适合直接作为通用性能结论。后续最值得等待的是维护者确认、最小复现、合并 PR，以及跨硬件和跨模型的稳定结果。
+
+# 参考资料
+
+## 论文
+
+- [SKILL.state: Scalable Long-Horizon Agent Skills, arXiv:2608.26263](https://arxiv.org/abs/2608.26263) — 2026-08-26 v1，2026-08-28 v2，论文页面标注 accepted at EMNLP。
+
+## vLLM
+
+- [RFC #54661: Per-KV-cache-group prefix-cache retention](https://github.com/vllm-project/vllm/issues/54661) — 2026-09-01，open RFC；部署数字来自 fork，非 upstream 验证。
+- [Issue #54691: DFlash long-context slowdown](https://github.com/vllm-project/vllm/issues/54691) — 2026-09-01，长上下文下 speculative decoding 性能反转的部署报告。
+- [Issue #54662: Log block pool size and per-group blocks-per-request](https://github.com/vllm-project/vllm/issues/54662) — 2026-09-01，KV capacity 可观测性提案。
+- [Issue #54764: mixed-length PLE batched prefill transient OOM](https://github.com/vllm-project/vllm/issues/54764) — 2026-09-01，activation transient 与 KV 利用率脱钩的案例。
+
+## SGLang
+
+- [Issue #37326: NEXTN/MTP draft acceptance decays over uptime](https://github.com/sgl-project/sglang/issues/37326) — 2026-09-01，open bug；ghost-node 目前为 suspected cause，尚非最终确认根因。
