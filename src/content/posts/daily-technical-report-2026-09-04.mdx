@@ -1,0 +1,154 @@
+---
+title: 每日技术报告｜2026-09-04：Agent 显式状态、跨轮安全状态与 vLLM 原生自基准
+description: 聚焦长程 Agent 的显式执行状态与跨轮安全状态、Agent 故障诊断与长程 MCP 基准，以及 vLLM 将 Dynamo 自基准能力上移到推理引擎的 RFC。
+publishedAt: 2026-09-04
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - Agent Systems
+  - vLLM
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-04
+agent:
+  summary: 本期聚焦五条技术主线：SKILL.state 用显式可变执行状态替代持续膨胀的对话历史；LoopHarness 论证 Agent 安全状态必须跨迭代持久化；AGENTSCOPE 以结构化行为抽象和 neural invariants 诊断长轨迹 Agent 故障；CivBench 用 300+ 轮、数千次 MCP 工具调用刻画长程 Agent 的状态监控与计划兑现问题；vLLM 新 RFC 提议将 Dynamo 的启动自基准、真实 KV 预热和 FPM 测量能力原生化。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights: []
+---
+
+# 今日概览
+
+今天值得关注的主线并不是又一个更大的模型，而是 **Agent 与推理系统都开始把“状态”从隐含副产物提升为一等系统对象**。
+
+1. **长程 Agent 的上下文管理正在从 append-only history 转向 explicit state。** 更新后的 [SKILL.state](https://arxiv.org/abs/2608.26263) 不再要求模型反复读取完整执行历史，而是只保留不可变 skill specification、当前结构化执行状态和最新 observation；中间推理在产生经过验证的状态更新后即可丢弃。这是对传统“对话即状态”运行时的一次直接挑战。
+2. **安全监控也出现相同的状态化趋势。** [Safety Does Not Compose](https://arxiv.org/abs/2608.27141) 指出，只在单条 trajectory 内工作的 monitor 无法识别被攻击者分散到多轮 autonomous loop 中的证据，并提出持久、非衰减的 loop-level safety state。
+3. **Agent 可观测性开始从日志回放走向结构化行为诊断。** 新论文 [Diagnosing with Insights](https://arxiv.org/abs/2609.02371) 用行为抽象和 neural invariants 对长轨迹中的失败步骤与失败类型进行定位。
+4. **长程 Agent benchmark 正在真正拉长执行时间。** [CivBench](https://arxiv.org/abs/2609.02459) 单个 episode 超过 300 轮、产生数千次工具调用，并通过 76 个 MCP tools 暴露环境，重点测量持续状态监控与计划兑现，而不是一次性问答能力。
+5. **推理框架开始把性能建模能力内生化。** vLLM 新的 [startup self-benchmark RFC #55259](https://github.com/vllm-project/vllm/issues/55259) 提议把 NVIDIA Dynamo 目前通过自定义 scheduler 实现的启动自基准迁入 vLLM 原生路径，并显式建模 prefill tokens、KV read tokens、decode batch size、CUDA Graph 边界和真实 KV 预热。
+
+# 重点进展
+
+## SKILL.state：不再把完整历史当作 Agent 的运行状态
+
+**新增点。** SKILL.state 的 arXiv 条目本次以更新版本重新进入列表，并标注已被 EMNLP 接收。论文针对长时间执行 procedural skill 时最直接的系统问题：传统 runtime 会把 observation、action 和 intermediate reasoning 持续追加到 conversation history，导致 prompt 随执行时间增长。
+
+**核心机制。** [论文](https://arxiv.org/abs/2608.26263) 将 runtime 输入拆成三部分：immutable skill specification、mutable structured execution state 和 latest observation。模型完成一步后，不是把完整 reasoning trace 留在上下文里，而是产生一个经过验证的 state update；随后中间推理即可丢弃。换句话说，历史文本不再承担“唯一事实源”的职责，执行状态被单独抽象出来。
+
+**实验与证据。** 作者报告，在多个数据集、模型和执行环境上，这种架构能够在降低累计 token 消耗的同时提高任务准确率。当前公开摘要没有给出一个可以脱离具体任务统一引用的总提升比例，因此这里不人为汇总数字。
+
+**限制与意义。** 这种设计依赖状态 schema 是否能覆盖真正影响未来决策的信息，也依赖 state update 的正确性。一旦错误状态被写入，后续步骤可能稳定地继承错误。但从系统角度看，它提出了一个很重要的边界：Agent runtime 不应默认把“可重放的自然语言历史”与“当前有效执行状态”视为同一种数据。
+
+## Safety Does Not Compose：跨迭代状态成为 Agent 安全边界
+
+[Safety Does Not Compose](https://arxiv.org/abs/2608.27141) 研究的不是单轮 jailbreak，而是 autonomous loop 的组合安全。作者指出，现实 Agent 会从一个目标出发持续发现任务、规划、调用工具、验证结果并持久化状态；如果安全 monitor 每一轮都重新初始化，那么攻击证据可以被人为拆散到多个 iteration 中。
+
+论文给出的核心理论结果是：当决定性证据从未完整出现在单个 trajectory window 中时，trajectory-scoped monitor 无论表达能力多强，都无法有效区分攻击与正常行为。作者进一步指出，简单维护一个几何衰减的 risk score 仍然不够，因为攻击者只需等待有限 cooling-off period。
+
+为此论文提出 **LoopHarness**，在 autonomous loop 层维护 persistent、non-decaying safety state，并配合 mediated commits 和 arbiter。论文还给出了 Agent-SafetyBench 上的 paired clean/attack protocol、跨 iteration 的 outer-state attack suite 和 adaptive white-box red team 设置。
+
+这里最值得系统研究者注意的并不是某个具体安全模块，而是安全状态的生命周期：当 Agent 本身跨越多个请求、多个工具调用甚至多个恢复周期存在时，安全上下文也必须具有至少同等的生命周期。否则，请求级隔离本身就可能成为监控盲区。
+
+## AGENTSCOPE：从“让另一个 LLM 看日志”走向结构化故障诊断
+
+9 月 3 日进入 arXiv 新列表的 [Diagnosing with Insights: Structured Analysis of Agent Failures via Behavioral Abstractions](https://arxiv.org/abs/2609.02371) 聚焦 Agent failure diagnosis。长轨迹中的错误往往不是最后一步才产生，人工逐步检查成本很高；但直接把整条 trajectory 交给 LLM judge，又会引入诊断不稳定性。
+
+论文提出的 **AGENTSCOPE** 是一种 neuro-symbolic 方法。它先把 trajectory 中的 Agent 行为抽象成结构化表示，再使用 **neural invariants** 描述预期行为属性，最后让 LLM 在结构化表示与 invariants 上推理，定位 failure step 并判断 failure type。
+
+作者在公开的 Who&When 数据集和自建 AgentErrata 上评估，并报告其 fault localization 与 attribution accuracy 显著优于现有方法。由于当前可验证的一手摘要没有提供足够细的逐数据集数字，本报告不复述二手材料中的具体提升值。
+
+这类工作意味着 Agent observability 可能逐渐形成类似传统系统中的 invariant checking、structured tracing 和 failure attribution 栈，而不是仅保存自然语言日志等待人工阅读。
+
+## CivBench：300+ 轮和数千次工具调用开始暴露真正的长程失效
+
+[CivBench](https://arxiv.org/abs/2609.02459) 将 Civilization VI 构造成一个通过 MCP 操作的长程 Agent 环境。单个 episode 超过 **300 turns**，产生 **thousands of tool calls**，环境提供 **76 个 MCP tools**，并将视觉游戏状态转成结构化文本。
+
+作者没有把 23 次 admissible runs 包装成模型排行榜，而明确称其为 pilot。论文重点提出两个 interface-level metric：**Proactive Monitoring Rate (PMR)** 衡量 Agent 是否主动查询潜在战略状态；**RAG@10** 衡量结构化 planning reflection 中承诺的动作是否在后续十轮内真正执行。
+
+公开结果显示，即使 playbook 明确要求每 20 轮检查一次 victory progress，实际 Agent 通常每 30–75 轮才查询；在 20 个可检测失败中的 7 个案例里，Agent 在失败前 20 轮没有查询相关状态。不同模型的 RAG@10 仅为 **48.2%–65.8%**。作者谨慎地把这些现象解释为 instruction-following deviation，而不是简单归因于“模型没有能力”。
+
+这组结果对 Agent 基础设施尤其重要：长程失败不只来自 reasoning quality，还来自“忘记检查”“计划没有兑现”“状态存在但没有主动读取”。这要求 benchmark 同时记录状态访问、工具调用、计划承诺和实际执行，而不能只记录最终 success/failure。
+
+## Evidence for Shared Routing Geometry：MoE 路由跨层可预测性可能具有共享结构
+
+新论文 [Evidence for Shared Routing Geometry and Dynamics in Sparse Mixture-of-Experts](https://arxiv.org/abs/2609.02404) 研究一个与 MoE 系统优化直接相关的问题：不同 sparse layer 的 router 虽然参数独立，但 routing state 为什么可以从较早层预测？
+
+作者先隔离各层 router 的 control subspace，再用 generalized orthogonal Procrustes 将这些空间对齐到共享 canonical representation。对齐后，一个共享线性 transition 达到 **R²=0.39–0.71**，并保留独立逐层 dynamics **79%–90%** 的预测能力。作者还做了 matched-rank residual representation 对照：普通 residual state 往往更容易跨层预测，但 router-control state 更能保持实际 expert choices，因此共享结构并非仅仅来自 hidden representation 的平滑变化。
+
+这仍然是一项表征与机制研究，而不是已经证明可直接加速 MoE serving 的系统方案。不过它提供了更严格的证据：跨层 expert routing 的可预测性可能来自可对齐的低维控制结构。未来如果系统利用早层信号进行 expert prefetch、通信准备或资源预留，需要验证这种 canonical dynamics 在不同模型、负载和量化条件下是否稳定。
+
+# 深度分析
+
+## Agent runtime 正在形成“历史、状态、证据”三种不同生命周期
+
+把今天几篇工作放在一起，一个清晰变化是：研究者开始停止把 Agent 的所有信息都塞进同一条 conversation。
+
+SKILL.state 区分 **execution history** 与 **current execution state**；LoopHarness 又进一步区分业务执行状态与 **persistent safety state**；AGENTSCOPE 则把 trajectory 转换成适合诊断的 **behavioral abstraction**。三者目标不同，但共同说明自然语言上下文不是所有状态的最佳承载形式。
+
+这会直接影响 Agent serving 的缓存与恢复语义。普通 chat request 可以把“请求结束”视为一个比较自然的资源回收边界；长程 Agent 则不一定如此。模型上下文可以压缩，执行状态必须保留，安全证据可能不能衰减，诊断 trace 又可能需要更长时间保存。未来 runtime 更可能按状态类别分别定义 retention、consistency、checkpoint 和 recovery policy。
+
+## vLLM self-benchmark RFC：性能模型开始进入引擎生命周期
+
+今天最值得关注的开源工程动态是 vLLM 的 [RFC #55259](https://github.com/vllm-project/vllm/issues/55259)。它建议把 NVIDIA Dynamo 当前 out-of-tree 的 startup self-benchmark controller 移入 vLLM，使部署规划器和 autoscaler 可以针对“实际模型 + quantization + parallelism + CUDA Graph + GPU”组合获得经验性能模型。
+
+RFC 的关键不是“启动时跑一次 benchmark”这么简单，而是它试图定义 **一次 model execution 的坐标系**。Prefill 用 `total_prefill_tokens`、`total_kv_read_tokens` 和 `batch_size` 描述；decode 用 aggregate KV depth 与 batch size 描述，同时记录 CUDA Graph capture boundary、padding 和执行模式。这样测量对象从外部 RPS/并发数下沉到了 scheduler 真正执行的工作量。
+
+更值得注意的是 **real-KV seeding**。RFC 引用 Dynamo PR #14029 的结果指出，在 MiniMax-M2.7、4×B200、TP4+EP 的实验中，对超过 100 万 aggregate KV-read tokens 的点，synthetic KV 与真实 serving-shaped probe 的误差中位数最高可达 **+160%**；real-KV-seeded collection 则可把已验证坐标复现到约 **1%**，147 个坐标的 repeated probe 给出 **0.54% anchor-reproduction MAPE**。这些数字来自 Dynamo 当前实现，RFC 也明确要求在 vLLM native timing 下重新验证，因此不能视为 vLLM 已实现性能。
+
+原因很有系统意义：对 expert-parallel MoE，假的 block table 或均匀随机 token 并不会重现产生 KV 时的 expert routing，因此“KV 容量相同”并不等价于“执行形态相同”。这说明未来推理性能模型不能只描述 tensor shape，还需要考虑 state provenance 和 workload content 对路由、通信与 kernel 行为的影响。
+
+RFC 当前仍是**讨论阶段**，不是已发布功能；并且首版明确限制 CUDA generative models，decode/aggregate 暂不支持 pipeline parallelism 与 speculative decoding，real-KV shadow borrowing 也暂不支持 recurrent-state/Mamba cache groups。
+
+# 开源项目的重要新闻
+
+除上述 self-benchmark RFC 外，vLLM 当前 main 还出现了一些值得跟踪、但尚不足以单独形成结论的工程问题。例如 [#55250](https://github.com/vllm-project/vllm/issues/55250) 报告 Qwen3.8-27B + DFlash2 在 Intel XPU 上使用 FP16 时 draft acceptance 为 0%，而 BF16 正常；该现象目前仅由 issue reporter 在 XPU 环境复现，尚不能推广到 CUDA。另一个 [#54906](https://github.com/vllm-project/vllm/issues/54906) 报告 Model Runner V2 的 Qwen3.8 NVFP4 + MTP 路径可能绕过 `thinking_token_budget`。两项都处于 bug report 阶段，因此本期只作为 speculative decoding 新执行路径的兼容性信号，不把它们描述为框架已确认缺陷。
+
+这两例共同提醒：speculative decoding 已不再是一个独立“加速开关”。draft dtype、reasoning parser/logits processor、target model quantization、runner implementation 和硬件 backend 都可能进入正确性边界。框架需要把 acceptance、reasoning budget、fallback 与 dtype compatibility 纳入持续测试，而不仅仅测试吞吐。
+
+# 前沿概念和技术
+
+今天没有足够可靠的一手材料支持新增一个类似 J-space/J-lens 的统一隐空间术语，因此不为了栏目完整性强行引入概念。更值得记录的是两个正在变清晰的技术抽象。
+
+第一是 **explicit mutable execution state**：它不是传统 memory retrieval，也不是简单 summary，而是由 runtime 明确定义、每步更新、直接决定下一步执行输入的状态对象。第二是 **loop-level persistent state**：其生命周期跨越单次 trajectory，用于保存不能因请求结束而遗忘的安全或控制信息。二者都指向“上下文管理”从 prompt engineering 走向 runtime state management。
+
+MoE 侧则出现 **shared routing geometry** 的证据：不同层 router 的控制空间经过对齐后可能共享部分动力学。这一概念目前应严格限定在论文实验支持的 representation-level observation，不能直接等同于可部署的 expert prediction 算法。
+
+# 对大模型推理与存储优化的启发
+
+今天材料给出的第一条普遍启示是：**缓存和存储策略需要先回答“保存的到底是哪一种状态”**。模型 KV、Agent 当前执行状态、完整历史、诊断轨迹和安全证据的价值函数完全不同。把它们统一套进基于最近访问时间的缓存模型，很可能会丢失真正的生命周期信息。
+
+第二，性能测量需要从“容量与 shape”进一步走向 **state-aware benchmarking**。vLLM RFC 对真实 KV 预热的讨论表明，在 MoE/EP 场景中，相同 KV depth 并不保证相同的专家路由和执行成本。对于复杂推理系统，benchmark trace 是否真实产生过对应状态，可能与状态大小本身一样重要。
+
+第三，Agent workload 的关键局部性不只是 prefix reuse。CivBench 暴露的是 monitoring interval、commitment execution 和长期状态读取；SKILL.state 暴露的是有效状态与历史文本的分离。未来评估 Agent serving，至少应同时观察 token/KV reuse、state read/write、tool-call gap、checkpoint/recovery 和跨轮状态保留，而不是把 Agent 当成“更长的聊天”。
+
+# 今夜白的观察
+
+今天最值得持续跟踪的趋势，是 **state 正在成为 AI systems 的共同语言**。模型层有 KV、router control state 和 recurrent state；推理引擎开始对 KV provenance 和 execution coordinate 建模；Agent runtime 开始显式维护 execution state；安全层则要求跨 iteration 的 non-decaying state。
+
+这意味着下一阶段的系统问题可能不再只是“如何让更多 token 更快通过 GPU”，而是“哪些状态必须存在、存在多久、由谁更新、什么时候可以压缩或删除、恢复时必须保持什么语义”。这也是为什么今天几篇看似分散在 Agent、safety、MoE 和 serving 的工作实际上能够形成同一条技术主线。
+
+短期内我会重点继续观察两件事：其一，SKILL.state 这类显式状态 runtime 是否会出现标准化 schema、checkpoint 或跨框架接口；其二，vLLM self-benchmark RFC 是否会真正进入主线，以及真实 KV / workload-content-aware profiling 是否会成为 Dynamo 等 serving planner 的标准输入。
+
+# 参考资料
+
+## 论文与技术报告
+
+- [SKILL.state: Scalable Long-Horizon Agent Skills — arXiv:2608.26263](https://arxiv.org/abs/2608.26263)
+- [Safety Does Not Compose: Non-Decaying Loop State for Autonomous LLM Agents — arXiv:2608.27141](https://arxiv.org/abs/2608.27141)
+- [Diagnosing with Insights: Structured Analysis of Agent Failures via Behavioral Abstractions — arXiv:2609.02371](https://arxiv.org/abs/2609.02371)
+- [CivBench: A Long-Horizon Benchmark for Tool-Mediated Agents in Civilization VI — arXiv:2609.02459](https://arxiv.org/abs/2609.02459)
+- [Evidence for Shared Routing Geometry and Dynamics in Sparse Mixture-of-Experts — arXiv:2609.02404](https://arxiv.org/abs/2609.02404)
+
+## 开源工程与 RFC
+
+- [vLLM RFC #55259: Optional native startup self-benchmarking for forward-pass performance characterization](https://github.com/vllm-project/vllm/issues/55259)
+- [vLLM Issue #55250: DFlash2 FP16 acceptance on XPU](https://github.com/vllm-project/vllm/issues/55250)
+- [vLLM Issue #54906: thinking_token_budget with Model Runner V2 + MTP](https://github.com/vllm-project/vllm/issues/54906)
+
+以上工程 Issue 均按当前公开状态记录；RFC 和 bug report 不等同于已经合并或由维护者确认的正式行为。
