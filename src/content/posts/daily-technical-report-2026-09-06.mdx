@@ -1,0 +1,140 @@
+---
+title: 每日技术报告｜2026-09-06：KV 压缩开始理解“头的功能”，Agent Memory 进入授权安全边界
+description: 关注 SGD-KV、HeadWiseKV、Agent Memory 授权漂移、Harness-of-Harness 与 reasoning trajectory 控制实验，并记录 vLLM 混合模型长上下文路径暴露的工程问题。
+publishedAt: 2026-09-06
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Inference
+  - Agent Memory
+  - Agent
+  - 长上下文
+  - vLLM
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-06
+agent:
+  summary: 本期聚焦 9 月 2–3 日的一手技术材料：SGD-KV 用 summarization head 诊断指导 KV 预算分配，HeadWiseKV 为 hybrid long-context 模型建立按物理 KV head 的静态驻留策略；EAL-Bench 揭示持久化 Agent Memory 中的授权漂移可传播为未授权动作；Harness-of-Harness 展示多日 coding agent 的迭代式 harness；同时分析 reasoning trajectory 中预算与题目难度的混杂因素，并记录 vLLM 在 hybrid GDN、FP8 speculative KV 和混合长度 prefill 上暴露的实现问题。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - KV 压缩从统一 token 重要性评分转向 attention head 功能与物理驻留预算。
+  - Agent Memory 不再只是检索组件，其错误可能直接改变长期 Agent 的有效授权状态。
+  - 长程 Agent 与 reasoning 研究都在强调状态、预算和对照实验，而非单纯扩大上下文。
+---
+
+# 今日概览
+
+今天值得关注的主线不是又出现了一个更复杂的 KV 打分器，而是**推理状态管理开始从“哪些 token 重要”转向“不同状态承担什么功能、应该占多少真实物理资源”**。9 月 3 日公开的 SGD-KV 用 summarization diagnostic 识别承担层次化信息聚合的 attention heads，再按 head 分配 KV 预算；9 月 2 日的 HeadWiseKV 则进一步把这种预算落实为 hybrid model 中每个物理 KV head 的实际驻留窗口。两者都说明，长上下文 KV 管理正在从统一缓存策略走向结构化、可部署的差异化 residency。
+
+Agent 侧出现了另一条更重要的系统边界：persistent memory 不只是性能组件，也可能成为权限状态的一部分。EAL-Bench 展示了 memory writer 如何在持续更新中生成并固化并不存在的授权，随后 executor 又把这份错误记忆当作可信状态执行。与此同时，Harness-of-Harness 把 coding agent 的运行从单次任务扩展到多日、可版本化、持续迭代的软件工程过程，使 project history、测试证据和状态恢复成为 harness 的核心资源。
+
+最后，一篇针对 reasoning trajectory 的控制实验提醒我们：hidden-state probe 的高 AUROC 或所谓“aha moment”不能脱离预算和题目难度直接解释。对推理系统而言，这意味着任何基于早期隐藏状态做动态算力分配的机制，都需要更严格的 within-problem 或 matched-budget 对照。
+
+# 重点进展
+
+## SGD-KV：用“总结能力”而不是单纯 attention 强度决定 KV 预算
+
+[SGD-KV: Summarization Guided KV Cache Compression](https://arxiv.org/abs/2609.03235) 于 2026 年 9 月 3 日公开。它针对现有 head-aware KV compression 的一个核心问题：即使预算已经细化到 attention head，head 的重要性通常仍由 retrieval、attention magnitude 等相对浅层的统计信号决定，并没有显式区分 head 在长上下文任务中的功能。
+
+SGD-KV 构造 chunk-summarization diagnostic：把多个文档拼成长上下文，让模型先识别语义 chunk，再为每个 chunk 提取关键词；随后测量输出关键词回看对应源文本时各 attention head 的注意力强度，由此得到 summarization score。预算层面，它保留 sink token 和最近窗口，将中间可压缩部分按 summarization score 分配给不同 head，并用类似 water-filling 的方式重新分配过度集中的预算；head 内部的 token 选择仍采用累计 attention score。
+
+论文在 Qwen2.5-7B-Instruct-1M 和 Qwen3-32B 上测试。作者报告，在 25% KV budget 下，Qwen3-32B 的 ETHIC 平均分为 28.38，Full KV 为 28.53；在 MRCR 上，SGD-KV 在超长上下文设置中相对多种 head-level baseline 保持更好的精度。作者将总体结果概括为最高 75% KV memory reduction，并测试到 1M context。需要注意的是，Qwen2.5-7B-Instruct-1M 在 MRCR 上经过额外 fine-tuning，因此不同模型之间不能简单横向比较。
+
+真正值得关注的是它把 interpretability signal 接入了 cache allocation：不是问“这个 token 的 attention score 高不高”，而是先问“哪个 head 对信息聚合更关键”。但当前 summarization head 是离线诊断得到的，head 功能在不同 workload、prompt distribution 和推理阶段是否稳定，仍需要生产负载验证。
+
+## HeadWiseKV：Hybrid 模型需要管理“真实驻留状态”，而不只是逻辑 mask
+
+[HeadWiseKV: Budgeted Per-Head Cache Residency for Hybrid Long-Context Language Models](https://arxiv.org/abs/2609.02029) 于 9 月 2 日公开。它针对 hybrid long-context model：即使 local attention、linear attention 或 recurrent path 已经降低了大部分状态成本，少数 residual global-attention layers 仍可能随着 context 线性增长，并最终主导 KV memory。
+
+HeadWiseKV 的关键区别是把问题定义为 aggregate KV-residency budget 下的物理驻留分配。它给每个 physical KV head 分配静态、多级 history window，并提出 SeqCalib 按模型执行顺序逐层生成策略；后层的校准会看到前面已经采用的压缩策略，从而考虑跨层相互作用。运行时通过 grouped-cache materialization 真正减少 resident KV，而不是在完整 KV cache 上做逻辑 mask。
+
+作者在四个 hybrid long-context 模型上评估质量，并在 Qwen3.6-27B 上做系统测试。论文报告，在 112K context 下 sampled peak device memory 下降 8.59%，最大验证成功上下文从 114K 延长到 161K，同时在其评估的 RULER 与 LoCoMo 设置中保持接近 Full-KV 的质量。
+
+这项工作的系统意义在于“可预测”：静态 per-head window 使服务前就能知道缓存需求。对于 continuous batching 和 admission control，这通常比一个只能在 attention 之后才知道结果的动态 selector 更容易纳入容量规划。当然，它牺牲了一部分 request-specific adaptivity；当同一 head 在不同请求中的需求差异很大时，静态 policy 可能不是最优。
+
+## Agent Memory：持久化记忆正在成为授权状态的一部分
+
+[Agent Memory Is a Surface for Endogenous Authorization Laundering](https://arxiv.org/abs/2609.01836) 研究的是一个此前容易被 memory benchmark 忽略的问题：长期 Agent 会把 permission、restriction 和 revocation 等状态写入 persistent memory，如果 memory update 把历史关系总结错了，Agent 后续可能在没有外部攻击的情况下自行“洗出”不存在的权限。
+
+作者把这种现象称为 endogenous authorization laundering，并提出 EAL-Bench，在采购、网络安全和金融场景中测试五个 memory-writer LLM 和两个 executor。论文报告，在 incremental memory update 下，writer 对 unauthorized requests 生成 false authority 的比例最高达到 50.2%；一旦 false authority 已经进入 memory，executor 在 98.6% 的试验中会据此执行。
+
+作者测试了两类 safeguard：要求 stored permission 必须能追溯到有效 source event，以及通过 bounded event sourcing 跟踪权限变化。两者都显著降低 laundering，但也提高了合法操作被拒绝的比例，形成明确的 safety–utility trade-off。
+
+这使 Agent Memory 的系统接口发生变化：memory entry 不能只携带文本、embedding、timestamp 和 importance，它可能还需要 provenance、validity interval、revocation relation 和 source event。换言之，memory consistency 不只是“是否记对事实”，还包括“当前状态是否仍然有效”。
+
+## Harness-of-Harness：Coding Agent 从一次任务走向多日持续工程
+
+上海人工智能实验室的 [Harness-of-Harness: Multi-Day Autonomous Software Development with Continual Improvement](https://arxiv.org/html/2609.01481v1) 把 coding agent 的评测边界从 repository-level issue 推向完整软件的持续开发。HoH 不替代现有 coding harness，而是在其外层组织 planning–coding–testing 的迭代循环。
+
+每一轮 planner 会综合高层需求与前序迭代的测试证据，既修复已有问题，也要求交付一个小而可验证的新能力；实现期测试与独立 evaluation 被分离，项目历史则持续版本化。作者在 GameCraft-Bench、FrontierSWE 和 ProgramBench 上测试 Codex/GPT-5.5、OpenCode/DeepSeek-V4-Pro、Pi/MiniMax-M3 三组 harness–model 配置，报告三轮后平均相对提升 52.25%，最高 82.86%；另进行了超过 70 次迭代的多日 FPS 游戏开发实验。
+
+这里最值得系统研究者注意的不是 benchmark 数字本身，而是 workload 形态改变：一次 Agent session 不再对应一次短暂 request chain，而可能形成数十轮 planning、tool execution、test、rollback、artifact reuse 和版本提交。此类 workload 的“状态”天然分散在模型上下文、workspace、测试结果和版本历史中，单纯扩大 context window 很难替代外部状态管理。
+
+## Reasoning trajectory：高 probe 分数可能首先是在识别“题有多难”
+
+[It’s the Problem, Not the Path: Budget and Difficulty Confounds in LLM Reasoning Trajectories](https://arxiv.org/html/2609.03436v1) 于 9 月 3 日公开，直接质疑两个常见解释：reasoning trace 中存在决定性 breakthrough moment，以及很早的 hidden state 已经能预测一次推理最终是否成功。
+
+作者首先用 restart-controlled truncation probe，把“已有 prefix 本身携带不可替代的信息”与“继续生成只是获得更多 token budget”区分开。在 89 个 MATH 问题、两个小型开放模型组成的 178 个 problem–model cells 中，只有 1 个被判定为 prefix-limited；在可做 matched-budget 比较的 9 个点上，继续原 prefix 都优于从头 restart，作者将主要收益解释为 compute compression，而不是扩展可达能力边界。
+
+更值得注意的是 early-state probe。论文报告，一个完全不看 reasoning trace、只利用题目难度的 baseline，在 192K 条 DeepSeek-R1 generations 上就能达到 AUROC 0.873；而复现接近既有 early-window positive 的 pooled probe 可达到 0.849，但控制到同一 problem 内后，在十个 anchor 上都与随机水平无显著差异，其中 t=4 为 0.496。
+
+这并不证明 hidden state 永远没有预测价值，而是说明 pooled AUROC 不能直接证明“某次 attempt 的命运已经写在早期 hidden state 里”。如果 serving 系统要据此提前终止、扩展 budget 或动态路由，实验必须加入 question-only baseline、within-problem evaluation 和 matched compute budget。
+
+# 开源项目的重要新闻
+
+本期没有为了凑数量而罗列普通 Release。更值得记录的是 vLLM 新模型路径暴露出的两个实现边界，它们都处于 **open issue**，不是已合并修复。
+
+其一，[vLLM #54690](https://github.com/vllm-project/vllm/issues/54690) 报告 hybrid GDN target 配合 draft-model speculative decoding 时，单独指定 draft `kv_cache_dtype=fp8` 会让 FlashInfer metadata builder 收到未解析的 `auto`；显式指定 target 为 bfloat16 后，在 SM89 上又可能出现 native crash。报告环境为 vLLM 0.28.0、4×RTX 4090、Qwen3.5-family hybrid target 和 DFlash2 drafter。它说明当 target 与 drafter 具有不同 attention/KV layout 时，“KV dtype”已经不能安全地被视为一个全局标量配置，而需要明确到 cache group、backend 和 hardware capability。
+
+其二，[vLLM #54764](https://github.com/vllm-project/vllm/issues/54764) 报告 Qwen3.8-Flash-Next 的 PLE short-conv batched prefill 会把同一步所有 prefill request pad 到 batch-max query length，使 activation memory 按 `num_prefills × max_len` 增长，而不是按实际 scheduled tokens 增长。报告中的混合长度 workload 在 KV cache 仅约 13% 利用率时仍发生 CUDA OOM。Issue 建议改成基于 `cu_seqlens` 的 varlen compact packing。这个案例提醒我们：在 hybrid architecture 中，显存瓶颈可能从 KV cache 转移到短暂 activation；只看 KV utilization 已不足以解释 serving capacity。
+
+# 前沿概念和技术
+
+今天几篇材料共同指向一个更细的抽象：**state residency 不应再等价于 token residency**。SGD-KV 把 attention head 的功能角色加入预算决策，HeadWiseKV 把 per-head budget 落到实际物理驻留；hybrid model 的工程问题又显示，KV、recurrent state、short-conv activation 和 speculative drafter state 会同时存在。未来推理框架更可能管理多类 model state，而不是维护一个同构的 KV block pool。
+
+Agent 侧则出现 **authorization-aware memory** 的问题。传统 memory pipeline 通常优化 write、retrieve、consolidate 和 forget，但当记忆中包含权限、约束或任务状态时，summary 本身就可能改变语义。EAL-Bench 的结果表明 provenance 和 revocation 不能只作为审计日志放在旁路，它们可能需要进入 memory object 的核心数据模型。
+
+# 深度分析
+
+把今天的结果放在一起，可以看到两个方向正在汇合：模型内部状态越来越异构，Agent 外部状态也越来越结构化。前者要求 serving runtime 理解 head、layer、attention type、draft/target 和 request phase；后者要求 Agent runtime 理解 provenance、版本、权限变化和 project history。两者的共同问题不是“能不能存更多”，而是**能否让状态的语义、生命周期和物理成本同时进入管理决策**。
+
+这也解释了为什么单一 importance score 越来越不够。一个 KV token 可以因为所属 head 的功能不同而具有不同价值；一条 memory 可以因为权限已经撤销而从“高相关”变成“绝不能继续生效”；一个 reasoning hidden state 的预测分数又可能只是题目难度的代理变量。系统若只看到一个 score，而不知道 score 的生成条件和状态语义，就很容易做出错误优化。
+
+# 对大模型推理与存储优化的启发
+
+第一，KV compression 的评价应该从“固定压缩率下精度”进一步扩展到**真实物理 residency 与 serving 行为**。逻辑 mask 没有释放显存就不能等价于系统收益；HeadWiseKV 在这一点上的 grouped-cache runtime 值得关注。
+
+第二，hybrid model 会让内存核算从单一 KV 预算变成多状态预算。linear/recurrent path 减少 KV 并不意味着显存压力自然消失，短卷积 activation、speculative draft state、global-attention residual KV 都可能成为新的峰值来源。capacity planning 应看 peak live state，而不是只看某一类 cache。
+
+第三，Agent workload 的状态管理需要 provenance-aware lifecycle。长期 session 中的 memory、workspace artifact、test evidence 和 permission event 具有不同有效期与一致性要求；仅按最近访问或语义相似度管理，很难覆盖 rollback、revocation 和 branch evolution。
+
+第四，任何利用 hidden state 做 adaptive serving 的工作都应把 confound control 当作系统实验的一部分。若一个廉价 question-only feature 已能解释大部分 probe performance，那么复杂的 activation probe 未必真的提供了 request-specific information。
+
+# 今夜白的观察
+
+今天最值得持续跟踪的是“状态管理粒度”正在快速细化。KV Cache 研究已经从 layer/token 进一步走向 physical head 和功能 head；Agent Memory 则从文本检索对象走向带 provenance 和 authorization semantics 的长期状态。它们看似属于模型系统与 Agent 系统两个社区，但都在迫使 runtime 回答同一个问题：**状态是什么、什么时候仍然有效、应该驻留在哪里，以及错误状态会造成什么后果。**
+
+另一个信号来自 vLLM 的两个 issue：新型 hybrid architecture 把 serving framework 中过去隐含的“所有 attention state 大体同构”假设逐渐打破。未来框架的难点可能不只是再实现一个新 kernel，而是让 scheduler、memory manager、attention backend 和 speculative path 对异构状态拥有一致的描述方式。
+
+# 参考资料
+
+## 论文与技术报告
+
+- [SGD-KV: Summarization Guided KV Cache Compression — arXiv:2609.03235](https://arxiv.org/abs/2609.03235)，首次公开：2026-09-03。
+- [HeadWiseKV: Budgeted Per-Head Cache Residency for Hybrid Long-Context Language Models — arXiv:2609.02029](https://arxiv.org/abs/2609.02029)，首次公开：2026-09-02。
+- [Agent Memory Is a Surface for Endogenous Authorization Laundering — arXiv:2609.01836](https://arxiv.org/abs/2609.01836)，2026 年 9 月公开。
+- [Harness-of-Harness: Multi-Day Autonomous Software Development with Continual Improvement — arXiv:2609.01481](https://arxiv.org/abs/2609.01481)。
+- [It’s the Problem, Not the Path: Budget and Difficulty Confounds in LLM Reasoning Trajectories — arXiv:2609.03436](https://arxiv.org/abs/2609.03436)，首次公开：2026-09-03。
+
+## 开源工程
+
+- [vLLM Issue #54690: speculative FP8 KV cache on hybrid GDN models](https://github.com/vllm-project/vllm/issues/54690)，opened 2026-09-01，当前为 open issue。
+- [vLLM Issue #54764: PLE short-conv batched prefill activation OOM](https://github.com/vllm-project/vllm/issues/54764)，opened 2026-09-01，当前为 open issue。
