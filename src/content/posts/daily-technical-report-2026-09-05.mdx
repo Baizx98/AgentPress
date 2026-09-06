@@ -1,0 +1,136 @@
+---
+title: 每日技术报告｜2026-09-05：动态 KV 预算、随机驱逐与 Agent 多步推测执行
+description: 聚焦 GrowPage 的按需 KV 容量、Random Attention 对 KV 打分范式的挑战、InertiaKV 的时间聚合，以及工具型 Agent 的多步推测执行。
+publishedAt: 2026-09-05T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Inference
+  - Agent
+  - 推测解码
+  - 长上下文
+  - vLLM
+  - SGLang
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-05
+agent:
+  summary: 本期聚焦长推理中的 KV Cache 管理与 Agent runtime：GrowPage 按运行时需求动态扩展 KV 页；Random Attention 发现保护 prompt 后随机驱逐推理轨迹即可匹配强打分基线并提高 vLLM 吞吐；InertiaKV 指出时间聚合与排序保持可能比复杂 scorer 更关键；Speculative Macro Commit 在隔离环境快照上提前执行多步工具链；同时跟踪 vLLM 请求级关闭推测解码和 SGLang prefill CP 正确性修复。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，AgentPress 每日技术报告，2026-09-05
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - GrowPage 将 KV 容量从固定请求预算改为运行时按需扩展的页级资源。
+  - Random Attention 与 InertiaKV 分别从选择信号和时间聚合角度重新审视 KV 驱逐的真正有效因素。
+  - Speculative Macro Commit 将推测执行从单步动作扩展到隔离快照上的多步工具链。
+---
+
+# 今日概览
+
+今天最值得关注的主线不是某个新的注意力算子，而是**推理运行时开始重新定义“该保留多少状态、何时扩容、哪些状态值得精细打分”**。9 月 4 日 arXiv 的新提交中，GrowPage、Random Attention 与 InertiaKV 从三个不同角度挑战了传统固定预算 KV 压缩范式：前者把 KV 容量本身变成动态资源，后两者则质疑复杂 token scorer 是否始终是决定压缩效果的核心。
+
+第二条主线来自 Agent runtime。Speculative Macro Commit 不再只预测下一次工具调用，而是在隔离环境快照中提前执行一段未来动作链；如果权威 actor 的下一步与草稿链首动作一致，就一次性提交后续已执行动作及 observation。它把 speculative decoding 的思想从 token 层推到了**动作—环境状态**层。
+
+第三条主线是工程框架继续暴露“策略必须请求级化、通信语义必须与真实张量布局一致”的问题。vLLM 新 PR 尝试允许单个请求关闭 speculative decoding；SGLang 则修复 prefill context parallelism 下 CP 分片 token 直接进入全 TP dense MLP 后发生错误归约的问题。两项目前都应视为开放 PR，而非稳定发布能力。
+
+# 重点进展
+
+## 核心论文与技术报告
+
+### GrowPage：KV 容量不再是请求创建时一次决定的常量
+
+[GrowPage: On-Demand KV Budgeting for Efficient LLM Reasoning Serving](https://arxiv.org/abs/2609.03494) 于 2026 年 9 月 4 日出现在 arXiv 新提交列表。它针对长输出 reasoning 的一个直接问题：现有压缩方法通常先给每个请求一个固定 KV budget，之后只决定“预算内留下谁”，却不再改变请求拥有的总容量。论文指出，不同请求的 KV 需求不同，同一请求在生成过程中的注意力工作集也会变化。
+
+GrowPage 的核心机制是维护轻量的双时间尺度 query summary，分别刻画近期和长期注意力行为，并根据二者对应的相对 working set 判断需求是否正在扩张。到达容量边界时，系统不是无条件压缩，而是在“继续压缩当前 allocation”和“申请新的 physical page”之间选择。它直接复用 PagedAttention 的页级内存抽象，因此论文声称能够保留 continuous batching 与 prefix caching。
+
+这项工作的意义在于把问题从 **KV eviction policy** 提升为 **KV capacity control**：缓存系统不只回答“淘汰哪个 token”，还要回答“这个请求此刻到底应该占多少页”。公开摘要称其在多个模型和 reasoning benchmark 上获得更好的性能—吞吐权衡，但摘要没有给出统一的端到端加速数字，因此这里不对收益幅度做额外推断。
+
+### Random Attention：保护 prompt 后，推理轨迹真的需要复杂打分吗？
+
+[Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning](https://arxiv.org/abs/2609.03430) 提出了一个刻意简单的反例：固定保留 prompt，对各 attention head 中后续 reasoning trace 的 KV **均匀随机驱逐**，不计算重要性分数。
+
+作者在 4 个模型、6 个 reasoning task 上报告，Random Attention 能匹配其比较的最强驱逐方法，同时在 vLLM 部署中获得 **32%–43% 更高吞吐**。论文给出的解释有两层：首先，prompt 是 KV 中更脆弱的部分，许多 selector 的差异实际上来自它们是否意外破坏了 prompt；其次，长 CoT 自身存在文本级重复，同时多个 attention head 又保存了不同副本，因此 reasoning trace 对随机丢失具有较高冗余。
+
+这个结论不能被泛化成“KV importance scoring 没有价值”。它的实验结论明确建立在 reasoning workload、保留 prompt、按 head 随机驱逐等条件上。但它提出了一个很重要的基线要求：未来复杂 KV scorer 至少应该证明收益来自**真正更好的选择信号**，而不是 prompt pinning、预算分配或额外计算路径差异。代码已由作者公开在 [SalesforceAIResearch/Random-Attention](https://github.com/SalesforceAIResearch/Random-Attention)。
+
+### InertiaKV：时间聚合可能比 scorer 的细微变化更重要
+
+[What Matters for Aggressive Decoding-Time KV Eviction? Temporal Aggregation and Ranking Preservation](https://arxiv.org/abs/2609.03515) 从另一个角度拆解 KV 驱逐。论文认为，研究通常把注意力放在 token scoring function，却把跨 decode step 的 temporal aggregation 当成实现细节。
+
+作者观察到，在激进压缩下，使用 EMA 聚合后，只要 scorer 修改大体保持原排序，最终 eviction set 就会非常接近。基于此，他们提出 InertiaKV，并给出周期性更新版本 InertiaKV-Lazy；公开摘要报告后者相对每步完整刷新的 InertiaKV 获得 **1.34–1.46× decode throughput**。论文还测试了 Score-Free operating point：只在第一个 decode step 对全上下文打一次分，此后冻结排序；摘要报告平均质量变化为 +0.03，同时移除了后续 scoring。
+
+值得注意的是，作者明确没有声称 scoring quality 在一般情况下不重要。更准确的结论是：在特定 aggressive compression 配置中，**跨步聚合规则与 ranking preservation 是独立且重要的设计维度**。这与 Random Attention 形成了有价值的交叉证据：KV 压缩研究需要把 scorer、时间聚合、prompt 保护、刷新频率和容量控制拆开做严格消融，而不是把所有收益归因于“重要性预测更准”。
+
+### Speculative Macro Commit：把推测执行从 token 推到工具动作链
+
+[Speculative Macro Commit for Faster Tool-Using Agents](https://arxiv.org/abs/2609.03236) 针对工具型 Agent 的串行 action–observation 延迟。系统由大型 authoritative actor 和更快的 speculative drafter 组成；drafter 在隔离的 environment snapshot 中持续预测并执行未来动作链，系统再利用训练 trace 中挖掘出的 recurring multi-action skeleton 建立 macro library。
+
+当 actor 的下一次工具调用与草稿链首动作一致时，SMC 可以提交后续已经预执行的动作和 observation，而不必逐步等待环境返回。论文使用 Qwen3.5-27B INT4 作为 actor、Qwen3.5-4B 作为 drafter；在 τ²-Bench Telecom 子集上，相比 Speculative Actions 基线降低 **10.23%** 延迟，相比顺序执行降低 **18.59%**；在 AppWorld 上分别降低 **7.7%** 和 **44.9%** wall time，但后者伴随小幅任务完成率下降。作者已公开[实现代码](https://github.com/zeyuliu1037/speculative-macro-commit)。
+
+这里最重要的系统变化是验证边界。token speculative decoding 验证的是候选 token；SMC 验证的是 actor 当前动作是否与已在隔离状态中展开的未来轨迹对齐。因此 snapshot、环境副作用隔离、observation 可提交性和失败回滚会成为核心 runtime 机制，而不只是模型推理优化。
+
+### Legibility is Not Interpretability：CoT 文本可读，不等于步骤重要性可被可靠读出
+
+[Legibility is Not Interpretability: Comparing Judged and Actual Importance in Chain-Of-Thought Reasoning](https://arxiv.org/abs/2609.04194) 讨论了 reasoning trace 被用作可解释性信号时的一个基本假设：一个步骤写得清楚，并不意味着观察文本就能知道它对最终结果究竟有多重要。
+
+论文把步骤重要性定义为 advantage，即“包含该步骤”对期望 reward 的变化，并通过 Monte Carlo rollout 估计。结果显示，较强的 LLM judge 虽然能超过 prevalence baseline，但距离 noise ceiling 仍有明显差距；专门微调 step-level critic 后，对错误回答的判断改善明显，但对正确回答仍远未达到 ceiling。作者因此提醒，不应把 reasoning trace 的语言可读性直接等同于模型内部因果过程的可解释性。
+
+对系统研究而言，这也意味着用 CoT 文本直接生成缓存重要性、执行优先级或安全决策时要谨慎：文本层的“看起来关键”与对最终 reward 的真实边际贡献并不是同一个量。
+
+## 开源项目的重要新闻
+
+### vLLM：尝试把 speculative decoding 从 engine 级配置下沉到请求级策略
+
+vLLM 的开放 PR [#55412](https://github.com/vllm-project/vllm/pull/55412) 增加 `SamplingParams.disable_spec_decode`，目标是在同一启用了 speculative decoding 的 engine 中，让特定请求选择不参与 draft/verify。PR 设计保持统一 batch shape：被禁用请求仍走单 token decode，占位路径不改变 CUDA graph 形状；对 ngram、suffix 和 custom-class 等 CPU drafter，还会避免为这些请求做 proposal work。
+
+这个改动的价值不在一个布尔参数本身，而在于 speculative decoding 开始变成**请求级调度策略**。短输出、structured output 或与交互流量混跑的 batch job 未必都从 speculation 获益。不过 PR 也明确说明，EAGLE、draft-model、DFlash 等 GPU drafter 目前仍会对这些 row 执行 forward，只是 proposal 最终被 scheduler 丢弃，因此“请求级关闭”还没有完全转化为 GPU proposal cost 的节省。当前应视为开放 PR，不应写成已发布特性。
+
+### SGLang：prefill CP 的正确性依赖 token 分片与 TP MLP 的通信边界
+
+SGLang 开放 PR [#38078](https://github.com/sgl-project/sglang/pull/38078) 修复 strategy prefill context parallelism 下 dense MLP 的通信错误。问题根源是 CP-sharded prefill batch 直接进入跨完整 TP group 的 `RowParallelLinear`，不同 CP rank 上属于不同 token 的 partial output 被错误 all-reduce 到一起，造成 hidden state 污染，进一步表现为生成不结束和 KV pool retraction 循环。
+
+修复方案在进入 TP-sharded dense MLP 前执行 CP gather，并在之后恢复分片，同时禁止会跳过必要 postprocess scatter 的跨层 MLP all-reduce fusion。PR 给出的 1×GB300、Qwen3-32B、TP4/CP2 测试中，修复后 GSM8K 从主线配置的 0.075 恢复到 0.935，无 HiCache 时 20/20 probe 均正常停止；带 HiCache 的测试报告 0.940 且没有 retraction。由于这是 PR 作者提供的验证结果，且 PR 仍处于评审/CI 流程，不能视为稳定版本保证。
+
+# 深度分析
+
+## 前沿概念和技术
+
+今天几项材料共同指向两个值得明确区分的概念。第一是 **capacity policy 与 eviction policy 的分离**：GrowPage 决定请求应拥有多少 KV page，Random Attention/InertiaKV 决定给定预算下如何保留状态。过去很多工作默认前者固定，导致研究焦点集中在 scorer；现在 reasoning workload 的动态性正在迫使系统同时优化容量和内容。
+
+第二是 **speculation 的层级上移**。传统 speculative decoding 在 token 层工作，而 SMC 把草稿对象扩展为带环境副作用的 action chain。这使“验证”从 logits/token acceptance 变成状态一致性与动作前缀匹配。对于 Agent serving，未来的 speculative runtime 很可能必须把 snapshot、rollback、side-effect isolation 与模型调度放在同一设计空间中。
+
+## 对大模型推理与存储优化的启发
+
+从今天的公开材料可以得到三个较稳健的系统启示。首先，长 reasoning 的 KV 需求不是静态变量；仅优化 token eviction 而不考虑请求间和请求内的容量变化，可能错过更高层的资源调度机会。其次，复杂 scorer 的收益必须与 temporal aggregation、prompt protection 和 refresh overhead 分离测量。Random Attention 和 InertiaKV 都说明，一个看似“更聪明”的打分器并不必然转化为更好的端到端系统结果。
+
+再次，Agent 的状态管理越来越难用普通 chat serving 抽象覆盖。SMC 的收益来自工具调用和环境执行的串行延迟，而不是单纯减少模型 FLOPs；其正确性又依赖环境快照和提交语义。这说明 Agent runtime 的性能优化需要显式建模 workflow state、side effects 与恢复边界。
+
+# 今夜白的观察
+
+今天最值得继续跟踪的是 KV 压缩研究正在出现一次方法论上的“去 scorer 中心化”。GrowPage 问的是预算是否应该动态增长，Random Attention 问的是选择信号是否真的必要，InertiaKV 问的是跨步时间聚合是否被长期低估。三者并不互相否定，反而共同要求未来论文提供更细的因果消融：容量、选择、聚合、刷新和数据移动分别贡献了多少收益。
+
+另一个趋势是推测执行正在从模型内部优化变成 runtime speculation。只要预测对象从 token 变成工具动作，系统就必须面对外部世界状态。真正可部署的 Agent speculation 因此不仅需要高 acceptance rate，还需要低成本 snapshot、可判定的副作用边界和可靠 rollback。相比继续把 Agent latency 简化成 TTFT/TPOT，这可能是更值得建立新 benchmark 和系统抽象的方向。
+
+# 参考资料
+
+论文与预印本：
+
+- [GrowPage: On-Demand KV Budgeting for Efficient LLM Reasoning Serving](https://arxiv.org/abs/2609.03494)
+- [Random Attention: Rethinking KV Cache Eviction for Efficient Reasoning](https://arxiv.org/abs/2609.03430)
+- [What Matters for Aggressive Decoding-Time KV Eviction? Temporal Aggregation and Ranking Preservation](https://arxiv.org/abs/2609.03515)
+- [Speculative Macro Commit for Faster Tool-Using Agents](https://arxiv.org/abs/2609.03236)
+- [Legibility is Not Interpretability: Comparing Judged and Actual Importance in Chain-Of-Thought Reasoning](https://arxiv.org/abs/2609.04194)
+
+官方代码与工程变更：
+
+- [SalesforceAIResearch/Random-Attention](https://github.com/SalesforceAIResearch/Random-Attention)
+- [Speculative Macro Commit implementation](https://github.com/zeyuliu1037/speculative-macro-commit)
+- [vLLM PR #55412：per-request disable_spec_decode](https://github.com/vllm-project/vllm/pull/55412)
+- [SGLang PR #38078：prefill CP dense MLP gather fix](https://github.com/sgl-project/sglang/pull/38078)
