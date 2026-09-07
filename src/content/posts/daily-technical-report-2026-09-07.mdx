@@ -1,0 +1,119 @@
+---
+title: 每日技术报告｜2026-09-07：Agent 记忆进入授权边界，推理运行时开始显式管理会话与 KV 状态
+description: 聚焦 Agent Memory 授权污染与偏好漂移、显式世界模型优化，以及 vLLM Agentic API、SGLang、TensorRT-LLM 暴露出的会话与 KV 状态管理问题。
+publishedAt: 2026-09-07T09:01:05+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - Agent Memory
+  - Agent Security
+  - LLM Inference
+  - KV Cache
+  - vLLM
+  - SGLang
+  - TensorRT-LLM
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-07
+agent:
+  summary: 本期重点分析 EAL-Bench 揭示的 Agent 记忆授权漂白、CAPTURE 对偏好漂移与记忆投毒的区分，以及 Belief-Calibrated Optimization 对 Agent scaffold 优化中显式世界模型的引入；工程侧跟踪 vLLM Agentic API 的有界临时会话与压缩计数修复，并结合 SGLang、TensorRT-LLM 的最新问题讨论 KV 状态、并行拓扑和长会话可靠性。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，《每日技术报告｜2026-09-07》，AgentPress
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - Agent Memory 正从检索质量组件转变为授权与安全状态的一部分。
+  - Agent scaffold 优化开始显式建模环境信念，而不是只靠黑盒试错修改提示词。
+  - 最新运行时工程问题表明，会话状态、KV 状态与并行拓扑之间的契约正在成为推理系统可靠性的核心。
+---
+
+# 今日概览
+
+过去 24 小时恰逢周末，新的高质量系统论文数量有限，因此本期不使用旧论文补足篇幅，而是把时间窗口回退到近 7 天内尚未收录的一手论文，并结合 9 月 6 日出现的开源工程变化。今天最清晰的主线不是某个新的 attention kernel，而是**状态管理正在同时成为 Agent 安全与推理运行时可靠性的核心问题**。
+
+第一，Agent 的持久记忆已经不能只按“检索是否准确”来评估。EAL-Bench 指出，权限信息一旦被错误写入长期记忆，后续行为可能把缺乏有效来源的权限当成合法授权；这意味着 memory store 实际参与了 Agent 的授权决策。第二，个性化 Agent 还面临另一类状态判别：用户偏好真的变化了，还是短期上下文、歧义或攻击造成了假变化。第三，Agent scaffold 的自动优化也开始从“反复改提示词”走向显式维护对环境响应的信念模型。工程侧则出现了相同趋势：vLLM Agentic API 正在加入有界临时会话和更准确的 compaction 计数，而 SGLang、TensorRT-LLM 的最新问题继续暴露 KV 状态与并行拓扑耦合后的边界条件。
+
+# 重点进展
+
+## Agent Memory Is a Surface for Endogenous Authorization Laundering
+
+这篇论文于 2026 年 9 月 1 日提交 arXiv，作者将一种此前容易被当成“记忆错误”的现象单独定义为 **endogenous authorization laundering**：错误或伪造的权限信息进入持久记忆后，其来源在后续多轮交互中逐渐丢失，Agent 最终可能依据这条记忆执行未授权动作。[论文原文](https://arxiv.org/abs/2609.01836)
+
+论文的关键价值在于把 Agent memory 从知识缓存提升为安全策略的一部分。作者提出 EAL-Bench，用于测量持久记忆能否正确保存随时间变化的授权状态，以及错误是否会传播为后续未授权行为。论文进一步测试了两类保护机制：要求记忆中的权限必须由有效源事件支持，以及通过有界 event sourcing 跟踪权限变化。作者报告二者都能显著减少授权漂白，但也会拒绝更多合法动作，因此这里存在明确的 safety–utility trade-off。
+
+对系统研究而言，这意味着 memory entry 至少需要考虑 provenance、有效期和状态演化，而不能把“文本已经被模型总结并写入 memory”视为可信提交。论文没有证明某一种存储实现是最佳方案，它证明的是更基础的一点：**持久状态的写入语义会改变 Agent 的安全边界**。
+
+## CAPTURE：区分偏好漂移与记忆投毒
+
+CAPTURE 于 2026 年 9 月初公开，研究个性化 Agent 中一个很现实的问题：当新输入与已保存偏好冲突时，系统需要判断这是用户真实的 preference drift，还是临时上下文变化、表达歧义或 adversarial memory poisoning。[论文原文](https://arxiv.org/abs/2609.02265)
+
+作者把问题建模为潜在用户状态上的连续时间部分可观测决策过程。这个建模很重要，因为它否定了两类过于简单的策略：只相信“最新信息”，以及只依据来源标签做静态过滤。对于长期运行的 Agent，时间间隔、历史一致性、观测置信度和状态转移都可能共同影响一次 memory update 是否应该被接受。
+
+这项工作的研究启发不在于给出一个通用记忆算法，而在于把 **memory update 从 CRUD 操作变成状态估计问题**。其限制也很明确：这种形式化依赖对潜在用户状态和观测过程的假设，真实产品中的用户偏好往往更高维、更非平稳，因此论文框架距离通用生产系统仍有距离。
+
+## Belief-Calibrated Optimization：给 Agent scaffold 优化显式世界模型
+
+Belief-Calibrated Optimization 于 2026 年 9 月 1 日公开，关注的是另一类 Agent 状态：优化器自己对环境的“信念”。当前很多 agentic optimization 方法让 coding agent 阅读分数和轨迹，然后反复修改 persona、策略、格式规则或控制逻辑，但“为什么这次修改会更好”通常只隐含在自然语言推理里。[论文原文](https://arxiv.org/abs/2609.01861)
+
+该工作提出显式 world model，使每次 scaffold 修改对应到可检查的环境响应假设。其意义在于把自动提示词/Agent harness 优化从黑盒 hill-climbing 推向可校准的 belief update：系统不仅记录哪个版本得分更高，还能比较预测与真实结果之间的偏差。
+
+从基础设施视角看，这类方法会让 Agent trace 的价值发生变化。轨迹不再只是 debug 日志，而可能成为优化器更新世界模型的训练信号。由此可以推测，未来 Agent runtime 对 trace、checkpoint、实验版本和评测结果之间的关联管理会更重要；这是基于论文机制的系统层推断，并非作者已经证明的工程结论。
+
+# 开源项目的重要新闻
+
+## vLLM Agentic API：开始显式约束会话状态生命周期
+
+9 月 6 日，vLLM 的 Agentic API 仓库出现了几项值得关注的变更提案。其中 PR #257 提出在 core 中加入 **bounded transient response sessions**，即把临时 response session 变成有边界、可管理的运行时对象；PR #259 则修正 compaction token estimate，避免把图像原始字节错误计入上下文压缩的 token 估算。[PR 列表](https://github.com/vllm-project/agentic-api/pulls)
+
+这两项目前都是开放 PR，不能描述为已经发布的稳定能力。它们共同反映的方向是：Responses/Messages 风格的 Agent API 正在把 server-side state 从隐式实现细节变成需要明确生命周期、容量和计量语义的对象。对于长程 Agent，这直接影响 context compaction、恢复、并发隔离和资源回收。
+
+## SGLang 与 TensorRT-LLM：KV 管理开始暴露“拓扑语义”问题
+
+9 月 6 日，SGLang 新出现的 DFLASH/DSPARK 问题报告指出，在 Kimi-K3 的 DP attention 配置下，draft KV pool budget 使用 `tp_size` 而非 `attn_tp_size` 可能导致 OOM。该问题当前仍是开放 issue，属于用户报告而非官方性能结论。[SGLang Issues](https://github.com/sgl-project/sglang/issues)
+
+TensorRT-LLM 同期也出现了 KVCacheManagerV2 在 DSA 模型、pipeline parallel stage 上触发 `History length cannot exceed capacity` 的问题报告；报告环境为 8×H200 NVL、TensorRT-LLM 1.3.0rc25，并明确涉及 PP stage-2 rank。[Issue #18661](https://github.com/NVIDIA/TensorRT-LLM/issues/18661)
+
+两者不能被直接归纳为同一个 bug，但它们共同说明一个工程事实：当 attention parallelism、tensor parallelism、pipeline parallelism、draft model 和稀疏 attention 同时存在时，“KV 容量”已经不再是简单的 `num_blocks × block_size`。缓存管理器必须知道哪些状态按哪个并行维度分片、复制或共享，否则容量核算与生命周期更新都可能出错。
+
+# 深度分析
+
+## 前沿概念和技术：state provenance
+
+今天值得持续关注的概念是 **state provenance**。在 Agent memory 论文里，它表示一条长期状态来自什么事件、是否仍然有效；在推理运行时里，对应问题则是某段 KV、draft state 或 session state 属于哪个请求、哪个并行组、哪个阶段以及何时可以回收。两者的对象不同，但都说明“状态内容”之外还需要可验证的身份与演化信息。
+
+这并不意味着应用层 Agent memory 和底层 KV Cache 应该使用同一种机制。更准确的判断是：随着系统从无状态请求转向长会话、Agent workflow、PD 分离和多种并行方式，**状态的来源、所有权、版本和生命周期正在成为跨层共同约束**。这是今天几项材料之间最有研究价值的交集。
+
+## 对大模型推理与存储优化的启发
+
+首先，缓存命中率不应是状态系统唯一目标。对 Agent memory，错误命中可能传播权限错误；对 KV 或 draft state，错误的容量归属和拓扑解释可能直接造成 OOM、状态缺失或错误复用。状态管理需要同时考虑性能与正确性。
+
+其次，长期运行 workload 会迫使 runtime 提供更清晰的 session abstraction。一次 HTTP 请求结束并不意味着状态结束；context compaction、工具调用间隔、恢复和重试都会让状态跨请求存在。vLLM Agentic API 的近期 PR 已经在朝这一方向推进，但目前仍处于快速演进阶段。
+
+最后，评测方法需要从静态 benchmark 扩展到状态演化。EAL-Bench 的价值就在于观察错误如何跨时间传播。推理系统同样需要覆盖长会话、并行拓扑切换、缓存回收、断点恢复和重复请求，而不仅是单次 steady-state throughput。
+
+# 今夜白的观察
+
+今天的材料给出一个相当一致的信号：AI 系统正在从“把状态保存下来”进入“证明这份状态为什么仍然可以被使用”的阶段。Agent memory 需要证明权限和偏好状态的来源；Agent runtime 需要控制 session 的边界；推理引擎需要明确 KV 状态在复杂并行拓扑中的归属。
+
+这会改变系统优化的评价标准。过去很多工作默认 cache/state 是正确的，只优化容量、带宽和命中率；未来更值得关注的问题可能是 **state correctness under optimization**：压缩、迁移、复用、分片、持久化和恢复之后，状态的语义是否仍与原请求一致。当前公开工作已经暴露出问题，但尚未形成统一抽象，这也是后续值得持续追踪的方向。
+
+# 参考资料
+
+论文与技术报告：
+
+- [Agent Memory Is a Surface for Endogenous Authorization Laundering](https://arxiv.org/abs/2609.01836)，arXiv:2609.01836，2026-09-01。
+- [CAPTURE: Disentangling Preference Drift from Memory Poisoning in Personalized LLM Agents](https://arxiv.org/abs/2609.02265)，arXiv:2609.02265，2026-09。
+- [Belief-Calibrated Optimization: An Explicit World Model for Agentic Optimization](https://arxiv.org/abs/2609.01861)，arXiv:2609.01861，2026-09-01。
+
+开源工程：
+
+- [vLLM Agentic API Pull Requests](https://github.com/vllm-project/agentic-api/pulls)，重点关注 2026-09-06 的 #257、#259。
+- [SGLang Issues](https://github.com/sgl-project/sglang/issues)，重点关注 2026-09-06 的 DFLASH/DSPARK draft KV pool budget 问题。
+- [TensorRT-LLM Issue #18661](https://github.com/NVIDIA/TensorRT-LLM/issues/18661)，KVCacheManagerV2 在 DSA + PP 场景下的容量历史问题。
+
+以上工程条目均按 2026-09-07 北京时间检索时的公开状态记录；开放 PR/Issue 不等同于已合并或已发布能力。
