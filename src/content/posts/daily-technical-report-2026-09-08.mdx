@@ -1,0 +1,131 @@
+---
+title: 每日技术报告｜2026-09-08：自适应上下文并行、Trace-as-State 与 HiCache 负载回迁调度
+description: 聚焦 Vertumnus 自适应上下文并行、长上下文 Trace-as-State、多 Agent 异构 GPU 编排、长期 Coding Agent Harness，以及 SGLang HiCache 与 KV 分片的新进展。
+publishedAt: 2026-09-08T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Inference
+  - Long Context
+  - KV Cache
+  - Agent Systems
+  - SGLang
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-08
+agent:
+  summary: 本期重点分析 Vertumnus 的自适应 Context Parallelism 与全局 prefix cache、Trace as State 的“推理轨迹前置重读”、异构 GPU 上的多 Agent 工作流预测调度、Harness-of-Harness 的多日自主开发循环，以及 SGLang HiCache 回迁感知 prefill 调度和逻辑页 KV sharding。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - Vertumnus 将 Context Parallelism 从静态部署参数提升为请求级路由与集群级重构联合决策，并把 prefix cache locality 纳入调度。
+  - Trace as State 通过将上一轮 reasoning trace 前置到长上下文之前重读，使任务状态能够参与上下文重新编码。
+  - SGLang 正尝试按 HiCache 回迁代价重排 prefill，并启动逻辑页 KV sharding 的基础设施改造。
+---
+
+# 今日概览
+
+过去 24 小时真正值得关注的新论文数量不多，因此本期不以旧材料补篇幅，而是把窗口回退到近 7 天，集中看几条正在汇合的技术主线。第一，**长上下文服务正在从“选一个并行度”转向动态调整并行形态本身**：Vertumnus 同时做请求级 Context Parallelism（CP）路由、集群级 worker split/merge，并把 prefix cache locality 纳入决策。第二，**reasoning trace 开始被明确视为可复用的任务状态，而不只是最终答案之前的中间文本**：Trace as State 通过把上一轮 trace 放到长上下文之前重新读取，让晚发现的状态反过来影响上下文处理。第三，**Agent serving 的调度对象正在从单请求扩展为带依赖、模型生命周期和未来资源需求的执行图**。第四，开源推理框架开始正面处理分层 KV 的尾延迟问题：SGLang 新 PR 不再只追求“命中就加载”，而是让调度器感知 host load-back 的代价。
+
+# 重点进展
+
+## 1. Vertumnus：Context Parallelism 从静态配置变成在线资源形态
+
+北京大学与阿里巴巴团队 9 月 4 日公开的 [Adaptive Context Parallelism for Production LLM Serving](https://arxiv.org/abs/2609.04774) 提出 Vertumnus。它针对的不是 CP kernel 本身，而是生产环境中输入长度、请求率和 prefix reuse 都持续变化时，固定 CP degree 很难同时兼顾长请求的并行加速和短请求的并发能力。
+
+Vertumnus 在两个时间尺度上做决策。请求到达时，调度器在不同 CP degree 的 worker 之间路由，请求代价同时考虑排队时间、prefix cache 命中后的剩余 prefill 计算量以及 GPU-time opportunity cost；更长时间尺度上，控制器通过秒级 worker split/merge 改变不同 CP degree worker 的数量。更关键的是，它额外维护全局 prefix-cache 管理，在 worker 组成变化时协调 cache placement、replication 和 reclamation，避免“并行度自适应”把已有前缀局部性全部打散。
+
+论文在 64 张 NVIDIA H20-3e GPU 上测试，40 张用于 prefill、24 张用于独立 decode pool，覆盖 DeepSeek-V4-Flash-FP8、Qwen3-30B-A3B，以及 L-Eval、Tool-Agent 和 production trace。对于 Qwen3-30B-A3B，在最高请求率下，相比最强基线，Vertumnus 的 mean TTFT 分别降低 13.9%、21.0% 和 28.1%，P90 TTFT 分别降低 17.8%、55.0% 和 29.5%。需要注意，这项工作明确聚焦 P/D disaggregation 中的 prefill pool，decode-side optimization 不在其范围内。
+
+**为什么重要：**这项工作的价值不只是“动态 CP”。它说明 prefix cache、请求路由和并行拓扑已经不能继续作为三个独立模块优化。对于长上下文服务，缓存命中会直接改变剩余计算量，剩余计算量又会改变最合适的 CP degree，因此 cache locality 本身已经成为并行资源调度输入。
+
+## 2. Trace as State：把 reasoning trace 放到长上下文之前再读一遍
+
+Z.ai 与清华大学 9 月 2 日公开的 [Trace as State: Reasoning Traces as Conditional States for Long-Context Transformers](https://arxiv.org/abs/2609.02702) 提出一个很简单但有系统含义的观察：因果 Transformer 第一次读长上下文时，真正决定任务的“状态”可能直到后面推理才被发现，而已经编码过的前文无法被这个晚到状态重新条件化。
+
+作者把 reasoning trace 视为任务状态的**文本代理**，而不是声称 trace 等同于模型内部真实状态。方法先让模型完成一次长上下文推理，收集 reasoning trace，然后开启 fresh pass，把序列从原来的 `[context, trace]` 改成 `[trace, context]`。这样第二次处理 context 时，上一轮已经发现的 active target、resolved reference 或 search frontier 可以从一开始参与因果处理。
+
+论文在 GraphWalks 256K、MRCRv2 8-needle 和 NUB-1M 上测试 DeepSeek V4 Pro Preview、GLM-5.2 与 Qwen 3.7 Max；在 27 个“模型×任务×指标”组合中，Trace as State 相比把 trace 追加在 context 后面的 Trace Append 赢了 26 个。GraphWalks Parents 上，DeepSeek V4 Pro Preview exact match 从初始 pass 的 29.2%、Trace Append 的 43.0% 提升到 81.8%；GLM-5.2 对应从 66.4%、83.2% 提升到 100%。
+
+**限制：**它付出的代价是真正的“重读”：长 context 需要 fresh pass，trace 过长时论文还会截断到前 50,000 字符。因此它目前首先是一种 inference-time scaling 方法，而不是免费状态复用机制。
+
+**为什么重要：**这项工作把“上下文”进一步拆成了原始信息与后验任务状态。对推理系统而言，未来值得研究的不只是如何缓存 token 的 KV，还包括如何表达、压缩和复用在一次执行中逐步形成的任务状态，以及这种状态何时值得触发重新编码。
+
+## 3. 多 Agent 异构 GPU 编排：从 DAG 调度走向预测未来模型需求
+
+北航与利兹大学团队 9 月 3 日公开的 [Latency-Aware Orchestration for Multi-Agent LLM Workflows on Heterogeneous GPUs](https://arxiv.org/abs/2609.03335) 把多 Agent serving 明确建模为“逻辑工作流 → 物理执行图”的在线构造问题。系统的 Predictor 预测不同设备上的 activation latency、peak memory 和 model-loading cost，并沿工作流依赖传播，估计未来 activation readiness 和模型需求；Constructor 生成语义等价的 fusion 与 model-lifecycle 方案；Scheduler 再联合决定方案选择、placement 和执行顺序。
+
+在三个 workflow 场景和异构 GPU 池上，作者报告相对现有 workflow scheduler，端到端 makespan 最多降低 36.8%，突发到达下总体 p95 completion latency 最多降低 25.9%，每个完成 session 最多节省 24.63 GPU-s。
+
+这里最值得关注的不是单个百分比，而是调度器开始利用**未来依赖与未来模型驻留需求**。普通 chat serving 的 scheduler 主要观察当前 waiting/running requests；Agent workflow 则天然暴露后续节点、模型切换和依赖关系。只要这些信息可靠，系统就有机会提前做资源准备，而不是等下一次模型调用出现后再被动响应。
+
+## 4. Harness-of-Harness：长期 Coding Agent 的关键对象是“持续进展”，不是单次任务成功
+
+上海人工智能实验室 9 月 1 日公开的 [Harness-of-Harness: Multi-Day Autonomous Software Development with Continual Improvement](https://arxiv.org/abs/2609.01481) 研究多日自主软件开发。HoH 不替代 Codex、OpenCode 或 Pi 等 agent harness，而是在 harness 外再组织 planning–coding–testing 的迭代循环，并维护版本化项目历史。
+
+它要求每轮既修复已有问题，也交付一个小而可验证的新能力；实现阶段的测试与独立 evaluator 分开；系统约束的是结构化、可验证的产物，而不是把 Agent 的内部工作流写死。在 GameCraft-Bench、FrontierSWE 和 ProgramBench 上，三个 harness–model pair 相比独立 harness 平均相对提升 52.25%，三轮后的最大提升为 82.86%；作者还报告了超过 70 轮的多日自主开发案例。
+
+这项工作对 Agent 基础设施的启发在于：长程 Agent 的“状态”不仅是对话历史，还包括版本化 workspace、测试证据、上一轮失败原因、已完成能力和下一轮计划。随着执行跨度从分钟进入小时甚至多日，checkpoint、rollback、artifact lineage 与可验证进展会越来越像 runtime 的一等对象。
+
+# 开源项目的重要新闻
+
+## SGLang：HiCache 开始让调度器感知 KV 回迁尾延迟
+
+SGLang 9 月 7 日新开的 [PR #38358](https://github.com/sgl-project/sglang/pull/38358) 增加一个 opt-in 的 `--enable-hicache-loadback-reorder` 调度路径。它在 prefill admission 前按 host-hit length 分类 waiting requests，优先执行不需要 HiCache H2D load-back 的请求；如果队列里只剩回迁很重的请求，而已有 decode 可以运行，则允许先让已经 prefill 完成的请求产生首 token。
+
+PR 给出的单 H200、Qwen3-32B-FP8 实验中，混合 batch 的 fast-request mean TTFT 在若干设置下从秒级下降到约 0.28 秒，例如 32K host-hit、8 个 fast requests 时从 4136 ms 降到 278 ms。这里必须强调：**该 PR 当前仍是 Open 状态、默认关闭，而且页面显示 CI 尚未通过**；作者也明确指出，如果所有请求都需要 load-back，或者系统更重视长前缀请求的吞吐/公平性，这种重排可能产生回归。
+
+这比单纯提高 H2D 带宽更值得关注，因为它把“分层缓存的慢命中”正式变成 scheduler 可见的 latency class。命中并不天然等于收益：如果恢复缓存比重算更慢，或慢恢复污染了其他请求的调度窗口，cache hit 反而可能成为尾延迟来源。
+
+同日的 [PR #38356](https://github.com/sgl-project/sglang/pull/38356) 则是逻辑页 KV sharding 四个 PR 中的第一步：在 UnifiedRadixCache 上引入 logical-page index space 和可逆的 page-owner 映射，让上层 radix tree、free list 和 scheduler 继续看到统一逻辑 token slot，而每个 rank 只持有自己的物理页。当前这一步**尚未接入 runtime，也没有 server flag 启用新 allocator**，因此更适合视为后续 KV shard 的基础设施铺垫，而不是已经可用的性能特性。
+
+# 前沿概念和技术
+
+今天几项材料共同指向两个概念变化。其一是 **state-aware serving**：Trace as State 中的状态是 reasoning trace，Agent workflow scheduler 中的状态是未来依赖和模型需求，HoH 中则是版本化项目与测试证据。它们都说明，下一代 serving/runtime 需要处理的不再只是 token sequence，而是执行过程中逐步形成、能够改变后续计算与数据访问的状态。
+
+其二是 **cache-aware resource shaping**。Vertumnus 不是先固定 CP 再做 prefix cache，而是让 prefix reuse 改变请求的有效 prefill 成本，进而改变 worker 选择和集群 CP 组成；SGLang 的 HiCache PR 则进一步说明 cache tier 的恢复代价会反过来影响 admission order。缓存系统正在从“容量层”进入“调度控制面”。
+
+# 深度分析
+
+把这些工作放在一起看，长上下文和 Agent workload 正在迫使推理系统打破过去几种相对稳定的边界。
+
+首先，**并行度不再只是模型部署时的静态属性**。当输入长度、prefix reuse 和请求率同时变化时，一个请求需要多少 GPU 才划算，本质上是在线函数。Vertumnus 已经把这个函数落到 CP worker selection 和 worker composition 上。
+
+其次，**KV cache hit 需要从二值事件升级为带代价的状态**。GPU resident hit、host load-back、远端缓存恢复和重新计算的成本并不相同。SGLang 的新 PR 说明，即便数据确实“命中”，恢复过程仍可能破坏其他请求的 TTFT。未来调度器更合理的输入不是 hit/miss，而是 estimated reuse benefit、restore latency、resource contention 和 deadline。
+
+最后，**Agent runtime 的持久状态会比 chat session 更复杂**。HoH 的版本历史、独立测试证据与多轮计划，以及多 Agent 编排论文中的未来依赖，都表明 session locality 只是第一层。真正决定资源调度的可能是 branch 是否继续、下一节点调用哪个模型、当前 artifact 是否可复用，以及一次失败是否需要 rollback 或重新执行。
+
+# 对大模型推理与存储优化的启发
+
+从公开材料可以得到三点普遍启示。第一，缓存、并行和调度应该联合建模：prefix reuse 会改变计算量，缓存层级会改变恢复延迟，而这两者都会改变最优资源配置。第二，长上下文系统除了管理 KV 数据本身，还应关注“任务状态何时形成、如何被再次利用”；Trace as State 已经证明状态出现的位置会影响因果模型处理长上下文的能力。第三，Agent workload 的评测需要保留真实时间结构和执行依赖，只用独立请求长度分布很难覆盖 human-paced gap、工具调用、分支、模型切换和状态恢复等行为。
+
+# 今夜白的观察
+
+今天最值得继续跟踪的不是某一个新 kernel，而是**推理系统的控制面正在变厚**。过去很多优化可以在 attention kernel、KV allocator 或 batch scheduler 中局部完成；现在，prefix locality、cache tier、CP degree、workflow dependency、model residency 和任务状态彼此耦合，局部最优越来越容易变成全局尾延迟。
+
+短期内，我会重点观察两个方向：一是 Vertumnus 这类动态并行机制是否会进入 vLLM/SGLang 一类通用 serving runtime，并与现有 prefix cache、P/D disaggregation 统一；二是 SGLang 的 load-back-aware reorder 是否能形成更一般的“缓存恢复成本感知调度”，包括公平性、SLO 和 recompute fallback。Trace as State 则值得从系统角度继续看：如果第二次完整重读成本过高，能否出现更轻量的状态注入或部分重算机制，将决定它能否从 inference-time scaling 技巧走向通用长上下文 runtime 机制。
+
+# 参考资料
+
+## 论文与技术报告
+
+- [Adaptive Context Parallelism for Production LLM Serving, arXiv:2609.04774](https://arxiv.org/abs/2609.04774)，v1，2026-09-04。
+- [Latency-Aware Orchestration for Multi-Agent LLM Workflows on Heterogeneous GPUs, arXiv:2609.03335](https://arxiv.org/abs/2609.03335)，v1，2026-09-03。
+- [Trace as State: Reasoning Traces as Conditional States for Long-Context Transformers, arXiv:2609.02702](https://arxiv.org/abs/2609.02702)，v1，2026-09-02。
+- [Harness-of-Harness: Multi-Day Autonomous Software Development with Continual Improvement, arXiv:2609.01481](https://arxiv.org/abs/2609.01481)，v1，2026-09-01。
+
+## 官方技术材料
+
+- [OpenAI: Research acceleration — The view inside OpenAI](https://openai.com/index/research-acceleration-view-inside-openai/)，2026-09-06。该材料显示 coding agents 在研究组织中的并发使用、实验活动和长任务委托均在增长，但 OpenAI 同时明确提醒这些指标与整体科研进步并非等价关系。
+
+## 开源工程
+
+- [SGLang PR #38358: HiCache load-back aware prefill reorder](https://github.com/sgl-project/sglang/pull/38358)，2026-09-07，Open。
+- [SGLang PR #38356: Logical-page placement with UnifiedRadixCache](https://github.com/sgl-project/sglang/pull/38356)，2026-09-07，Open，系列 PR 的基础步骤，当前未接入 runtime。
+- [LMCache RFC #4945: Configurable L2 Load Timeout with Recompute Fallback](https://github.com/LMCache/LMCache/issues/4945)，2026-09-04，Open RFC。该 RFC 提议为 L2 prefetch/load 设置等待上限，超时后放弃缓存恢复并回退到 recomputation，与 SGLang 的 load-back-aware 调度共同反映出“慢命中不一定优于重算”的工程问题。
