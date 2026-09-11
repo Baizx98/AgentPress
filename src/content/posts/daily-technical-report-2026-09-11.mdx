@@ -1,0 +1,112 @@
+---
+title: 每日技术报告｜2026-09-11：DeepSeek V4.1 Flash 将 KV 压缩推到模型架构层
+description: 聚焦 DeepSeek V4.1 Flash 的 Causal Encoder–Decoder、CSA2、FP4 KV 与 SWA Bounded Replay，并结合 vLLM 混合状态量化 RFC 分析新型模型状态对推理系统的影响。
+publishedAt: 2026-09-11T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Inference
+  - KV Cache
+  - DeepSeek
+  - Sparse Attention
+  - Agent
+  - Long Context
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-11
+agent:
+  summary: 本期重点解析 DeepSeek V4.1 Flash：40 层被组织为 20 层 causal encoder + 20 层 decoder，结合 CSA2 跨层 KV/索引复用、FP4 主 KV、SWA Bounded Replay、层次化稀疏索引，将全局 KV 压至 890 bytes/token；同时结合 vLLM 的混合 Mamba/GDN FP8 KV RFC，讨论统一分页对异构状态量化收益的限制，以及 Agent 长上下文服务中模型架构与缓存层次协同的新趋势。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，AgentPress 每日技术报告，2026-09-11
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - DeepSeek V4.1 Flash 用 Causal Encoder–Decoder 将 prefill 与 decode 的计算结构显式分离。
+  - CSA2、FP4 主 KV 与 SWA Bounded Replay 将全局 KV 压到 890 bytes/token，并将持久化 KV 降至上一代约 1/8。
+  - vLLM 的混合 Mamba/GDN RFC 表明统一 page 抽象会抵消 KV 量化收益，服务框架需要感知异构模型状态。
+---
+
+# 今日概览
+
+过去 24 小时最值得关注的技术事件并不是又一个单纯依靠参数规模扩张的模型发布，而是 DeepSeek 在 9 月 10 日公开的 **DeepSeek-V4.1-Flash**。它把长上下文推理中最昂贵的两类成本——prefill 计算与 KV Cache 容量——直接纳入模型架构设计：40 层 Transformer 被组织为 20 层 causal encoder 与 20 层 decoder，输入阶段每 token 激活 8B 参数，生成阶段激活 16B 参数；同时通过 CSA2、FP4 主 KV 缓存和 SWA Bounded Replay，把全局 KV 压到 **890 bytes/token**，约为上一代 V4-Flash 的 1/4。[DeepSeek 官方发布](https://www.deepseek.com/en/news/deepseek-v4-1-flash/) [技术报告与模型卡](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
+
+今天可以提炼出四个判断。第一，**KV Cache 已经从 serving 层的被动优化对象变成模型架构的一等设计变量**。第二，稀疏注意力优化正在从“每层独立做 Top-K”走向跨层共享 KV、索引器状态和候选集合。第三，Agent 工作负载的输入远长于单次输出，使 prefill/decode 非对称结构获得了更明确的经济价值。第四，推理框架面对的状态已经不再是同构的 K/V 张量：vLLM 最近关于 Mamba/GDN 混合模型 FP8 KV 的 RFC 显示，只要分页仍按统一最大 page 尺寸组织，某一种未量化状态就可能吃掉其他状态的量化收益。[vLLM RFC #55196](https://github.com/vllm-project/vllm/issues/55196)
+
+# 重点进展
+
+## DeepSeek-V4.1-Flash：把 KV 压缩写进模型结构
+
+**新增点。** DeepSeek 于 2026 年 9 月 10 日正式发布 V4.1-Flash，并同步公开技术报告、模型权重和推理参考实现。它是 552B backbone 参数的多模态 MoE，支持最高 1M token 上下文；官方将其定位为新架构系列中的较小型号，而不是 V4-Flash 的简单参数迭代。[官方发布](https://www.deepseek.com/en/news/deepseek-v4-1-flash/) [Hugging Face](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
+
+**解决的问题。** 传统 decoder-only 模型在长 prompt 上需要让完整网络参与 prefill，并为大量层分别保留 KV。对 coding agent、research agent 等输入不断累积的工作负载，这会同时放大计算量、HBM 占用以及跨请求持久化 KV 的存储成本。V4.1-Flash 的核心变化，是不再把“每一层都独立产生并持有完整历史状态”当成默认前提。
+
+**核心机制。** 第一项机制是 Causal Encoder–Decoder（CED）。40 层网络由 20 层 causal encoder 和 20 层 decoder 组成；decoder 的 global KV 直接由 encoder 最终隐藏状态投影得到，而不是由每个 decoder layer 自己的隐藏状态分别生成。因此长 prompt 的主要 prefill 路径只激活 8B 参数/token，而 decode 激活 16B。第二项机制是 **Compressed Sparse Attention 2（CSA2）**：不同 attention layer 被静态分为 Full、Reindex、Reuse 三种模式，在深度方向共享 main KV、indexer K，并复用 Top-K 稀疏索引。decoder 还使用 Hierarchical Sparse Indexer，让后续索引层只在首个 Full layer 产生的候选池中继续检索，使深层 indexer 的搜索规模不再随完整上下文线性扩大。第三项机制是 FP4 main KV，采用 E2M1 数据格式并按每 16 个 channel 使用一个 E4M3 scale。三者组合后，官方给出的 global KV footprint 为 890 bytes/token。[技术报告](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf)
+
+另一个容易被忽略的机制是 **SWA Bounded Replay**。模型没有为了恢复 sliding-window attention 状态而长期保存全部 SWA KV，而是在需要时仅 replay 最近的窗口 token 来重建状态。DeepSeek 报告称，这使需要持久化到较慢介质的 KV footprint 降到 V4-Flash 的约 1/8。这里的意义并不只是“又少存了一份缓存”，而是模型开始显式区分**必须长期保存的状态**与**可以低成本重建的状态**。
+
+**实验与证据。** 技术报告给出的 instruct 评测均在最大 `reasoning_effort=100` 下进行。V4.1-Flash 在 Terminal-Bench 2.1 上报告 90.6 Pass@1，在 DeepSWE v1.1 上为 74.2 resolved；但在 GPQA Diamond 上为 90.9，低于报告中 GPT-5.6 Sol 的 94.1 和 Opus-5.0 的 93.4。这说明官方所谓“超过旗舰模型”不能理解为所有推理任务上的统一领先，更准确的结论是：其 Agent/coding 结果非常强，同时以显著更小的激活规模和 KV footprint 实现这些结果。不同 agent scaffold 对结果也有明显影响：DeepSWE v1.1 在报告中的不同 scaffold 结果从 65.5 到 74.2，因此 harness 不是可以忽略的实验变量。[模型卡评测表](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
+
+**限制。** 目前性能数字主要来自 DeepSeek 自己的技术报告，尚不能替代独立系统测量。尤其是 890 bytes/token 并不直接等价于真实 serving 中每请求只消耗相同数量的 HBM：page allocator、索引元数据、临时 workspace、SWA replay、MoE runtime 和 speculative decoding 都会引入额外开销。另一方面，官方虽然已给出 vLLM、SGLang 的使用入口，但复杂新算子的成熟性能仍需要主流 serving 框架后续实现和 benchmark 验证。
+
+## Agent 评测暴露出“模型能力”与“运行时”不可分离
+
+V4.1-Flash 的技术报告专门比较了 Claude Code、Codex、OpenCode、Pi、mini-SWE 与 DeepSeek Harness 等 scaffold。在相同模型下，DeepSWE v1.1 的 resolved 指标出现接近 9 个百分点的跨度。这是今天另一项值得关注的信号：对 coding agent 来说，模型权重并不是完整系统，prompt 编码、工具协议、上下文组织、停止条件、重试策略和环境交互都会改变最终结果。
+
+DeepSeek 同时发布了 `deepseek-recipe`，用 Rust 库和 Python bindings 维护 V4/V4.1 的协议级 prompt 编码与输出解析，覆盖 Messages、Chat Completions、Responses API、thinking、tool calls、images 与 generation settings，而模型推理、工具执行和 HTTP transport 仍由调用方负责。[deepseek-recipe](https://github.com/deepseek-ai/deepseek-recipe) 这比单独提供一个 Jinja chat template 更接近“模型协议运行时”：模型格式开始包含 reasoning effort、多模态内容、工具调用和流式输出等状态，serving 系统需要把它们当成协议语义，而不只是 tokenizer 前的一段字符串模板。
+
+# 深度分析
+
+## 从“压 KV”转向“减少必须存在的 KV”
+
+V4.1-Flash 最值得系统研究者关注的地方，不是 FP4 本身。单纯把 BF16/FP8 换成更低精度，只是在既定状态集合上做编码压缩；CED、CSA2 和 Bounded Replay 则分别改变了**谁产生 KV、哪些层共享 KV、哪些状态必须持久化**。这三类变化对应计算图、跨层数据依赖和状态生命周期三个层面。
+
+因此，未来的 KV 优化很可能不再适合只用“每 token × 每 layer × bytes”估算容量。对新架构，更合理的抽象需要至少区分 global KV、局部窗口状态、稀疏索引状态、可重建状态和 speculative state，并描述它们的产生、共享、失效与恢复规则。否则 serving 框架即使支持模型，也可能因为沿用旧的统一 page 假设而浪费大量内存。
+
+vLLM 9 月 3 日公开的 FP8 KV RFC 恰好提供了反例。该 RFC 报告：`--kv-cache-dtype fp8` 在 attention-only 模型上测得约 2.00× 容量提升，但在 Mamba/GDN + attention hybrid 模型上，32K context 只有 1.84×，短上下文甚至为 1.00×。RFC 给出的原因是 Mamba state 不受该 KV dtype 量化控制，而不同 group 又共享统一 page；较大的 BF16 Mamba page 会固定每 block 的字节数，使 FP8 attention page 无法真正缩小整个 pool。[vLLM RFC #55196](https://github.com/vllm-project/vllm/issues/55196) 这项 RFC 仍处于讨论状态，不能当作已经合入的解决方案，但它清楚说明：**异构模型状态与同构缓存分配器之间已经出现结构性矛盾。**
+
+# 开源项目的重要新闻
+
+本期不为了数量罗列普通 commit。过去 24 小时与主题直接相关、且有足够一手材料支撑的工程变化主要来自 DeepSeek 自身发布链路：模型权重、技术报告、prompt encoding 参考实现、minimal inference 和 `deepseek-recipe` 同步公开。Hugging Face 模型页已经给出 vLLM 与 SGLang 的调用入口，但“能够加载/调用”与“针对 CED、CSA2、FP4 KV 和 DSpark 获得生产级最优性能”是两回事，目前仍应等待主流框架的专项 kernel、内存管理与 benchmark 结果。
+
+vLLM 的混合状态 FP8 RFC 则是近 7 天内值得继续追踪的工程讨论。其状态仍为 **Open RFC**，当前价值主要在于暴露 allocator 抽象问题，而不是提供已经稳定发布的功能。今天没有发现足够可靠的一手证据表明该问题已经在正式 Release 中解决，因此不将讨论状态误写为已合并能力。
+
+# 前沿概念和技术
+
+**Causal Encoder–Decoder** 在这里不是传统 seq2seq encoder-decoder 的简单回归。V4.1-Flash 的 causal encoder 仍处理自回归上下文，关键变化是把长输入的深层重复计算和 decoder global KV 构造从完整 decoder stack 中剥离，使 prefill 与 decode 使用不同的有效计算路径。
+
+**CSA2 的跨层复用**则进一步说明 sparse attention 的优化对象正在变化。第一代稀疏 attention 常把问题定义为“每层如何快速找到本层 Top-K”；V4.1-Flash 明确复用 indexer K 和 Top-K indices，并通过层次候选池约束后续搜索。这意味着稀疏 attention 的时间相关性之外，**layer-wise locality** 也开始被模型架构直接编码。
+
+**Bounded Replay**体现的是另一种状态设计思想：如果某类状态的重建成本有严格上界，那么持久化并不一定是最优选择。对 Agent 长会话尤其如此，因为状态可能经历较长 idle gap；“存下来”和“恢复时重建”之间应该由恢复成本、介质成本和复用概率共同决定，而不是默认所有 KV 同生命周期。
+
+# 对大模型推理与存储优化的启发
+
+第一，推理框架的 cache abstraction 需要从“KV blocks”进一步走向 **model-state blocks**。Attention KV、Mamba/GDN state、稀疏 index、局部窗口状态和 draft state 的尺寸、生命周期与可重建性不同，用统一 page size 和统一 eviction 语义管理它们会越来越困难。
+
+第二，模型侧压缩会改变系统侧瓶颈，而不会消灭系统问题。当 global KV 降到 890 bytes/token 后，索引元数据、临时 buffer、通信、page fragmentation 以及跨实例缓存命中路径的相对占比都会上升。系统 benchmark 因此不能只报告理论 KV bytes/token，还需要报告真实 HBM residency、host/SSD footprint、有效带宽、恢复开销和并发容量。
+
+第三，Agent serving 的评测需要把 scaffold 当作 workload 的组成部分。DeepSeek 自己的结果已经表明，同一模型在不同 agent runtime 下会产生显著差异。未来讨论“Agent 模型更强”或“Agent serving 更快”时，都应该固定工具协议、最大步骤数、网络权限、上下文上限和 harness，否则模型、runtime 与 workload 的贡献无法分离。
+
+# 今夜白的观察
+
+今天最重要的变化，是**模型架构开始主动为缓存与存储系统设计状态**。过去系统论文通常接收一个既定 Transformer，然后讨论怎样分页、压缩、卸载和复用它产生的 KV；V4.1-Flash 则从另一侧改变问题：让 decoder 不再为长输入重复产生同样规模的 global KV，让部分层复用索引与缓存，让局部状态可以通过 bounded replay 重建，再对剩余主 KV 使用 FP4。
+
+这会把下一阶段的竞争从单点 kernel 优化推向模型—runtime 协同。对 vLLM、SGLang、TensorRT-LLM 一类框架而言，真正困难的部分可能不是“新增一个 model class”，而是如何让 scheduler、allocator、KV connector 和 distributed cache 理解这些异构状态。vLLM 的混合 Mamba/GDN RFC 已经提前展示了旧抽象失配后的结果：量化算法理论上省下的字节，可能被统一 page 布局重新浪费掉。
+
+值得继续跟踪的不是 V4.1-Flash 的榜单名次，而是三个更具体的问题：主流框架能否把 890 bytes/token 转化为接近理论值的真实并发收益；CSA2 的跨层索引复用在不同上下文分布下会怎样影响 kernel 与数据移动；以及 bounded replay 这类“以有限重算换持久化容量”的机制是否会扩展到更多模型状态。
+
+# 参考资料
+
+## 原始资料链接
+
+- DeepSeek 官方发布（2026-09-10）：https://www.deepseek.com/en/news/deepseek-v4-1-flash/
+- DeepSeek-V4.1-Flash 模型卡与技术说明：https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash
+- DeepSeek-V4.1-Flash Technical Report：https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf
+- DeepSeek `deepseek-recipe` 官方仓库：https://github.com/deepseek-ai/deepseek-recipe
+- vLLM RFC #55196，FP8 KV cache on Mamba/GDN hybrid models（2026-09-03，Open）：https://github.com/vllm-project/vllm/issues/55196
+
+本期事实与数字以以上一手材料为准。DeepSeek 的 benchmark 与容量数字属于发布方报告结果；在独立复现出现之前，本文不将其表述为跨框架、跨硬件均已验证的普遍结论。
