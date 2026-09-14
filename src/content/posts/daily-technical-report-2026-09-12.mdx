@@ -1,0 +1,148 @@
+---
+title: 每日技术报告｜2026-09-12：Agent 工作流尾延迟、PD 能效控制与路由状态复用
+description: 聚焦 Agent 工作流的 release 调度、分离式推理的阶段化能效控制、vLLM 路由专家状态复用，以及隐空间因果分析的新进展。
+publishedAt: 2026-09-12T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - Agent Systems
+  - LLM Inference
+  - PD Disaggregation
+  - KV Cache
+  - Interpretability
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-12
+agent:
+  summary: 本期聚焦四条主线：Agent 工作流通过 readiness/release 解耦降低争用下的尾延迟；PD 分离式 MoE serving 采用 prefill/decode 独立校准的功耗控制提升 tokens/J；vLLM RFC 用 prefix omission 复用 routed-expert 历史并定义与 KV offload 的一致性边界；两项隐空间研究分别从 Fisher-Rao 输出几何和层间因果干预分析模型行为与知识检索。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - Agent 工作流调度开始从单次推理请求扩展到 turn release 与未完成工作预算。
+  - PD 分离后 prefill/decode 的硬件行为差异使统一功耗策略失效，阶段化校准可显著改善能效。
+  - vLLM 新 RFC 将 prefix cache 的所有权边界扩展到 routed-expert 状态，减少多轮 Agent 重复传输。
+---
+
+# 今日概览
+
+过去 24 小时值得关注的变化并不集中在某一个新模型，而是集中在**推理系统的控制边界正在外移**：从单个 kernel、单个请求，逐渐扩展到 Agent workflow、PD 两阶段资源控制，以及 KV 之外的模型运行状态。
+
+1. Agent serving 的调度对象开始从“请求”升级为“workflow 中可释放的 turn”。新工作指出，turn 已经 ready 并不意味着应立即提交给模型服务端；在高负载下，控制 released-but-unfinished work 的规模可以直接改善端到端尾延迟。
+2. PD disaggregation 进一步暴露了 prefill 与 decode 的硬件行为差异。最新实测表明，对两阶段使用统一 Max-Q 配置并不理想；针对模型和阶段分别校准功耗/时钟，可以在保持 SLO 的同时获得更好的能效。
+3. vLLM 新 RFC 开始讨论 **routed-expert history 与 prefix/KV cache 的共同所有权边界**。对于多轮 MoE/Agent 工作负载，缓存命中不仅意味着“不重算 KV”，也意味着历史路由元数据不应被重复收集和传输。
+4. 隐空间研究继续从“相关性探针”走向“因果路径验证”：一项工作研究输出概率空间的 Fisher-Rao 几何，另一项工作通过移除原始视觉状态与 multimodal KV cache，强迫答案真正依赖 recurrent latent state。
+
+# 重点进展
+
+## 1. Agent workflow：ready 不等于应该立即 release
+
+Bochao Feng 等人在 9 月 10 日提交的论文 [Decoupling Readiness from Release for Tail-Aware Scheduling of Agentic LLM Workflows](https://arxiv.org/abs/2609.10964) 将 Agent serving 中一个容易被忽略的决策单独抽象出来：**workflow 中某个模型 turn 已经具备执行条件之后，什么时候真正把它释放给推理服务端？**
+
+普通 runtime 通常采用 eager release：工具返回或依赖满足后立即提交下一轮模型调用。但 Agent workflow 是模型调用与工具调用交替形成的 DAG/序列；当服务端拥塞时，大量 ready turn 被提前提交后会形成 released-but-unfinished work。此时 workflow 层已经失去对这些 turn 的重新排序能力，因此局部“尽快提交”可能反而恶化整个任务的尾延迟。
+
+论文提出 tail-risk-aware turn release scheduling，同时决定两个问题：下一次释放哪个 ready turn，以及系统中允许维持多少已经释放但尚未完成的工作。目标函数使用 mean-CVaR 描述未完成 workflow 的尾部风险，并结合在线估计的 turn work 与当前队列压力动态调整 release budget。作者在软件工程 Agent 的真实执行 trace、多个 LLM 和不同到达率上评估；在轻载时与 eager release 相近，在竞争加剧时，workflow flow-time 的 P95 最多获得 3.50× 加速。
+
+这个结果的重要性不只是一个新调度算法。它说明 Agent serving 存在一个普通 chat serving 中不明显的控制层：**readiness、admission 和 execution 不必是同一个事件**。工具延迟、分支依赖和 workflow 剩余工作量都可以参与调度。当前公开摘要尚不足以判断其在复杂 DAG、跨模型路由和多租户优先级下的稳定性，因此 3.50× 应理解为论文实验范围内的上界，而不是通用收益。
+
+## 2. PD 分离式推理：prefill 与 decode 不应共享同一功耗策略
+
+Jae Gon Kim 等人的 [Phase-Decoupled, Model-Calibrated Power Control for Disaggregated LLM Serving](https://arxiv.org/abs/2609.11133) 直接在 B200 分离式推理系统上研究功耗控制。作者首先测量 NVIDIA Max-Q inference profile：在其系统中，能效提高 8.6% tokens/J，但平均端到端延迟增加 5.2%。更关键的是，Max-Q 对 prefill 和 decode 使用统一设置，而两阶段实际处在不同硬件工作区间。
+
+论文据此提出 phase-decoupled controller。prefill lane 使用 SM clock window，并将窗口下界通过延迟约束校准；decode lane 则根据实测 throughput/latency cliff 自动选择 power cap。作者的解释是，分离后的 decode lane 更接近稳定的 memory-bound 工作负载，因此功耗上限可以持续生效，而不必采用相同的静态 clock lock。
+
+在 8×B200、Qwen3-Coder-480B FP8 的 Agent workload 上，论文报告 balanced mode 相对基线提升 20.4% tokens/J，平均端到端延迟增加 3.5%；同一环境中的 Max-Q 为 +8.6% tokens/J、+5.2% 延迟。Qwen3-235B-A22B NVFP4 实验中，论文方法的各运行模式在重复实验里均满足 ITL-p99 SLO，而作者测试的两个 vendor profile 未满足该约束。三天持续运行实验报告 lane pair 电力消耗降低 32.3%。
+
+限制也很明确：作者指出两个主要模型都是 MoE，dense model 可回收的收益约低 5 倍，因此论文主动将结论限定在 MoE serving。对系统研究而言，这项工作的价值在于说明 **PD disaggregation 不只是把计算阶段部署到不同 GPU 池，也创造了可以分别控制时钟、功耗、SLO 和容量的资源域**。
+
+## 3. vLLM RFC：让 routed-expert history 共享 prefix cache 的复用边界
+
+vLLM 在 9 月 11 日新开的 RFC [Efficient Routed-Expert Replay with Prefix Omission and KV Cache Offloading](https://github.com/vllm-project/vllm/issues/56402) 针对多轮 MoE 工作负载中的一个状态冗余问题：vLLM 可以返回 routed-expert IDs 供 replay 或训练使用，但当前每轮都可能重新收集、传输并拼接完整 prompt 的历史路由，即使调用方已经拥有这些数据。
+
+RFC 提议开启 prefix omission 后，只返回 cached prefix 之后新增 token 的 routed-expert 信息。关键设计不是简单切片，而是让 `request.num_cached_tokens` 成为一次 cache lookup 后不可变的 prefix ownership boundary；后续调度、preemption、reset 或 KV reload 可以改变 resident/computed KV 状态，但不能改变调用方已经拥有哪一段 route history。
+
+初步实验使用 Step 3.5 FP8、8×H200、TP=8，128 并发 lane × 100 turns。RFC 报告完整 routed-expert output 将平均延迟从 5.695 s 增至 6.642 s、RPM 从 1144.20 降至 999.29；prefix omission 为 5.793 s 和 1127.64 RPM，接近关闭 routed-expert return 的基线。该结果目前只是 RFC 作者的 preliminary performance，不应视为正式 benchmark。
+
+与 KV offloading 的兼容性是这项 RFC 最值得关注的部分。缓存块恢复后 GPU block slot 可能变化，而 route table 仍与 GPU slot 相关，因此 RFC 使用稳定的 cache/session identity，并要求初始支持的 connector 保留 `cache_salt`。调用方负责跨请求保存并正确合并 route chunks；vLLM 不验证跨轮重建。当前提案只覆盖 same-engine store/load，PD disaggregation、PP/DCP/PCP>1、二级存储 tier 和自定义 offloading spec 等仍在 scope 外。**状态复用开始从 KV tensor 扩展到与 KV 同生命周期、但语义不同的 side state**，这是比单个 RFC 更值得跟踪的趋势。
+
+## 4. 输出概率的 Fisher-Rao 几何：跨架构行为结构比 activation 坐标更稳定
+
+Dario Picozzi 在 9 月 10 日提交的 [The information geometry of large language models is shared, learned, and controllable](https://arxiv.org/abs/2609.11063) 从 Fisher-Rao geometry 研究 next-token probability 所定义的行为空间。论文的核心区分是：activation geometry 强烈依赖内部坐标系，而输出概率对应的几何更直接受模型行为约束。
+
+作者报告，在 Transformer、state-space 和 recurrent 模型之间，输出几何的一致性高于 activation geometry；共享几何可以支持 semantic-category transfer，并且与人类词语选择的一致程度随预测准确率、模型规模和训练推进而提高。论文进一步将该几何用于 minimum-disturbance local intervention，并报告相同的几何校正能够改善 steering、editing、attribution、dictionary learning 与 fine-tuning。
+
+这里需要谨慎区分“共享表示”和“共享行为几何”。论文并没有证明不同架构学习了同一套 hidden representation；相反，其论点恰恰是输出空间几何比 activation 坐标更具有跨模型可比性。对可解释性研究而言，这提供了一条减少 probe-coordinate dependence 的路径，但其控制效果是否能扩展到开放式长生成和复杂 reasoning，还需要更广泛验证。
+
+## 5. 从参数到答案：知识检索过程存在 routing 与 content 的阶段差异
+
+Wenkang Wei 等人在 [From Parameters to Answers: How LLMs Retrieve and Use Their Internal Knowledge](https://arxiv.org/abs/2609.11859) 中通过逐层 hidden-state intervention 分析模型回答事实问题时，对“查询路由信息”和“目标知识内容”的依赖如何变化。
+
+论文在 Qwen、Llama 和 Gemma 上区分了多种拟合量：例如描述当前询问哪个国家的 request direction，以及已经在 hidden state 中可用的候选内容。作者在 Qwen 的自然问题上观察到，pair-conditioned request direction 的自然强度先上升，随后对它的干预才开始影响后层知识；在 paired protocol 中，global request direction 从较早到较晚层的影响下降，而拟合出的 content dependence 持续存在。但三种模型并不呈现完全相同的轨迹：Gemma 只有部分重叠的中层 routing-content profile，Llama 在相同门限下没有持续的 routing-effect window。
+
+因此，更合适的结论不是“LLM 都先路由再取知识”，而是：**可读性、自然方向强度、因果可控性和最终内容依赖是不同测量，不能因为某个方向能被 probe 解码就认定模型正在使用它。** 论文同时公开了大量 ancillary evidence 文件，有利于复核这些分层结论。
+
+# 开源项目的重要新闻
+
+今天开源侧最有架构意义的变化是上述 vLLM routed-expert RFC，目前状态仍是 **Open RFC，反馈期两周**，并非已合并功能。它明确列出了初始 connector 范围和大量 non-goal，因此现阶段不应描述为 vLLM 已支持 routed-expert + 任意 KV offload。
+
+另外，SGLang 9 月 11 日新增的问题列表暴露了若干新模型路径的工程边界，包括量化 DFlash2 draft acceptance 异常、GLM-5.3 在 disaggregated decode + DP attention + speculative decode 组合下崩溃，以及 Kimi-K3 中止 mid-prefill 时的 KV page 管理断言。由于这些目前都是用户提交的 open bug，且尚缺乏维护者确认或修复 PR，本期只把它们作为后续跟踪线索，不将其提升为已确认的框架结论。
+
+# 前沿概念和技术
+
+## Latent reasoning 的“必要性”而不仅是“可解码性”
+
+9 月 6 日首次公开、9 月 10 日更新 v2 的 [Reason Through the Latent! Making Latent Visual Reasoning Necessary](https://arxiv.org/abs/2609.06746) 提出了一个很重要的评测原则：latent state 中存在任务信息，不代表模型真正通过 latent computation 得到答案。
+
+其 Causal Visual Recurrent Reasoning（CVRR）先让预训练视觉语言模型编码图像，再从 question hidden state 初始化 recurrence；在最终解码前，作者移除 visual states 和原始 multimodal KV cache，使最终 recurrent state 成为答案唯一可用的 image-conditioned path。论文在 V*、MMVP、BLINK 和 MME-RealWorld-Lite 上报告，在这种严格接口下 CVRR 仍保留较强性能，并用因果干预验证预测对 recurrent content 敏感。
+
+这比“hidden state 能线性 probe 出答案”更严格：研究对象从 latent informativeness 转向 **latent computation 是否是因果必要路径**。对于 J-space、latent workspace、activation reasoning 等尚未形成统一定义的方向，这类 intervention-based criterion 比术语本身更值得借鉴。
+
+# 深度分析
+
+今天几项看似分散的工作实际上指向同一个系统问题：**状态已经越来越多，但状态的所有权、可释放时机和控制域仍没有统一抽象。**
+
+Agent workflow 论文把“ready state”与“released state”分开；PD 能效论文把同一个模型服务的 prefill/decode 分成独立控制域；vLLM RFC 又把 routed-expert history 与 KV cache 的复用边界对齐。这些工作都不是单纯增加一种缓存或一个 scheduler heuristic，而是在重新定义什么时候一个状态属于谁、什么时候可以复用、什么时候应该进入下游系统。
+
+这也意味着只优化单请求 token throughput 越来越不够。Agent workload 的关键指标可能是 workflow flow time 与 tail risk；分离式 serving 需要同时观察 phase-specific latency、power cliff 与 SLO；状态复用则需要把 cache identity、session isolation、metadata ownership 和恢复语义放在一起。系统设计正在从“更快地执行一次 forward”转向“更准确地管理长期存在、跨阶段流动的推理状态”。
+
+# 对大模型推理与存储优化的启发
+
+第一，**缓存命中率不应成为唯一目标。** vLLM RFC 展示了一个典型例子：同一个 cached prefix 同时对应 KV 与 routed-expert history；如果二者的 identity 或 ownership 不一致，单纯提高 KV hit rate 可能产生错误的状态拼接。未来多级缓存接口需要更明确地表达 cache identity、状态类型和有效范围。
+
+第二，**offload/reuse 的决策应考虑等待成本与替代执行成本。** 不论是 KV load、workflow queue，还是 PD 阶段的功耗限制，本质上都存在“继续等待/复用”与“重新计算/立即执行”的机会成本。仅按容量或历史命中做策略，会忽略尾延迟和 SLO。
+
+第三，**Agent workload 需要 workflow-aware trace。** 如果 trace 只保留 request arrival、prompt length 和 output length，就无法复现 readiness、tool gap、branch dependency、release budget 等行为。今天的 Agent 调度论文再次说明，研究 Agent serving 时应保留 turn 与 workflow 的因果关系，而不是把它降维成普通聊天请求流。
+
+第四，**模型内部状态研究需要从可预测性走向因果验证。** 无论是知识 routing 还是 latent visual reasoning，今天的工作都在强调 probe 能读出某种信息与模型实际依赖该信息是两回事。对 hidden-state steering、latent workspace 或 activation-level reasoning 的系统化研究，应优先设计干预、删除替代路径和反事实实验。
+
+# 今夜白的观察
+
+今天最值得持续跟踪的不是某一个 3.50× 或 20.4% 的数字，而是三个边界正在同时发生变化。
+
+其一，**调度边界上移到 workflow。** Agent runtime 未来很可能需要与 inference scheduler 交换更多信息，例如剩余 turn work、deadline、tool dependency 和 session state；仅靠 OpenAI-compatible request API 很难表达这些信息。
+
+其二，**缓存边界从 KV 扩展到伴生状态。** routed experts 只是一个例子。随着 speculative decoding、稀疏 attention、MoE routing 和 recurrent/hybrid state 增多，服务端会出现越来越多与 token history 对齐、却不能简单塞进 KV tensor 的 side state。它们是否共享 hash、生命周期和 offload protocol，会成为实际工程问题。
+
+其三，**控制边界从统一 GPU 策略分裂为阶段化策略。** PD disaggregation 之后，prefill 与 decode 已经可以分别做容量、功耗和 SLO 控制。类似思想可能继续扩展到不同模型阶段、不同 request class 和不同 workload phase，但今天的证据仍主要来自特定 MoE+B200 环境，不能过度外推。
+
+因此，本期更明确的趋势判断是：大模型系统优化正在从“算子级加速”继续向 **workflow-aware、state-aware、phase-aware** 的控制体系演进。下一步值得观察的是这些局部机制能否形成稳定的跨框架接口，而不是继续以模型特例和 connector 特例存在。
+
+# 参考资料
+
+## 论文与技术报告
+
+- Feng et al., [Decoupling Readiness from Release for Tail-Aware Scheduling of Agentic LLM Workflows](https://arxiv.org/abs/2609.10964), arXiv, submitted 2026-09-10.
+- Kim et al., [Phase-Decoupled, Model-Calibrated Power Control for Disaggregated LLM Serving](https://arxiv.org/abs/2609.11133), arXiv, submitted 2026-09-10.
+- Picozzi, [The information geometry of large language models is shared, learned, and controllable](https://arxiv.org/abs/2609.11063), arXiv, submitted 2026-09-10.
+- Wei et al., [From Parameters to Answers: How LLMs Retrieve and Use Their Internal Knowledge](https://arxiv.org/abs/2609.11859), arXiv, submitted 2026-09-10.
+- Park et al., [Reason Through the Latent! Making Latent Visual Reasoning Necessary](https://arxiv.org/abs/2609.06746), v1 2026-09-06, v2 2026-09-10.
+
+## 开源工程
+
+- vLLM RFC #56402, [Efficient Routed-Expert Replay with Prefix Omission and KV Cache Offloading](https://github.com/vllm-project/vllm/issues/56402), opened 2026-09-11.
+- SGLang [Issues](https://github.com/sgl-project/sglang/issues), 2026-09-11 open issues used only as engineering follow-up signals; no unverified bug is treated as an established framework conclusion.
