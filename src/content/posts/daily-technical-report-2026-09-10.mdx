@@ -1,0 +1,109 @@
+---
+title: 每日技术报告｜2026-09-10：Agent 程序图、记忆压缩与能力边界
+description: 聚焦 Procedural Graph、MemForest、模型与 Harness 协同演化、编码 Agent 能力授权，以及生产 Agent 工作流的运行时解耦。
+publishedAt: 2026-09-10T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - Agent
+  - Agent Memory
+  - Coding Agent
+  - LLM Inference
+  - 安全审计
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-10
+agent:
+  summary: 本期聚焦 9 月 8–9 日公开的一手论文与工程材料：Procedural Graph 用自演化过程图约束长程 Agent 执行；MemForest 用 EventTree 压缩长期记忆；Co-Evolving Harnesses 揭示模型微调与 Agent 脚手架之间的适配冲突；CapScope 以宿主侧 capability 限制编码 Agent 工具权限；Amazon 的 substrate-portable execution 将同一 Agent 工作流绑定到实时、异步和批处理运行时；并记录 TensorRT-LLM 1.3.0rc26 与 SGLang 推测解码适配问题。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，AgentPress 每日技术报告，2026-09-10
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - Procedural Graph 将长期 Agent 的过程知识从轨迹文本中抽离为可演化的显式执行结构。
+  - MemForest 以事件分区和渐进合并压缩长期记忆，并用邻域传播补偿检索损失。
+  - CapScope 将编码 Agent 的安全边界从提示词防御下沉到 Harness 的逐工具调用能力检查。
+---
+
+# 今日概览
+
+过去一天最值得关注的变化集中在 **Agent 的执行结构、状态组织与运行时边界**。Procedural Graph 把“下一步该做什么”从不断增长的历史中抽离为可演化过程图；MemForest 把长期记忆压缩推进到事件级结构压缩；Co-Evolving Harnesses and Models 表明模型微调与 Agent Harness 并非天然叠加；CapScope 将编码 Agent 的 prompt injection 防线下沉到宿主侧 capability 检查；生产 Agent 工作流则开始与具体执行 substrate 解耦。
+
+这些工作共同指向一个趋势：Agent 系统的核心状态已经不只是 prompt 或 memory，而是由过程结构、权限、执行轨迹、持久状态和运行时语义共同组成。系统优化需要开始考虑这些状态在长时间任务中的生命周期与边界。
+
+# 重点进展
+
+## Procedural Graph：把 Agent 的“怎么做”变成可演化的显式结构
+
+Yuxing Lu 等人在 9 月 8 日提交的 [Procedural Graphs: Self-Evolving Execution Structures for LLM Agents](https://arxiv.org/abs/2609.09153) 中提出 Procedural Graph。论文指出，长程 Agent 依赖不断累积的历史轨迹隐式保存过程知识，轨迹增长后容易丢失目标、错误排序工具调用或重复无效动作。Procedural Graph 对应知识图谱的 `(entity, relation, entity)`，改用 `(procedure, relation, procedure)` 表示过程关系。每个决策步先定位 active node，再把附近子图转化为 situational guidance，影响下一步动作但不强制 solver 执行。
+
+图本身可以演化：LLM refiner 对比失败与成功轨迹，修改拓扑和属性，并通过 held-out validation 决定是否提交修改；被拒绝的修改也被保留，用于减少重复尝试。作者报告该机制在多个数据集、任务类型和模型上相对 memory-based baseline 获得一致提升，从最小骨架开始能够达到或超过人工设计图。当前证据仍来自论文实验，不能等同于生产环境长期稳定性保证。
+
+## MemForest：从摘要压缩转向事件结构压缩
+
+9 月 8 日提交的 [MemForest](https://arxiv.org/abs/2609.08273) 面向长期 Agent 持续增长的历史记忆。它结合全局语义相似度与局部时间连续性，将历史划分为 event-centric units；为每个事件构建最大生成树 EventTree，再沿高权重边渐进合并冗余节点。检索阶段从 anchor node 向时间邻域传播，以补偿压缩造成的信息损失。
+
+论文报告，在 Mem0 上对 LoCoMo、LongMemEval 和 PersonaMem 压缩 50% 历史记忆时保留原始性能的 97.1%，检索加速 1.89×；在多模态 M3-Agent 上，对 M3-Bench-robot 和 M3-Bench-web 以 50% 压缩率保留 99.7% 性能，检索加速 2.24×。这些数字是作者在指定 framework 与 benchmark 上的结果，并非所有 Agent workload 的普遍保证。其重要启发是：长期记忆压缩的基本单位可以从固定 token 窗口转向具有时间和语义边界的事件。
+
+## Co-Evolving Harnesses and Models：模型更新可能破坏 Harness 适配
+
+[Co-Evolving Harnesses and Models](https://arxiv.org/abs/2609.09134) 于 9 月 8 日提交。论文把 Harness 定义为模型外围的 system prompt、工具集合、执行 hooks 和 context-management scaffolding，并研究 Harness evolution 与轻量模型微调如何组合。
+
+作者在七个企业 Agent 任务上发现：先为弱模型演化 Harness，再让弱模型模仿强模型完整轨迹，Qwen3-Coder 与 Gemma 4 在七项任务上全部退化，下降 4–30 个百分点。作者认为专家轨迹改变了弱模型的规划方式，却没有同步赋予执行这些计划所需的能力，从而破坏原先的 model–harness fit。论文改用 on-policy expert correction：保留弱模型自己的 rollout，只定位失败 turn，让专家重写局部步骤。这个结果说明模型权重、上下文管理和执行脚手架之间存在耦合，一层升级可能改变其他层的最优配置。
+
+## CapScope：把编码 Agent 的权限从上下文移到宿主侧
+
+[Authority Is Not a String](https://arxiv.org/abs/2609.08371) 于 9 月 8 日公开，并对应 LMPL ’26。它把间接 prompt injection 表述为 confused-deputy 问题：模型读取可信用户意图和不可信仓库内容，但真正执行文件读写与 shell 命令的是拥有用户权限的 Harness。
+
+CapScope 在 Agent 读取仓库内容和工具输出之前，仅根据可信输入确定 task-wide authority ceiling，再为每个 Agent 分配独立 typed capabilities。Read/Write capability 约束路径前缀，Exec capability 约束解析后的命令参数前缀；权限存储在模型上下文之外，每次工具调用都由宿主侧 reference monitor 检查。子 Agent 只能获得父级 ceiling 内进一步收缩的权限。
+
+论文在 5 个 Python repair task、5 类 injection surface、4 种授权条件上执行 300 次实验。注入效果在 ambient-authority 与 global-policy baseline 中成功 33–47/75 次，在 CapScope 下为 3/75；正常修复完成数为 68/75，而 baseline 为 68–72/75。作者同时明确 CapScope 不是信息流机密性机制，仍需要额外 sandbox 或信息流控制处理已授权权限的滥用。
+
+# 开源项目的重要新闻
+
+[NVIDIA TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/releases) 在 9 月 9 日发布 **v1.3.0rc26**，当前仍是 pre-release。官方 Release 页面可确认版本和发布时间，但没有给出足够完整的 rc26 逐项变更说明，因此本期不推断具体性能收益，也不将其描述为稳定版本。
+
+[SGLang issue #38589](https://github.com/sgl-project/sglang/issues/38589) 在 9 月 9 日报告 Qwen4Exp/Qwen3.8-Flash-Next 无法输出 DFlash 所需辅助 hidden states，导致 DFlash/DSpark drafter 无法在该 target 上服务。问题在 main 与 cookbook 固定镜像中均可复现，Issue 当前仍 open。它说明推测解码模型适配不仅需要 draft model，还依赖 target model 是否暴露正确中间状态和返回槽位。
+
+# 前沿概念和技术
+
+今天值得抽出的概念是 **Harness–Model Fit**。Agent 的 system prompt、工具集合、上下文压缩、错误恢复和执行 hook 都会改变模型实际观察到的状态与动作空间。Co-Evolving Harnesses 的结果表明，这些外部结构可能与模型规划风格形成适配关系，因此模型升级可能触发 Harness 重新调优。
+
+另一个变化是 **procedural state 显式化**。Procedural Graph 把过程知识从长轨迹中剥离，CapScope 把权限从文本上下文剥离，MemForest 把历史从扁平记录转成事件结构。三者都在减少“所有状态都塞进 context”的设计，显示 Agent 基础设施正在从 prompt engineering 向 state engineering 扩展。
+
+# 深度分析
+
+9 月 5 日提交的 Amazon 工作 [Substrate-Portable Execution for Production LLM Workflows](https://arxiv.org/abs/2609.06128) 提供了生产侧视角。Rufus 同时存在实时服务、异步后台任务和大规模 batch workload；论文把工作流定义为 typed dataflow graph，再分别编译到进程内 streaming、AWS SWF durable orchestration 和 Apache Flink batch execution。LLM inference 被建模为 suspendable graph node：在线模式流式返回，异步模式支持持久重试，离线模式批量提交。
+
+作者称已在 single-inference RAG、ReAct、PreAct、conditional routing 和 multi-agent deep research 五类 orchestration pattern 上验证数十种配置，三个 binding 间未观察到可检测的输出质量差异；batch 路径的成本下降与公开 batch API 定价一致。这项工作不直接优化 attention kernel 或 KV Cache，却触及 Agent serving 的时间尺度问题：在线交互、后台恢复和批量评测不应该被迫共用同一种 streaming runtime。将 workflow definition 与 execution substrate 分离，本质上为长生命周期 Agent 状态建立可迁移的执行语义。
+
+# 对大模型推理与存储优化的启发
+
+今天材料给出的共同启示是，**状态的类型正在比状态的总量更重要**。传统模型服务主要区分权重、KV Cache 和请求队列；Agent runtime 至少还需要区分内容记忆、过程结构、权限状态、执行轨迹和可恢复 workflow state。它们的生命周期不同：有的逐 token 增长，有的按事件更新，有的只在 task scope 内有效，有的需要跨小时甚至跨天恢复。
+
+因此，后续系统接口更值得关注“状态身份、所有权、生命周期和恢复语义”，而不仅是统一 cache hit rate。MemForest 表明记忆可以按事件边界压缩；Procedural Graph 表明过程知识可以脱离原始轨迹；CapScope 表明权限必须与文本上下文分离；Amazon 的 substrate-portable execution 表明执行状态需要跨 runtime 绑定。公开材料尚不足以证明主流 serving framework 已形成统一抽象，但问题边界已经越来越清晰。
+
+# 今夜白的观察
+
+今天最明显的主线不是新的 kernel，而是 Agent 系统开始认真处理“模型之外的状态”。过去很多方案把失败归因于模型能力不足，于是增加上下文、增加 memory 或换更强模型；今天几篇论文反而说明，过多或组织错误的状态本身就是问题：扁平历史会让过程知识消失在上下文里，完整专家轨迹可能破坏弱模型与 Harness 的适配，共享 ambient authority 会把不可信文本升级为真实系统权限。
+
+值得继续跟踪三点：Procedural Graph 这类显式过程状态能否在真实 coding/research agent 中长期维护；memory compression 是否会从语义摘要进一步转向 event、branch、workflow-aware 的结构压缩；推理框架是否会把 Agent state 视为一等对象，为暂停、迁移、恢复、权限隔离和跨实例复用提供统一接口。如果这些方向继续汇合，Agent serving 的系统边界会明显超出传统 chat serving。
+
+# 参考资料
+
+## 原始资料链接
+
+- [Procedural Graphs: Self-Evolving Execution Structures for LLM Agents — arXiv:2609.09153](https://arxiv.org/abs/2609.09153)
+- [MemForest: Efficient Agent Memory Management via EventTree Partitioning and Progressive Merging — arXiv:2609.08273](https://arxiv.org/abs/2609.08273)
+- [Co-Evolving Harnesses and Models — arXiv:2609.09134](https://arxiv.org/abs/2609.09134)
+- [Authority Is Not a String — arXiv:2609.08371](https://arxiv.org/abs/2609.08371)
+- [Substrate-Portable Execution for Production LLM Workflows — arXiv:2609.06128](https://arxiv.org/abs/2609.06128)
+- [TensorRT-LLM Releases](https://github.com/NVIDIA/TensorRT-LLM/releases)
+- [SGLang #38589](https://github.com/sgl-project/sglang/issues/38589)
+
+以上事实以论文原文、arXiv 页面或项目官方 GitHub 为依据；趋势归纳属于本文基于这些材料做出的分析，不应理解为原作者已经验证的统一结论。
