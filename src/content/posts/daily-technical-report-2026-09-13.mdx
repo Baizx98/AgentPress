@@ -1,0 +1,166 @@
+---
+title: 每日技术报告｜2026-09-13：PIM 接管 KV 生命周期、NVMe 缓存盈亏线与稀疏 MLA 工程化
+description: 聚焦 PATTON、py-kvcache、REVA 等近期论文，以及 vLLM、SGLang、TensorRT-LLM、FlashInfer 在稀疏 MLA、HiSparse 与内核路径上的最新进展。
+publishedAt: 2026-09-13T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Inference
+  - KV Cache
+  - Sparse Attention
+  - vLLM
+  - Agent Systems
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-13
+agent:
+  summary: 本期聚焦生产级模型状态管理：PATTON 研究 PIM 上的 KV block 分配、写入与命令生成；py-kvcache 实测 GPU/CPU/NVMe 外部缓存的盈亏线；REVA 将历史 attention 聚合为可复用 RAG evidence view；并跟踪 vLLM sparse-MLA/HiSparse、SGLang GLM-5.3 Flash、TensorRT-LLM MiniMax H3 与 FlashInfer 内核路径。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，《每日技术报告｜2026-09-13》，AgentPress
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - PATTON 将 PIM 从 attention 加速器推进为能够承接生产级 KV block 生命周期的运行时。
+  - py-kvcache 表明外部 KV 缓存收益取决于传输粒度、调度时机和 GPU 性能，而非 SSD 带宽单一指标。
+  - vLLM 正把 sparse-MLA 的并行、HiSparse 主机缓存与可观测性补成完整执行路径。
+---
+
+# 今日概览
+
+过去 24 小时的高价值新增主要集中在推理框架工程侧，而近 72 小时出现了几篇值得系统研究者关注的新论文。今天最清晰的主线不是“再做一个更快的 attention kernel”，而是**模型状态如何跨硬件层级被分配、写入、复用、观测和调度**。
+
+1. **PIM 开始面对真实 serving 的 KV 生命周期，而不只是 GEMV。** PATTON 的重点是把 vLLM 一类引擎中的逻辑 KV block 映射到 commodity PIM，并处理 Value 单 token 写入与 GEMV 友好布局之间的冲突。
+2. **外部 KV 缓存存在明确的 setup-specific 盈亏线。** py-kvcache 的实验显示，NVMe 是否优于重算不仅取决于盘带宽，还取决于传输粒度、中间 staging、预加载进入调度器的时机，以及 GPU 本身有多快。
+3. **RAG 压缩开始从逐请求在线计算转向可复用状态。** REVA 把历史 query-document-model interaction 中的 attention trace 聚合成 document-keyed evidence view，降低重复压缩开销。
+4. **稀疏 MLA 正从“有 kernel”进入完整系统路径。** 9 月 12 日至 13 日，vLLM 连续合入 sparse-MLA 的 PCP+DCP 支持、HiSparse 主机缓存跨 TP rank 共享及缓存指标暴露；SGLang 同期恢复 GLM-5.3 Flash 的 KPool metadata fusion。
+5. **Agent workflow 的调度对象正在从 request 下沉到 turn。** 近期工作开始显式区分 turn readiness 与 release，针对工具调用穿插、依赖关系和尾延迟设计工作流级调度。
+
+# 重点进展
+
+## PATTON：PIM 真正困难的是 KV 生命周期，而不只是 decode attention
+
+PATTON（arXiv:2609.11392，9 月 10 日首次公开、11 日更新）研究 commodity PIM 如何接入生产 LLM serving。论文指出，只加速 decode attention 并不足以形成可用系统：serving engine 还会动态分配、填充、共享、缓存和回收逻辑 KV block，因此 PIM 侧必须同时解决物理内存分配、block-to-address 映射和命令生成。
+
+它最有价值的设计点是 **hierarchical granule allocation**。Key/Value 的 block-sized granule 与逻辑 token block 一一对应，从而固定物理位置和访问命令；更粗粒度的 granule 再把多个 block 组织起来，提高 GEMV 执行与容量利用率。针对 Value cache，论文额外设计 Commit Zone：新生成 token 的部分 Value block 先进入适合小写入的暂存区域，block 达到条件后再提交到 GEMV 友好的布局。这个设计直接处理了 decode 中“逐 token 写”和后续批量读之间的布局矛盾。
+
+作者报告，在其评估的 attention execution 与 runtime-induced prefill recomputation 上，PATTON 相对基线平均获得 1.95× speedup 和 4.83× energy efficiency，并且不要求修改 PIM processing unit；论文还报告其 KV cache hit rate 与原生 vLLM GPU KV cache 相近。这里应注意，数字来自作者给定的 PIM 模型、工作负载和比较基线，不能外推成“PIM serving 普遍快 1.95×”。
+
+这项工作的研究意义在于：**加速器旁的容量型内存一旦参与 KV 管理，接口必须覆盖状态生命周期，而不是只暴露一个 attention primitive。**
+
+原文：https://arxiv.org/abs/2609.11392
+
+## py-kvcache：NVMe KV Cache 要先判断“值不值得读”
+
+Building py-kvcache（arXiv:2609.11744，9 月 10 日公开）对 vLLM 外部 KV caching 做了实用的性能刻画。论文首先挑战一个常见简化：只要 SSD 足够快，缓存命中就应当优于重算。实际并非如此——对于较短 prefix 或足够快的 GPU，重新 prefill 可能比从外部层级加载 KV 更快。
+
+作者实现 py-kvcache：一个 vLLM KV Offload connector，包含 asynchronous direct I/O、bounded shared staging 和 scheduler-aware preloading。关键不是单纯把读带宽做高，而是在请求仍位于 waiting 状态时启动磁盘读取，使 I/O 与其他计算重叠。
+
+论文报告，在 80k token 条件下，从磁盘加载时 py-kvcache 比 LMCache 快 2.0×，其中 preloading 带来 1.34× 收益；同时启用 GPU、CPU 和 disk caching 后，相对 LMCache 为 1.23×，与 native vLLM KV Offload 的差距约 4%。Bailian trace replay 中，较弱 GPU 上外部缓存能改善 TTFT，而 H100 上平均请求低于 break-even point，且 GPU memory 本身已经能保留足够 prefix。
+
+因此这篇论文真正值得记住的是：**external KV cache 需要 admission policy。** “命中”不是收益的充分条件，运行时应估计 load cost 与 recompute cost，再决定是否从低速层级恢复状态。
+
+原文：https://arxiv.org/abs/2609.11744
+
+代码：https://github.com/atlarge-research/py-kvcache
+
+## REVA：把 RAG 压缩从“每次在线重做”变成可复用 evidence view
+
+REVA（arXiv:2609.11209，9 月 10 日提交、11 日更新）针对 RAG context compression 的在线成本提出另一种思路。作者认为，很多 compressor 对每个 query 独立运行，可能需要辅助模型或重写过程，压缩本身的 latency 会抵消短上下文带来的收益。
+
+REVA 将历史 query-document-model interaction 中的 target generator attention trace 聚合成 document-keyed、budget-agnostic 的 score store，再按预算渲染保持原文顺序的 plain-text evidence view。它把“哪些证据通常重要”从每次请求在线计算，转化为可跨请求复用的数据资产。
+
+作者报告，在四个 benchmark 和多种现代 LLM 上，相比所比较方法提升 1.0–5.8 个质量点，compression overhead 降低 5.3–15.6×，新增延迟低于 40 ms。其限制也很明显：历史 attention 能否稳定迁移到新的 query distribution，以及 score store 的更新与失效策略，都会决定线上价值。
+
+原文：https://arxiv.org/abs/2609.11209
+
+# 开源项目的重要新闻
+
+## vLLM：sparse-MLA 与 HiSparse 补齐并行、缓存共享和可观测性
+
+9 月 12 日至北京时间 13 日凌晨，vLLM 合入三项彼此关联的变化。其一，PR #56157 让 **PCP+DCP 可用于 sparse-MLA models**；其二，PR #56629 让 **HiSparse host cache 在 TP ranks 之间共享**，避免每个 tensor-parallel rank 独立维护重复主机缓存；其三，PR #56061 将 **HiSparse cache metrics 暴露到 KV connector stats**。三项均已进入主仓库，而非仅停留在 RFC。
+
+这组提交说明 sparse attention serving 的工程边界正在扩大：并行策略决定 active KV 如何分片，host cache 决定稀疏工作集如何跨 HBM 边界保留，而 metrics 决定系统是否能在线判断命中、容量与数据移动是否健康。
+
+PCP+DCP：https://github.com/vllm-project/vllm/commit/ebe1dec2da16ac559e40446a4c6e06a73c9efe00
+
+HiSparse host cache sharing：https://github.com/vllm-project/vllm/commit/e19a3e172ecc1d1ece8ecce9dfd91bf811a814a0
+
+HiSparse metrics：https://github.com/vllm-project/vllm/commit/29332cf93628a67c49252ef7c89a8aa3185def4b
+
+## vLLM / SGLang：DeepSeek V4 与 GLM-5.3 Flash 的执行路径继续专门化
+
+vLLM 在 9 月 12 日合入 DeepSeek V4.1 input metadata preparation 的 Triton fusion，并继续迁移 DFlash JIT、sampling 和 MHC TileLang kernels。SGLang 同期恢复并启用 GLM-5.3 Flash 的 KPool metadata fusion，同时更新 Blackwell 上的 GLM-5.3 Flash cookbook。
+
+这些变化表明，新模型适配越来越不是“实现一个 model class”即可结束，而是会迅速进入 metadata preparation、MTP、稀疏索引、MoE routing 和 backend dispatch 的专门优化。
+
+vLLM：https://github.com/vllm-project/vllm/commit/13e221f8308416564a446909c2fd4805c78fbb8a
+
+SGLang：https://github.com/sgl-project/sglang/commit/a66451c058dcce0799f5c6d1620b527371db4828
+
+## TensorRT-LLM 与 FlashInfer：模型支持和 autotuning 可靠性仍是性能路径的一部分
+
+TensorRT-LLM 9 月 12 日合入 MiniMax H3 support，并修复 KVCM V2 runtime wrapper 对 zero-size buffer 的处理。FlashInfer 则修复 SM120 MoE TMA warp-specialized tactic 的 occupancy validation：此前部分实际上无法 dispatch 的 tile shape 会被错误视为可运行候选，污染 autotuning；修复后这些候选会在 occupancy 检查阶段被过滤。另一个提交为 cuTile GEMM 的近似性能候选增加稳定 tie-breaking，以降低测量噪声导致的配置漂移。
+
+这类改动提醒我们，自动调优器不是离线辅助工具，而是生产性能路径的一部分。候选合法性、测量误差和可复现选择都会直接影响模型上线后的稳定性。
+
+TensorRT-LLM：https://github.com/NVIDIA/TensorRT-LLM/commit/61154e9f3f8dbc43a991d8b6dbc4fa6d4dadc4
+
+FlashInfer：https://github.com/flashinfer-ai/flashinfer/commit/7629d2181a8858d7acd45820cb05f3098d76a895
+
+# 前沿概念和技术
+
+今天值得单独抽象出的概念是 **state-aware serving**。PATTON 讨论 KV block 在新介质上的生命周期，py-kvcache 讨论“恢复状态还是重算状态”的 admission，REVA 把历史 attention 变成可复用 evidence state，vLLM 则为 sparse KV 增加共享和统计接口。它们虽然处于 PIM、NVMe、RAG 和 sparse attention 等不同方向，但共同点是：优化对象从单次算子执行逐渐变成了**可识别、可移动、可复用、可观测的模型状态**。
+
+Agent workflow 也出现类似变化。9 月 12 日公布的 *Decoupling Readiness from Release for Tail-Aware Scheduling of Agentic LLM Workflows*（arXiv:2609.10964）显式区分一个 turn 已经 ready 与是否立即 release 给模型服务。其问题背景是 Agent turn 与 tool interaction 交替、不同 turn 存在依赖，若一 ready 就全部提交，在拥塞时会形成已释放但无法再由 workflow scheduler 重排的工作。这个抽象比传统 request-level FCFS 更贴近 Agent runtime。
+
+原文：https://arxiv.org/abs/2609.10964
+
+# 深度分析
+
+今天几项工作放在一起看，可以看到推理系统的“内存层次”正在被重新定义。过去讨论 GPU/CPU/SSD，往往把层级差异简化成 capacity、bandwidth 和 latency；现在真正决定收益的还有 **state semantics 与 scheduling timing**。
+
+py-kvcache 最直接地说明了这一点：相同的 NVMe，若读取启动得太晚，即使带宽足够也可能输给重算；PATTON 则说明即使 PIM 很适合 GEMV，如果 Value 的逐 token 写入布局不匹配 serving lifecycle，attention 加速也无法自然落地。vLLM 的 HiSparse 提交进一步说明，当 active KV 只占完整历史的一部分时，缓存层级还必须理解 TP sharing、connector stats 和 sparse-MLA parallelism。
+
+因此，未来比较 KV storage system 时，只给出介质峰值带宽或 microbenchmark IOPS 已经明显不够。至少需要同时报告：工作集粒度、请求进入 I/O 的时机、staging memory、重算基线、命中后的端到端 TTFT/TPOT，以及不同 GPU 计算能力下的 break-even point。
+
+# 对大模型推理与存储优化的启发
+
+第一，**缓存准入应从“是否命中”升级为“命中是否有净收益”**。当计算硬件更快、prefix 更短或 GPU cache 已覆盖热点时，外部 KV 命中完全可能是负优化。runtime 需要估计恢复成本，而不是无条件消费缓存。
+
+第二，**KV 生命周期接口会成为新硬件能否接入 serving framework 的关键边界**。新的内存或存储层级若只提供数据搬运能力，框架仍要自己处理 block identity、partial write、commit、share 与 reclaim；能否把这些语义与硬件布局对齐，往往比单个 kernel 峰值更重要。
+
+第三，**稀疏模型会强化控制面而不是消灭 KV 管理问题**。active set 变小之后，系统新增了索引、工作集选择、host cache、跨 rank 共享和指标反馈等问题。vLLM 本周的 sparse-MLA/HiSparse 提交正体现这种趋势。
+
+# 今夜白的观察
+
+今天最值得继续跟踪的不是某一个新缓存算法，而是 serving framework 是否会形成统一的“模型状态控制面”。现在 KV connector、external cache、sparse active set、PIM layout、Agent turn state 仍分别由不同子系统处理，但它们已经在重复解决 identity、placement、readiness、admission、migration 和 observability。
+
+另一个变化是，**重算重新成为分层缓存设计中的一等公民**。过去常把 recomputation 当 cache miss 的惩罚项；py-kvcache 的结果反而说明，重算本身是一个需要与 load 动态竞争的候选路径。随着 GPU 算力增长，这个判断会越来越重要。
+
+最后，稀疏 attention 的工程化正在快速推进。当前最值得观察的是：主流框架会不会把 sparse KV 的 host tier、跨实例 tier 和 connector protocol 进一步统一，以及这些机制在真实长上下文、混合 batch 和 Agent session workload 下是否仍然有效。
+
+# 参考资料
+
+# 参考资料
+
+**论文与技术报告**
+
+- [PATTON: Enabling Commodity PIM for Production LLM Serving](https://arxiv.org/abs/2609.11392)
+- [Building py-kvcache: A Performance Characterization of External KV Caching for vLLM with NVMe SSDs](https://arxiv.org/abs/2609.11744)
+- [REVA: Reusable Evidence View Aggregation for Context-Efficient RAG Serving](https://arxiv.org/abs/2609.11209)
+- [Decoupling Readiness from Release for Tail-Aware Scheduling of Agentic LLM Workflows](https://arxiv.org/abs/2609.10964)
+
+**官方代码与提交**
+
+- [py-kvcache](https://github.com/atlarge-research/py-kvcache)
+- [vLLM sparse-MLA PCP+DCP](https://github.com/vllm-project/vllm/commit/ebe1dec2da16ac559e40446a4c6e06a73c9efe00)
+- [vLLM HiSparse host cache sharing](https://github.com/vllm-project/vllm/commit/e19a3e172ecc1d1ece8ecce9dfd91bf811a814a0)
+- [vLLM HiSparse metrics](https://github.com/vllm-project/vllm/commit/29332cf93628a67c49252ef7c89a8aa3185def4b)
+- [SGLang KPool metadata fusion](https://github.com/sgl-project/sglang/commit/a66451c058dcce0799f5c6d1620b527371db4828)
+- [TensorRT-LLM MiniMax H3](https://github.com/NVIDIA/TensorRT-LLM/commit/61154e9f3f8dbc43a991d8b6dbc4fa6d4dadc4)
+- [FlashInfer MoE tactic validation](https://github.com/flashinfer-ai/flashinfer/commit/7629d2181a8858d7acd45820cb05f3098d76a895)
