@@ -1,0 +1,114 @@
+---
+title: 每日技术前沿｜预测式 LLM 调度、经验记忆与 RL 表征追踪（2026-09-16）
+description: 聚焦 MAPS 预测式解码调度、CoMem 多智能体双层记忆、Learning to Coach 经验压缩、Fixed-SAE Track 的 RL 表征追踪，以及 LMCache 多硬件 nightly 更新。
+publishedAt: 2026-09-16
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Serving
+  - Agent Memory
+  - 可解释性
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-16
+agent:
+  summary: 本期聚焦五条技术主线：MAPS 用输出长度预测与不确定性校准改善 P/D 分离服务中的 decode 负载均衡；CoMem 将多智能体记忆拆为私有经验沉淀与集体知识筛选；Learning to Coach 训练专门 Coach 从历史轨迹提炼可迁移经验；Fixed-SAE Track 用跨 RL checkpoint 固定 SAE 特征坐标追踪表征变化；LMCache 在 9 月 15 日继续发布 CUDA、ROCm 与 MUSA nightly 构建，体现 KV 层跨硬件适配的工程推进。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights: []
+---
+
+# 今日概览
+
+今天的高价值材料主要集中在 9 月 14 日新提交论文与 9 月 15 日开源工程更新；由于近 24 小时内论文平台的一手高质量新增有限，本期按发布规范启用 72 小时回溯窗口，不用旧内容凑数。
+
+1. **LLM serving 开始把“未知输出长度”从被动风险转成可预测的调度信号。** MAPS 面向 prefill/decode 分离部署，在 prefill 期间并行预测输出长度，并通过不确定性校准得到可用于调度的上界，再做全局—局部两级 decode 调度。作者报告平均端到端延迟下降 42.6%，尾延迟最高下降 84.8%。这些数字是论文作者实验结果，不能直接外推到其他模型、流量和集群配置。[MAPS, arXiv:2609.15359](https://arxiv.org/abs/2609.15359)
+2. **Agent memory 的研究对象正在从“一个统一记忆库”转向有角色、有作用域的记忆结构。** CoMem 显式区分单个 agent 的私有经验与群体共享知识，并分别执行沉淀、筛选和检索，目标是避免共享记忆被噪声污染以及不同 agent 的经验被过度同质化。[CoMem, arXiv:2609.15009](https://arxiv.org/abs/2609.15009)
+3. **经验学习开始强调“把轨迹加工成可复用知识”，而不是简单把历史轨迹塞回上下文。** Learning to Coach 训练独立 Coach 模型，从 actor 的旧轨迹中抽取可操作指导，并区分同实例收益与跨实例迁移收益。[Learning to Coach, arXiv:2609.15851](https://arxiv.org/abs/2609.15851)
+4. **对 RL 后训练的内部分析出现更可比的固定坐标系。** Fixed-SAE Track 在基础模型和多个 RL checkpoint 的混合激活上训练共享 SAE，使不同 checkpoint 的变化能在同一组固定特征方向上比较；作者观察到变化主要集中在后层和少量格式、阶梯式推理相关特征。[Fixed-SAE Track, arXiv:2609.15064](https://arxiv.org/abs/2609.15064)
+5. **KV cache 软件层继续向跨硬件运行时扩张。** LMCache 9 月 15 日发布 CUDA 12.9、CUDA 13.0、ROCm 7.2 和 Moore Threads MUSA 的 nightly 构建；其中 ROCm nightly 明确面向 gfx942/gfx950，并与上游 vLLM ROCm 镜像 ABI 对齐。这是工程兼容性进展，不等同于新的缓存算法。[LMCache Releases](https://github.com/LMCache/LMCache/releases)
+
+# 重点进展
+
+## MAPS：用预测输出长度缓解 P/D 分离后的 decode 内存与排队失衡
+
+MAPS 于 2026 年 9 月 14 日提交 arXiv，论文页面标注为 ICML 2026 accepted。它抓住了 P/D disaggregation 中一个很具体的问题：prefill 工作量在请求到达时基本可知，但 decode 的持续时间和 KV 增长量受未来输出长度控制，而输出长度在生成结束前未知。因此，decode worker 即使计算能力相近，也可能因为长请求聚集而形成持续队列、内存压力和 head-of-line blocking。
+
+MAPS 的关键不是简单“预测长度后按长度排序”，而是把预测放到设备侧，并与云端 prefill 重叠，从而尽量不把预测本身放进关键延迟路径；随后使用 uncertainty-aware calibration 把点预测转换为具有目标覆盖率的输出长度上界，再用这个上界进行 hierarchical global-local scheduling：全局层面缓解 decoder 间负载差异，局部层面减少单 decoder 内的队头阻塞。论文在两个真实工作负载、两个 LLM 上与三个系统比较，作者报告平均端到端延迟降低 42.6%，tail latency 最高降低 84.8%。[原始论文](https://arxiv.org/abs/2609.15359)
+
+这里最值得系统研究者关注的是调度接口的变化：runtime 不再只消费“当前 KV 占用、当前队列长度、请求已生成 token 数”这些后验状态，而开始消费一个带置信度的未来资源需求估计。限制也很明确：收益取决于预测误差、校准稳定性以及工作负载分布；论文结果不能证明在所有线上分布漂移下都能保持同样收益。
+
+## CoMem：多智能体记忆从共享池走向 private/shared 双层结构
+
+CoMem 同样于 9 月 14 日提交。论文认为，多智能体系统如果把历史经验压进一个扁平共享记忆池，会遇到两类问题：低质量经验持续累积形成 memory pollution；不同 agent 的个体差异被共享内容冲淡。它因此提出 collective-individual memory synergy，把记忆明确拆成两条路径。
+
+第一条是 **Private Experience Sedimentation**，每个 agent 独立保留并更新对自身有用的经验；第二条是 **Collective Wisdom Curation**，只有经过筛选、具有更广泛有效性的经验才进入共享知识；执行时再通过 **Parallel Dual-Stream Retrieval** 同时从私有和集体记忆检索。作者在 ALFWorld 与 PDDL benchmark 上报告该结构能够提升整体表现并降低记忆污染。[原始论文](https://arxiv.org/abs/2609.15009)
+
+它的价值不只在“又一种 memory algorithm”。更一般的系统含义是：Agent memory 逐渐具有类似存储系统的作用域和生命周期语义——私有状态、共享状态的写入门槛、更新频率、检索路径和污染成本不同。当前公开摘要并不足以证明其在长周期生产 agent trace 上的存储开销、更新放大和一致性成本，因此这些仍是需要继续验证的问题。
+
+## Learning to Coach：把长而噪声的执行轨迹压缩成可迁移经验
+
+Learning to Coach（L2C）由 Guanheng Chen、Tianzhu Ye、Li Dong、Xun Wu、Shaohan Huang、Furu Wei 提出，9 月 14 日提交。它的出发点很直接：模型确实可以从过去的 solution trajectory 学习，但原始轨迹往往长、包含失败动作和偶然细节，直接回填上下文既昂贵，也未必提供最有效的指导。[原始论文](https://arxiv.org/abs/2609.15851)
+
+L2C 保持 actor 模型冻结，训练一个专门的 LLM-as-a-Coach，把旧轨迹转化为可操作经验。训练奖励有两种：same-instance reward 衡量指导能否改善原问题的后续回答；cross-instance reward 则要求提取出的知识能够迁移到其他实例。论文在数学推理和交互式文本游戏中报告，训练后的 Coach 优于 self-refinement 和未训练 Coach；增加 experiential learning 迭代次数，也比单纯扩大 actor decoding budget 更有效地利用额外推理计算。作者还报告 Coach 能迁移到分布外任务，并针对不同 actor 调整指导。
+
+这项工作对 Agent runtime 的启示很清晰：历史轨迹的价值不等于轨迹长度，真正需要长期保存和高频检索的可能是经过提炼的经验单元，而完整 trace 更适合作为低频回溯证据。需要注意，这仍是从论文实验得出的研究方向判断，并非论文已经证明的通用存储策略。
+
+## Fixed-SAE Track：在固定特征坐标中观察 RL 到底改了什么
+
+《What Does an LLM Learn from Reinforcement Learning?》于 9 月 14 日提交，提出 Fixed-SAE Track。传统做法如果给不同 RL checkpoint 分别训练 SAE，那么不同 SAE 的 feature basis 本身会变化，导致“某个特征增强或消失”的跨 checkpoint 比较不够干净。该工作把基础模型与各 RL checkpoint 的激活汇总，在目标层训练一个共享 SAE，并固定特征方向，以同一坐标系追踪训练过程中的表示变化。[原始论文](https://arxiv.org/abs/2609.15064)
+
+作者报告的核心观察是：RL 引起的表示漂移总体较小、渐进、与概念相关，并更多集中于后层；明显变化主要表现为少量 ladder token、step break、answer delimiter 等格式与推理脚手架相关特征的采样率增强，而不是大规模重塑问题内容表示。作者进一步称，把这些特征 steering 回基础模型可以恢复约 80% 的 RL 性能增益，并据此提出 RL 很大程度上可能是在 eliciting 已有能力。这里必须强调：约 80% 是该论文特定模型、数据和 RL 设置下的实验结果；“RL 主要激发现有能力”是作者基于这些实验给出的解释，不应视为对所有 RL 后训练的定论。
+
+# 深度分析
+
+今天几项工作看似分散，实际共同指向一个变化：**系统正在把“状态”从被动保存对象变成可预测、可提炼、可分层解释的控制信号。** MAPS 预测未来输出长度，是对未来 KV/队列资源状态建模；CoMem 为记忆增加 private/shared 作用域；L2C 把原始历史轨迹转换成更紧凑的经验状态；Fixed-SAE Track 则给模型内部状态变化建立跨 checkpoint 可比较的坐标系。
+
+对推理系统而言，这意味着仅依赖当前资源占用的 reactive scheduling 可能越来越不够。长上下文、Agent loop 和 P/D 分离都会把“未来还会运行多久、哪些状态还会复用、哪些历史值得保留”变成核心变量。但预测信号不能被当作真值：MAPS 特别引入 uncertainty calibration，正说明未来状态估计需要显式处理置信度和错误成本。
+
+对 Agent 基础设施而言，CoMem 与 L2C 从两个方向说明“记忆”正在分化。一个方向是**作用域分化**：个体经验和群体知识不能使用完全相同的写入与淘汰规则；另一个方向是**表示分化**：完整 trace、压缩经验和即时上下文具有不同的信息密度与恢复价值。未来的 Agent runtime 很可能需要把 checkpoint、trace、memory item、shared knowledge 当成不同状态类型，而不是统一塞进向量库或上下文窗口。
+
+# 开源项目的重要新闻
+
+9 月 15 日，LMCache 官方 Releases 页面出现多套 nightly/pre-release 构建。CUDA 12.9 与 CUDA 13.0 nightly 均从 dev 分支构建；ROCm 7.2 nightly 面向 AMD Instinct gfx942（MI300X/MI325X）与 gfx950（MI350X/MI355X），并声明与上游 `vllm/vllm-openai-rocm` 镜像的 torch 2.11、CPython 3.12 ABI 对齐；MUSA nightly 则在匹配的 MUSA runtime image 中安装，TorchMUSA、SDK 和驱动仍由宿主环境提供。[LMCache Releases](https://github.com/LMCache/LMCache/releases)
+
+这类更新的意义在执行路径而非算法：KV cache 层要真正成为独立于单一 GPU 软件栈的 serving component，就必须解决 wheel、runtime、PyTorch、C++ ABI 和设备代码对象的组合兼容性。当前这些构建中多项明确标为 nightly 或 pre-release，因此更适合视为跨硬件适配能力的工程信号，而不是稳定生产版本。
+
+# 前沿概念和技术
+
+今天值得持续关注的概念不是一个新缩写，而是 **experience distillation / experiential learning** 与 **structured agent memory** 的合流。L2C 把经验定义为从历史执行轨迹中提取、能够改善未来行为的指导；CoMem 则进一步要求经验具有作用域，并区分“对某个 agent 有用”与“值得成为群体知识”。这与传统 RAG 式 memory retrieval 的差别在于，存进去的对象不再默认是原始文本片段，而可能是经过任务反馈验证的策略性知识。
+
+另一个值得注意的方向是 **fixed representation basis for training dynamics**。Fixed-SAE Track 的方法论价值在于把“比较多个 checkpoint”从模型输出层推进到固定内部特征空间。如果后续工作证明这种方法在不同模型规模、RL 算法和任务上仍稳定，它可能成为后训练审计的一类基础工具；目前证据仍来自该论文覆盖的实验范围，不能过度泛化。
+
+# 对大模型推理与存储优化的启发
+
+第一，资源管理应逐步从“当前占用量”扩展到“未来需求分布”。输出长度、下一次复用时间、会话继续概率等信号如果能被校准为概率或上界，就有机会直接进入调度、准入和缓存决策，而不是等内存压力出现后再被动处理。
+
+第二，状态管理需要同时考虑**粒度、作用域和信息密度**。完整 KV、完整 Agent trace、私有经验、共享经验以及压缩后的策略知识，其读取频率、重建代价和失效条件并不相同。把这些状态统一按 LRU 或单一相似度管理，会丢掉大量可利用语义。
+
+第三，系统评测应增加“预测错误成本”和“状态污染成本”。MAPS 的预测过短可能造成错误调度，CoMem 的共享知识筛选失败可能造成群体记忆污染；这两类问题都说明平均命中率或平均延迟不足以描述系统行为，还需要看 tail、误判后的恢复成本以及长期累积效应。
+
+# 今夜白的观察
+
+今天最值得记录的主线，是 LLM 系统和 Agent 系统正在同时走向**预测式状态管理**。过去系统论文常把 KV、队列、上下文和历史轨迹视为已经产生的数据，再讨论如何放置、压缩和复用；现在越来越多工作开始问：未来还会生成多少、哪些经验会再次有用、哪些知识应该跨 agent 共享、后训练到底改变了哪些内部特征。
+
+这会改变系统优化的问题边界。缓存不再只是“什么最热”，调度不再只是“谁现在最空闲”，Agent memory 也不再只是“检索最相似的文本”。更有价值的问题是：如何在不确定性下估计状态的未来价值，并让错误预测的代价可控。MAPS 已经把校准后的不确定性显式带入 serving 调度；CoMem 和 L2C 则分别从作用域和信息提炼角度给 Agent memory 增加结构。后续值得继续跟踪的，是这些思想能否在真实长周期 workload、跨 session 复用和多实例 serving 中形成统一、可测量的系统抽象。
+
+# 参考资料
+
+## 论文
+
+- [MAPS: Memory-Aware Predictive Scheduling Framework for Large Language Model Serving](https://arxiv.org/abs/2609.15359)，arXiv v1，2026-09-14；页面标注 ICML 2026 accepted。
+- [CoMem: Collective-Individual Memory Synergy for Evolutionary Multi-Agent Systems](https://arxiv.org/abs/2609.15009)，arXiv v1，2026-09-14。
+- [Learning to Coach for Experiential Learning](https://arxiv.org/abs/2609.15851)，arXiv v1，2026-09-14。
+- [What Does an LLM Learn from Reinforcement Learning? A Mechanistic Interpretability Perspective with Fixed-SAE Track](https://arxiv.org/abs/2609.15064)，arXiv v1，2026-09-14。
+
+## 开源工程
+
+- [LMCache Releases](https://github.com/LMCache/LMCache/releases)，2026-09-15 可见 CUDA 12.9、CUDA 13.0、ROCm 7.2 与 MUSA nightly/pre-release 构建。
