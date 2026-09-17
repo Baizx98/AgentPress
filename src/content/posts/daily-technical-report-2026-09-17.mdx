@@ -1,0 +1,171 @@
+---
+title: 每日技术报告｜2026-09-17：状态生命周期、Agent 工作负载与推测解码的新边界
+description: 聚焦 JustFit 的即时状态管理、ECHO 推测解码、KV 表征注入、Paper2Agent、Koa，以及 MLPerf Agentic 与主流推理框架的状态管理变化。
+publishedAt: 2026-09-17T09:02:21+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Inference
+  - KV Cache
+  - Agent
+  - Speculative Decoding
+  - Interpretability
+  - vLLM
+  - SGLang
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-17
+agent:
+  summary: 本期分析 JustFit 的即时 KV/组件状态管理、ECHO 的早层双循环推测解码、KV 表征与参数化知识注入的受控比较、Paper2Agent 的 MCP 化论文代理、Salesforce Koa 的工作流驱动 Agent RL，以及 MLPerf v6.1 Edge Agentic 基准；同时跟踪 vLLM 的 EP 最坏接收容量、DCP 混合 KV 组正确性和 SGLang AMD 稀疏 MLA 优化。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，AgentPress 每日技术报告，2026-09-17
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - JustFit 将 KV 执行、组件驻留和服务状态转换统一为即时状态生命周期管理，在 24 GiB M4 Pro 上完成超过 200K token 的单请求执行。
+  - ECHO 利用早层与末层功能不对称构造双循环推测解码；同期 vLLM 继续把 KV 规划、释放和混合状态正确性做成显式系统接口。
+  - MLPerf v6.1 的 Edge Agentic workload 与 Paper2Agent/Koa 显示 Agent 评测正在从单轮模型能力转向多轮状态复用、工具调用和完整工作流。
+---
+
+# 今日概览
+
+过去 24 小时值得关注的变化并不是某一个单点 kernel 又快了多少，而是**推理系统开始更明确地把“状态”当成独立资源管理对象**。9 月 15 日提交的 [JustFit](https://arxiv.org/abs/2609.17475) 在本地 24 GiB 设备上把压缩 KV 执行、组件驻留和服务状态转换放到同一套即时物化/释放机制中；与此同时，vLLM 的多个开放 PR 正分别处理不同 KV group 的 DCP 语义以及 MoE 接收缓冲区的最坏情况容量。这些工作共同说明，权重、KV、循环状态、临时 workspace 已经不能继续被一个粗粒度“显存占用”概念覆盖。
+
+第二条主线是**推测解码继续从“额外 draft model”转向复用目标模型内部结构**。[ECHO](https://arxiv.org/abs/2609.17241) 利用早层和末层的功能不对称，把低成本候选探索和完整模型验证拆成高频/低频双循环；这类方法的系统价值越来越取决于状态复用、CUDA Graph、metadata 构造和不同并行维度之间能否正确协同，而不只是接受长度本身。
+
+第三，Agent 的“上下文”正在被拆成更丰富的可执行状态。[Paper2Agent](https://www.nature.com/articles/s41586-026-11044-y) 把论文方法和数据转换成 MCP 资源；Salesforce 的 [Koa](https://arxiv.org/abs/2609.15066) 则用工作流规格生成多轮工具任务并以任务完成结果作为 RL 奖励。两者都把 Agent 能力从“回答文本”推进到“携带结构化状态完成工作流”。
+
+最后，评测也开始追上这种变化。NVIDIA 9 月 16 日公布的 [MLPerf Inference v6.1](https://blogs.nvidia.com/blog/vera-rubin-nvl72-mlperf-inference/) 材料明确包含 Edge Agentic workload；其 TensorRT Edge-LLM 实现把跨轮 KV/循环状态复用、低精度 KV 和树形 MTP 作为关键优化对象。Agent serving 的性能指标因此正在从单请求 tok/s 扩展到完整多轮轨迹的总完成时间。
+
+# 重点进展
+
+今天的重点进展集中在三条相互关联的技术线上：推理状态的细粒度生命周期管理、面向多轮 Agent 的可执行状态与工作流，以及利用模型内部结构降低推测解码成本。下文的核心论文、工程变更和 benchmark 分别从算法、runtime 与评测三个层面展开这些变化。
+
+
+过去 24 小时值得关注的变化并不是某一个单点 kernel 又快了多少，而是**推理系统开始更明确地把“状态”当成独立资源管理对象**。9 月 15 日提交的 [JustFit](https://arxiv.org/abs/2609.17475) 在本地 24 GiB 设备上把压缩 KV 执行、组件驻留和服务状态转换放到同一套即时物化/释放机制中；与此同时，vLLM 的多个开放 PR 正分别处理 KV-only 释放、不同 KV group 的 DCP 语义以及 MoE 接收缓冲区的最坏情况容量。这些工作共同说明，权重、KV、循环状态、临时 workspace 已经不能继续被一个粗粒度“显存占用”概念覆盖。
+
+第二条主线是**推测解码继续从“额外 draft model”转向复用目标模型内部结构**。[ECHO](https://arxiv.org/abs/2609.17241) 利用早层和末层的功能不对称，把低成本候选探索和完整模型验证拆成高频/低频双循环；vLLM 同期也在继续推进 EAGLE3、DSpark 等路径。这类方法的系统价值越来越取决于状态复用、CUDA Graph、metadata 构造和不同并行维度之间能否正确协同，而不只是接受长度本身。
+
+第三，Agent 的“上下文”正在被拆成更丰富的可执行状态。[Paper2Agent](https://www.nature.com/articles/s41586-026-11044-y) 把论文方法和数据转换成 MCP 资源，让论文从静态文本变成可调用的研究代理；Salesforce 的 [Koa](https://arxiv.org/abs/2609.15066) 则用工作流规格生成多轮工具任务并以任务完成结果作为 RL 奖励。两者虽然一个偏知识封装、一个偏模型训练，但都把 Agent 能力从“回答文本”推进到“携带结构化状态完成工作流”。
+
+最后，评测也开始追上这种变化。NVIDIA 9 月 16 日公布的 [MLPerf Inference v6.1](https://blogs.nvidia.com/blog/vera-rubin-nvl72-mlperf-inference/) 材料明确包含 Edge Agentic workload；其 TensorRT Edge-LLM 实现把跨轮 KV/循环状态复用、低精度 KV 和树形 MTP 作为关键优化对象。Agent serving 的性能指标因此正在从单请求 tok/s 扩展到完整多轮轨迹的总完成时间。
+
+# 核心论文与技术报告
+
+## JustFit：在 24 GiB 笔记本上把 200K 上下文问题改写成状态生命周期问题
+
+**新增点。** [JustFit: 200K-Token LLM Serving on a 24 GiB Laptop with Just-in-Time State Management](https://arxiv.org/abs/2609.17475) 于 9 月 15 日提交。它不是简单把权重再压低几个 bit，而是明确提出 KVExec、PhaseSwap 和 StateTrans 三个机制：分别处理压缩 KV 的执行、模型组件的阶段性驻留，以及服务阶段切换时状态的保存与恢复。
+
+**核心机制与证据。** 作者在 24 GiB M4 Pro MacBook 上运行 Qwen3.8-27B MXFP4。论文报告三次独立容量测试均完成 196,608 输入 token 加 16,384 输出 token，即总计 212,992 positions；相对 mlx-vlm 基线可完成的 30,720 positions，容量提升为 6.93 倍。另一个双请求实验保留了合计 229,376 positions。性能侧，32K 输入、64 token 输出探针达到 19.11 token/s；32K+6K 重复负载的进程峰值内存中位数为 16,374 MiB。作者还报告集成系统在 AIME 2026 上答对 30 题中的 29 题。
+
+**限制与意义。** 这些数字来自 Apple MLX、本地单机和特定 MXFP4 模型，不能直接外推到 CUDA 数据中心 serving；容量实验、吞吐实验和 AIME 结果也不是同一个 benchmark。更重要的贡献在于问题定义：当模型状态已经包括权重、KV、执行中间态和服务转换状态时，系统需要决定“什么状态何时物化、何时释放、转换后如何保持语义”，而不仅是做静态 offload。
+
+## ECHO：用早层高频探索、末层低频验证重构 draft-model-free speculative decoding
+
+[ECHO: Early-layer Collaborative Hierarchical Orchestration with Bonus Logits in Speculative Decoding](https://arxiv.org/abs/2609.17241) 于 9 月 15 日提交。它针对无独立 draft model 的推测解码中两个问题：候选容易变旧，以及完整验证成本仍然偏高。ECHO 利用作者观察到的层间功能不对称，把早层用于高频 draft-tree 探索，把末层保留为低频的权威验证器。
+
+其内循环由 early-layer bonus logits 驱动多步树探索，外循环执行完整模型验证，并通过状态复用降低重复工作；final-layer bonus logits 还会修正已有路径并补充下一轮高置信候选。作者报告在多项 benchmark 上获得 2.4×–2.9× 加速，并提高平均接受 token 数，同时不需要额外部署一个 draft model。需要注意的是，论文明确指出达到最佳加速仍依赖一次性 fine-tuning，因此“无额外部署参数”不等于完全 training-free。
+
+对系统实现而言，ECHO 的关键不是简单“少跑几层”。一旦早层探索和末层验证以不同频率运行，runtime 必须维护树状态、复用中间状态并控制验证节奏；这会直接触及 CUDA Graph 捕获、KV/metadata 生命周期和批处理调度。它与传统单 draft→target verification 的执行结构已经明显不同。
+
+## 新知识应该放在哪里：上下文、KV 表征还是参数？
+
+9 月 15 日提交的 [Where Should a Document Live: Context, Representations, or Parameters?](https://arxiv.org/abs/2609.17346) 做了一个很有价值的受控比较：同一份外部知识可以直接放入 context，也可以编码成 KV-cache 类表征，或者通过 fine-tuning / adapter 写入参数。论文在五个知识密集 benchmark 上比较这些路径，而不是只比较某一种压缩算法内部的 ablation。
+
+作者报告，在 oracle 文档条件下，Cartridges 这类 KV 表征注入在几乎所有存储预算下最准确，相对参数化方法最高领先约 10 个点；KV Compaction 在低压缩率时接近 Cartridges，但压缩率超过 50× 后落后参数化方法约 10 个点。在更现实的多文档检索设置中，Cartridges 是唯一能匹配 ICL 的方法，分别领先参数化方法 29 个点、领先 Compaction 15 个点。
+
+但结果也揭示了一个容易被忽略的问题：Cartridges 并非“只读缓存”。作者观察到它和完整 fine-tuning、大 MLP adapter 一样出现 control benchmark 退化，整体约 6%，coding 约 13%。因此，持久化 KV/latent representation 更接近一种**可注入模型状态**，其设计需要同时考虑存储成本、检索选择、组合方式和对原有能力的干扰，而不能仅按 cache hit rate 评价。
+
+## Paper2Agent：论文从文档变成 MCP 可调用的研究对象
+
+[Reimagining research papers as interactive and reliable AI agents](https://www.nature.com/articles/s41586-026-11044-y) 于 9 月 16 日正式发表于 Nature。Paper2Agent 自动把论文转换成 AI agent，并把论文中的方法与数据组织为结构化 MCP resources。目标不只是“对论文聊天”，而是让代理能够回答方法问题、把方法应用到新数据，并与其他 paper agents 协作。
+
+论文给出的案例中，系统将 ADHD GWAS 数据和 AlphaGenome 方法 MCP 组合，由 agent 生成并测试假设；它在 209 个候选变异中优先选择 rs1626703，并通过 AlphaGenome 计算提出其可能影响 MPHOSPH9 剪接和谷氨酸能神经元表达的机制假设。论文同时明确指出这仍是待实验验证的候选机制，因此不能把 agent 的计算结果表述成已确认生物学发现。
+
+这项工作的基础设施意义很直接：知识不再只是被检索后塞进 prompt 的文本，而可以被封装成带接口、数据依赖和执行能力的资源。对于 Agent runtime，这意味着上下文管理之外还需要处理资源发现、工具 schema、数据版本、执行环境和跨代理调用链。
+
+## Salesforce Koa：把企业工作流规格直接变成 Agent RL 的训练环境
+
+[Salesforce Koa: An Enterprise Language Model for Agentic Tool Use](https://arxiv.org/abs/2609.15066) 于 9 月 14 日提交，并在 9 月 15 日由 Salesforce 发布官方材料。Koa 基于 Nemotron-3-Super-120B 进行后训练，使用 GRPO，论文强调训练使用公开与合成数据而非客户数据。
+
+其技术核心是 simulation-to-reward pipeline：企业场景用 Agent Script 描述工作流规格，系统再扩展为 persona-conditioned 的多轮任务，并把是否通过正确工具完成数据依赖任务转化为 task-resolution reward；公开工具场景则合成对应的 workflow structure。论文报告 Koa 相比开放权重基座在公开 tool-use、agentic reasoning 和 CRM benchmark 上均有提升，多轮工具使用提升最明显，并超过一个强 proprietary baseline，但仍低于最强 frontier models。
+
+这里更值得关注的是训练数据的结构：Agent 后训练样本不再只是 `(prompt, response, reward)`，而天然包含 workflow、persona、tool state、环境反馈和跨轮任务完成条件。未来 Agent serving 和 trace 系统若只记录对话 token，很可能无法完整表达这种工作负载。
+
+# 开源项目的重要新闻
+
+vLLM 9 月 16 日更新的 [PR #57262](https://github.com/vllm-project/vllm/pull/57262) 处理 MoE DP/EP 下一个很系统化的问题：某个 rank 实际接收的 token 数取决于路由，而 profile run 观察到的流量并不等于运行时最坏情况。PR 新增 `--ep-max-recv-tokens-fraction`，让 DeepEP HT、DeepEP v2、FlashInfer NVLink two-sided 等路径在锁定 workspace 前显式预留最坏接收容量。作者在 H200、Qwen3-30B-A3B-FP8 上报告：DP=2、fraction=1.0 时每 rank 预留 16,384 tokens，可用 KV cache 为 109.81 GiB；fraction=0.25 时预留 4,096 tokens，可用 KV cache 增至 110.56 GiB。该 PR 当前仍是开放变更，不应视为正式 release。
+
+另一个 [vLLM PR #57260](https://github.com/vllm-project/vllm/pull/57260) 修复 DCP 下不同 KV cache group 的 slot mapping 语义。完整 attention/MLA 状态按 DCP 分片，但 Mamba/GDN recurrent state、sliding-window/chunked-local state 等是每 rank 复制；旧逻辑却在 `CP_SIZE > 1` 时对所有 group 都做 localization。PR 将 `cp_enabled` 下沉为 per-group 属性，只对真正 DCP-sharded 的 group 做位置转换。作者指出错误不会产生 shape/assert，而可能静默破坏状态；CUDA-gated 新测试在提交说明中的最终环境尚未实际执行，因此当前证据仍不完整。
+
+SGLang 的 [PR #39059](https://github.com/sgl-project/sglang/pull/39059) 则针对 AMD gfx950 的 FP8 sparse MLA 调整 split-K/reduction launch geometry，并让 split-K workspace 可安全用于 graph capture/replay。作者在 8×MI355X 上报告，prefill microbenchmark 在 1,024–16,384 token 区间约提升 7.82%–15.23%；端到端 C=8 场景总吞吐提升 0.61%，P90 TTFT 降低 10.90%。但 GSM8K strict exact match 从 97.42% 降至 96.82%，作者将 8 个翻转答案归因于 `tl.dot` 累加顺序变化，McNemar p=0.115。这个案例提醒我们：kernel 调优即便数学公式不变，也可能改变 greedy decoding 的离散输出。
+
+# 前沿概念和技术
+
+## Agentic benchmark 开始显式利用跨轮状态局部性
+
+NVIDIA 9 月 16 日发布的 [TensorRT Edge-LLM MLPerf Edge Agentic 结果](https://developer.nvidia.com/blog/tensorrt-edge-llm-completes-the-mlperf-edge-agentic-benchmark-6-4x-faster-on-jetson-agx-thor/) 很适合作为 Agent workload 与普通 chat workload 差异的例子。该 benchmark 使用 Qwen3.6-27B，性能 workload 包含来自 SWE-bench Verified 的 20 条 coding trajectories、合计 1,007 turns，单流、一次一个请求，并保持 32K context。
+
+NVIDIA 报告 Jetson AGX Thor 上 TensorRT Edge-LLM 达到 52.33 token/s，完整 1,007 turns 用时 24 分 36 秒，相比 llama.cpp reference 的 2 小时 37 分快 6.4×。实现同时使用 NVFP4 权重/激活、FP8 KV cache、树形 MTP，以及跨 Agent turn 的 KV/循环状态复用；官方材料称约 96% prompt tokens 可由 hot cache 服务，树形 MTP 相对 linear MTP 对 function-calling workload 再带来约 40% decode 性能收益。这些数字是 NVIDIA 对其提交的说明，适用范围是该硬件、模型和 MLPerf workload，不能泛化为所有 coding agent。
+
+## 多类别概念需要比单一 steering direction 更丰富的内部几何
+
+9 月 15 日提交的 [MAxBench](https://arxiv.org/abs/2609.13072) 把 interpretability/steering 从常见的二元概念扩展到 multinomial concept。作者比较 10 种 localization 方法、5 类几何结构、6 个概念和 4 个模型，发现 affine subspace 的 steering 可靠性和 recall 通常优于 rank-one/linear subspace，其中相当一部分优势来自更好的非零 offset，而不只是 basis 本身；manifold steering 在适用场景也具有竞争力。不过没有一种方法稳定超过 prompting。
+
+这意味着“一个行为对应一条 activation direction”更像特定问题上的有效近似，而不是普适模型。对于未来的内部状态监测和安全审计，表示的几何结构本身可能成为评测对象，而不能只比较某个 probe 的分类准确率。
+
+# 对大模型推理与存储优化的启发
+
+今天几项材料共同指向三个系统层面的结论。第一，**状态管理需要从容量管理升级为语义化生命周期管理**。JustFit 区分 KV 执行状态、组件驻留状态和服务转换状态；vLLM 的 DCP 修复又说明不同 cache group 的复制/分片语义不同。系统若只知道一块显存“属于 KV”，已经不足以安全地决定移动、释放和恢复。
+
+第二，**Agent 的 locality 应按 workflow 而非独立 request 建模**。MLPerf Edge Agentic 的 1,007-turn 轨迹中，大量 prompt token 来自共享历史；Paper2Agent 和 Koa 又进一步引入方法资源、工具状态和工作流规格。由此可以推测，面向 Agent 的缓存系统需要把 session、branch、tool result 和可执行资源的生命周期纳入命中价值，而不是仅按 token 前缀长度排序。
+
+第三，**性能优化越来越需要把“状态正确性”作为一等验证指标**。SGLang sparse MLA 的累加顺序变化能够翻转 greedy 输出；vLLM DCP bug 则可能静默写错 replicated state 的 slot。未来 benchmark 除 tok/s、TTFT、TPOT 外，还应记录状态恢复一致性、跨轮复用正确性、不同并行配置下的状态映射，以及优化前后的 token-level equivalence。
+
+# 深度分析
+
+如果把今天的工作放在同一条技术轴线上，可以看到 LLM runtime 正从“执行 Transformer graph”转向“执行一个持续演化的状态机”。传统服务框架最重要的长期对象主要是模型权重和每个 request 的 KV；现在又出现 Mamba/recurrent state、speculative tree state、MoE workspace、MCP resource、Agent workflow state，以及可在 sleep/wake、prefill/decode、tool call 之间迁移的中间状态。
+
+这会改变系统抽象。资源规划不再只是 `bytes = tokens × layers × heads`，而需要描述状态的**所有权、复制域、可重建性、恢复代价、下一次使用概率和正确性约束**。例如 DCP attention KV 可以分片，但 replicated recurrent state 不能套用同一 slot localization；MoE workspace 可以回收，但必须先知道最坏路由接收量；Agent KV 可以跨 turn 命中，但工具调用后的分支是否继续存活并不由 token 长度决定。
+
+因此，未来主流推理框架中值得持续观察的不是某个单独的 offload backend，而是是否出现统一的 state descriptor、lifecycle callback、placement policy 和 correctness contract。vLLM 正在进行的 extensible KV cache、KV-only release、per-group CP 语义等工作已经显露这种趋势，但目前仍是多个独立接口，距离统一状态层还有明显距离。
+
+# 今夜白的观察
+
+今天最值得记住的不是 6.93×、2.9× 或 6.4× 这些 headline 数字，而是它们背后的共同条件：收益都来自**避免重复构造状态，或让状态只在真正需要时驻留**。这比单纯“更快的 attention kernel”更接近下一阶段推理系统的核心矛盾。
+
+另一个趋势是 Agent benchmark 终于开始把真实执行形态带入系统评价。1,007-turn coding trajectory 与普通随机 prompt benchmark 的差别非常大：前者存在强 session locality、共享长历史、工具边界和连续状态，优化目标是整个任务完成时间。只要这类 benchmark 继续标准化，KV reuse、prefix caching、speculative decoding 和状态恢复机制的评价方式都会随之变化。
+
+最后需要保持克制：今天多项工程工作仍处于开放 PR，ECHO 和 JustFit 是新预印本，Koa 的部分企业指标来自厂商体系，MLPerf 中 Vera Rubin 也包含 preview submission。它们足以揭示方向，但还不足以证明某一种具体实现会成为统一答案。接下来更值得跟踪的是这些机制能否进入主流框架、能否在多模型多硬件上复现，以及状态抽象是否逐步收敛。
+
+# 原始资料链接
+
+论文与正式技术材料：
+
+- [JustFit: 200K-Token LLM Serving on a 24 GiB Laptop with Just-in-Time State Management](https://arxiv.org/abs/2609.17475)
+- [ECHO: Early-layer Collaborative Hierarchical Orchestration with Bonus Logits in Speculative Decoding](https://arxiv.org/abs/2609.17241)
+- [Where Should a Document Live: Context, Representations, or Parameters?](https://arxiv.org/abs/2609.17346)
+- [Reimagining research papers as interactive and reliable AI agents](https://www.nature.com/articles/s41586-026-11044-y)
+- [Salesforce Koa: An Enterprise Language Model for Agentic Tool Use](https://arxiv.org/abs/2609.15066)
+- [MAxBench: A Multinomial Concept Recovery Benchmark](https://arxiv.org/abs/2609.13072)
+
+官方博客与 benchmark：
+
+- [NVIDIA Vera Rubin NVL72 Delivers Leading Performance in MLPerf Inference v6.1 Debut](https://blogs.nvidia.com/blog/vera-rubin-nvl72-mlperf-inference/)
+- [TensorRT Edge-LLM Completes the MLPerf Edge Agentic Benchmark 6.4x Faster on Jetson AGX Thor](https://developer.nvidia.com/blog/tensorrt-edge-llm-completes-the-mlperf-edge-agentic-benchmark-6-4x-faster-on-jetson-agx-thor/)
+- [Salesforce Koa 官方页面](https://www.salesforce.com/agentforce/koa/)
+
+开源工程：
+
+- [vLLM PR #57262: Configurable worst-case EP receive capacity](https://github.com/vllm-project/vllm/pull/57262)
+- [vLLM PR #57260: DCP slot mapping only for context-parallel KV groups](https://github.com/vllm-project/vllm/pull/57260)
+- [SGLang PR #39059: Tune Triton sparse MLA on gfx950](https://github.com/sgl-project/sglang/pull/39059)
+
+# 参考资料
+
+本报告优先采用上述 arXiv、Nature、NVIDIA/Salesforce 官方材料和项目官方 GitHub PR。论文中的性能数字均按作者公开实验范围表述；GitHub 项目均明确标注为 PR 而非稳定发布。NVIDIA Vera Rubin 的 MLPerf 结果中包含 preview submission，文中未将其表述为已经广泛部署的量产性能。
