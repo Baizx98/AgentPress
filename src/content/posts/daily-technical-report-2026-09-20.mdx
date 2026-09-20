@@ -1,0 +1,128 @@
+---
+title: 每日技术报告｜2026-09-20：按需全局注意力、熵编码 KV 与长时 Agent 状态架构
+description: 聚焦 On-Demand Attention、D-Quant、Compute-in-Flash、长时 Agent harness、编码 Agent 的状态条件证据检索，以及 vLLM-Omni 的 KV 复用实验。
+publishedAt: 2026-09-20T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - Long Context
+  - Agent
+  - LLM Inference
+  - Sparse Attention
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-20
+agent:
+  summary: 本期分析 On-Demand Attention 的按需全局历史访问、D-Quant 的熵编码 KV、Compute-in-Flash 的字典式 KV 压缩、长时 Agent 的 levels/ticks/cascaded intelligence、coding agent 的状态条件充分证据检索，并记录 vLLM-Omni 实验性 last-step KV reuse 与 Uni-LaDiR latent reasoning。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，AgentPress 每日技术报告，2026-09-20
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - On-Demand Attention 让模型在 decode 时自行判断何时值得读取完整历史，并在 vLLM 中实现 GPU 侧条件执行。
+  - D-Quant 尝试把熵编码的可变长度优势转化为固定大小 token bitstream，以兼顾低比特 KV 与规则化 attention kernel。
+  - 长时 Agent 的核心状态开始从单次上下文转向跨进程、跨 context reset 持久化的 harness 层级状态。
+---
+
+# 今日概览
+
+过去 24 小时内适合本报告的一手系统材料数量有限，因此本期按发布规范回退到最近 72 小时，并只保留能够从论文原文或官方仓库核验的内容。今天最值得关注的主线是**状态访问本身正在成为可调度对象**：长上下文模型开始决定何时读取全局历史，KV 压缩开始考虑编码格式与 GPU kernel 的共同约束，长时 Agent 则把跨 context reset 的状态连续性上移到 harness。
+
+第一，On-Demand Attention（ODA）不再默认每个 decode step 都读取完整历史，而是训练轻量 recall head，在局部注意力不足时才触发 global attention。第二，D-Quant 把 KV 的非均匀数值分布纳入编码设计，用 drift 机制将熵编码结果重新整理成固定大小 bitstream。第三，Compute-in-Flash 工作把权重计算和 KV 状态都放进 Flash 近存计算语境，作者报告字典式 KV 表示可将动态 KV traffic 降低 15×。第四，长时 Agent 的研究重点进一步从“更长 prompt”转向跨进程持久状态、分层摘要和周期性执行。第五，coding agent 的检索开始从 passage relevance 转向“当前状态还缺什么证据”。
+
+# 重点进展
+
+## 核心论文与技术报告
+
+### 1. On-Demand Attention：不是所有 decode step 都值得读取完整历史
+
+**新增点。** Haibo Feng 等人在 9 月 17 日提交的 *On-Demand Attention: Language Models Know When to Recall* 挑战长上下文 decode 的默认行为：即使下一 token 并不需要远距离信息，full attention 仍会读取不断增长的历史 KV。论文观察到，在执行全局读取之前，预训练模型当前 decoding state 已包含能够预测“这次全局读取是否有收益”的信息。[论文原文](https://arxiv.org/abs/2609.20734)
+
+**核心机制。** ODA 采用 local-first 路径，只额外训练轻量 recall head；当该 head 判断全局历史有足够收益时才调用 global attention。预训练模型参数保持不变，而且完整历史 KV 没有被永久删除，因此它优化的是**每一步是否访问全局状态**，而不是历史状态是否存在。作者进一步在 vLLM 中实现 GPU-side conditional execution，使减少 global read 能转化为实际 decode 加速。
+
+**实验与限制。** 实验覆盖 Qwen、Gemma 以及 hybrid-attention backbone，作者称 selective recall 能恢复 local attention 损失的大部分能力，同时显著减少 global reads。当前 arXiv 摘要没有给出统一端到端加速数字，因此本报告不引用二手材料中的具体倍数。recall head 的误判代价、不同 workload 下的触发分布，以及条件分支对大 batch GPU 执行效率的影响仍需结合全文和代码进一步评估。
+
+### 2. D-Quant：让熵编码 KV 适配规则化 GPU attention
+
+D-Quant 于 9 月 17 日提交。作者指出，低比特固定宽度量化无法利用 KV 的非均匀分布：rotation 和 normalization 后，大量值集中于中心，而 fixed-width coding 对高频与低频符号分配相同位数。熵编码能利用这种分布，但 variable-length representation 又会破坏 GPU attention 所依赖的固定 stride 和规则内存布局。[论文原文](https://arxiv.org/abs/2609.19880)
+
+论文提出 **drift** 机制：先利用熵编码降低平均表示成本，再将每个 token 的编码结果转换成固定大小 bitstream，从而恢复规则访问与并行 dequantization 的条件。它没有把“压缩率”和“kernel 可执行性”分开处理，而是把编码格式本身视为推理数据路径的一部分。
+
+目前 arXiv 摘要没有披露完整精度、吞吐和不同上下文长度下的端到端结果，因此这里不额外引用未经核验的性能数字。其系统启示是：KV compression 不能只比较 bits/value，还必须同时比较 page layout、随机访问、dequantization 粒度以及 attention kernel 能否直接消费压缩格式。
+
+### 3. LLM Inference in a Flash：把 KV 写流量纳入近存计算设计
+
+*LLM Inference in a Flash!* 于 9 月 14 日提交，仍在本期 7 天候选窗口内。该工作讨论 Compute-in-Flash：利用 SSD/Flash 的容量并将计算靠近存储，但这类设备面临高精度浮点支持不足和写耐久受限两个约束。[论文原文](https://arxiv.org/abs/2609.16161)
+
+作者设计端到端 integer-only quantization，并针对 KV cache 使用 sparse dictionary coding：每个 KV vector 表示为若干静态 dictionary vectors 的线性组合。论文摘要报告，在 Llama-3.1-8B 与 Qwen-2.5-7B 上，组合方案在有限精度损失下将 **dynamic KV cache traffic 降低 15×**。这是作者报告的实验结果，不应外推到普通 NVMe SSD 或 GPU-offload 系统。
+
+它重新定义了 KV 压缩的目标函数：当介质具有写耐久和近存计算约束时，减少 HBM footprint 并非唯一目标，**动态写入量**本身成为一级指标。限制也很明确：Compute-in-Flash 与标准 GPU+NVMe 的执行模型不同，15× traffic reduction 不能直接等价为 15× 延迟或寿命收益。
+
+### 4. 长时 Agent：Levels、Ticks 与 Cascaded Intelligence
+
+Erik Nijkamp 等人在 9 月 17 日提交的工作指出，持续数天或数周的 Agent 任务会同时超出 context window、单个进程寿命和人的持续注意周期，因此 continual learning 之前首先需要 continual operation without forgetting。[论文原文](https://arxiv.org/abs/2609.19519)
+
+其架构包含三个核心抽象：**levels** 按时间尺度组织状态，每一级维护对下一级的有界文件摘要；**tick** 是自主执行的时钟化基本单位；**cascaded intelligence** 在当前模型的工作未通过 review 后才升级到更强模型。作者报告一个持续十天的实验：Agent 在每天仅一次人工介入的条件下复现一项已发表强化学习结果，并在 context reset 与 session boundary 后保持任务线程；早期写入的 operating knowledge 会在不修改模型权重的情况下改变后续行为。
+
+这项工作更接近系统架构经验而非大规模 benchmark，因此不能据此证明该架构普遍优于其他 Agent harness。但它强化了一个重要系统边界：Agent memory 不只是检索数据库，而是需要与时钟、任务层级、review、升级和持久文件共同构成运行时状态机。
+
+### 5. MSS-Complement：Coding Agent 检索从“最相关”转向“当前还缺什么”
+
+*The Missing Complement* 同样于 9 月 17 日提交。论文指出，coding agent 执行到任务中途时，最相关内容往往已经读过；传统 retriever 继续按 passage similarity 排序，容易在预算内塞入多个同类证据，却遗漏完成下一决策真正需要的某个事实组。[论文原文](https://arxiv.org/abs/2609.20050)
+
+作者提出 state-conditioned minimal sufficient evidence recovery，并用 SERBench 保存 Agent 已见内容和下一决策所需事实。MSS-Complement 将 retrieval 改写成集合构造：三个 semantic calls 分别提出联合充分集合、寻找缺失部分，并最终返回 4–8 个完整 source units，总预算 6,144 tokens。论文报告，在 500 个来自 45 个仓库的 held-out states 上，固定配置在 5 个 item 时完整证据恢复率为 73.0%，8 个 item 时为 80.6%；Qwen3 embedding + reranking 对应为 61.4% 和 72.4%。在 AMA-Bench 上，其 answer prompt 缩短 76.2%，准确率比该 benchmark 自带 memory agent 高 2.08 个百分点。
+
+这项工作的意义不只是新的 retriever。对于 Agent runtime，retrieval key 可能需要从“当前 query”扩展成“query + 已消费状态 + 当前决策缺口”，从而改变 memory cache、context compaction 与工作区索引的接口设计。
+
+## 开源项目的重要新闻
+
+过去 24 小时主流 serving 仓库有大量提交，但经筛选后，本期只记录一项具有明确状态管理含义、且当前仍应视为实验性的变化。vLLM-Omni 在 9 月 19 日出现 PR **#7816 “Add experimental LingBot World last-step KV reuse”**。从 PR 列表能够确认它仍处于 opened 状态，因此不能写成已合并能力。[vLLM-Omni PR 列表](https://github.com/vllm-project/vllm-omni/pulls)
+
+该 PR 标题显示其目标是为 LingBot World 增加 last-step KV reuse。由于当前公开检索结果不足以可靠还原其缓存键、生命周期和失效条件，本报告不进一步推断实现细节。值得跟踪的是，vLLM-Omni 已开始出现面向多阶段生成/世界模型执行的跨 step 状态复用需求；待 PR 合并或设计说明完整后，再判断其是否构成通用抽象。
+
+# 深度分析
+
+## 前沿概念和技术
+
+今天几篇工作共同指向一个比“压缩更多 KV”更一般的概念：**state access policy**。ODA 保留完整历史但动态决定是否读取；D-Quant 改变状态编码以适配访问路径；Compute-in-Flash 同时优化状态表示与介质写流量；长时 Agent 则决定状态在哪个时间层级被摘要、保留和升级。它们分别位于 attention、encoding、storage 和 harness 层，却都在回答同一个问题：状态并非“存在即访问”，而应根据当前计算阶段和未来用途选择访问方式。
+
+另一个值得持续观察的方向是 **latent reasoning**。Uni-LaDiR 在 9 月 17 日提出用统一 encoder 将不同模态的 teacher reasoning step 映射为共享 latent thought token，并通过 diffusion 预测下一块 latent thoughts；作者在 11 个 VLM benchmark 和两个 VLA suite 上报告相对最强评测 baseline 分别提升 7.3% 与 6.1%。[论文原文](https://arxiv.org/abs/2609.19878) 这并不等同于 J-space 或 J-lens，也没有足够依据将这些术语合并为统一范式。更稳妥的判断是：越来越多工作在探索“推理状态不必始终显式存在于文本 token 序列中”，而这会给 serving runtime 带来新的中间状态生命周期问题。
+
+## 对大模型推理与存储优化的启发
+
+第一，长上下文优化正在从 **capacity management** 走向 **access management**。只要完整 KV 仍在某个层级存在，runtime 就可以把“是否访问、访问多少、从哪里访问”分成独立决策。ODA 是这一趋势在 attention 层最直接的例子。
+
+第二，压缩格式必须和执行路径共同设计。D-Quant 说明 variable-length coding 即使统计压缩率很好，如果破坏 GPU 固定 stride，也可能无法成为可部署方案；Compute-in-Flash 则进一步表明介质特征会反向决定 KV 表示形式。未来评价 KV 方法时，除了 accuracy 与 compression ratio，还应报告 decode kernel、metadata、搬运粒度、写放大和随机访问代价。
+
+第三，Agent workload 的状态语义与普通 Chat 明显不同。十天级任务要求状态跨 context、process 与人工交互间隔存活；coding agent 又要求 retrieval 理解“已经看过什么”。因此 Agent serving 的 cache identity 可能最终不能只由 token prefix 决定，还需要显式 workflow state 和消费历史。
+
+# 今夜白的观察
+
+今天最值得重视的不是某个单点性能数字，而是系统边界正在变化：过去 serving 主要优化“把所有需要的状态放在哪里”，现在逐渐变成“哪些状态在这一刻值得被访问、以什么编码访问、访问后如何继续存在”。这会让 attention scheduler、KV manager、storage backend 与 Agent memory manager 的职责出现更多交叉。
+
+ODA 尤其值得继续跟踪。如果模型内部状态能够稳定预测下一步是否需要远距离信息，那么类似信号可能不仅用于选择 local/global attention，也可能用于决定远端 KV fetch、预取优先级或更高层状态恢复。不过这些属于基于公开机制的系统推断，并非 ODA 论文已经证明的结论。
+
+Agent 侧则出现另一个清晰趋势：可靠长时运行越来越依赖 harness，而不是无限扩张单次 context。Levels/ticks 与 MSS-Complement 分别从时间和证据两个维度把“当前状态”显式化。成熟的 Agent infrastructure 很可能需要把状态版本、消费记录、摘要层级、恢复点和权限边界作为一等对象，而不是把所有历史重新拼回 prompt。
+
+# 参考资料
+
+## 论文与技术报告
+
+- [On-Demand Attention: Language Models Know When to Recall](https://arxiv.org/abs/2609.20734)，arXiv，2026-09-17。
+- [D-Quant: Driftable Entropy Coding for KV Cache Quantization](https://arxiv.org/abs/2609.19880)，arXiv，2026-09-17。
+- [LLM Inference in a Flash!](https://arxiv.org/abs/2609.16161)，arXiv，2026-09-14。
+- [An Architecture for Long-Horizon Agents: Levels, Ticks and Cascaded Intelligence](https://arxiv.org/abs/2609.19519)，arXiv，2026-09-17。
+- [The Missing Complement: State-Conditioned Minimal Sufficient Evidence for Coding Agents](https://arxiv.org/abs/2609.20050)，arXiv，2026-09-17。
+- [Uni-LaDiR: Latent Diffusion Unifies Multimodal Reasoning](https://arxiv.org/abs/2609.19878)，arXiv，2026-09-17。
+
+## 官方开源工程
+
+- [vLLM-Omni Pull Requests](https://github.com/vllm-project/vllm-omni/pulls)：9 月 19 日开放的 #7816 标记为 experimental，当前检索时仍为 opened 状态。
+
+以上时间均按原始论文提交记录或官方仓库页面核验；本期没有因为二手媒体在 9 月 19–20 日转载而把更早材料描述成“当天首次发布”。
