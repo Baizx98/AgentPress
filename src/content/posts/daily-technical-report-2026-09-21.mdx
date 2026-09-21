@@ -1,0 +1,133 @@
+---
+title: 每日技术报告｜2026-09-21：按需全局注意力、Agent 授权边界与 PB 级 KV 存储
+description: 聚焦 On-Demand Attention 的条件式全局读取、Agent 端到端 QA 与结构化授权，以及华为 PB 级 KV 存储和边缘 Agent 推理工程进展。
+publishedAt: 2026-09-21T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Inference
+  - KV Cache
+  - Agent
+  - Long Context
+  - Agent Security
+  - Edge AI
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-21
+agent:
+  summary: 本期聚焦长上下文与 Agent 基础设施：ODA 用轻量 recall head 按需触发全局注意力并在 vLLM 中实现条件执行；两项 Agent 研究分别揭示开源 Agent 的端到端 QA 缺口与独立授权层对共享记忆污染的结构化遏制作用；同时分析 OceanStor M900 的 PB 级 KV 分层存储、TensorRT Edge-LLM 的跨轮前缀复用，以及 LMCache 多硬件 nightly 的工程信号。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，AgentPress 每日技术报告，2026-09-21
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - On-Demand Attention 让模型按需触发全局 KV 读取，并在 vLLM 中实现 GPU 侧条件执行。
+  - Agent 安全研究开始从提示层防御转向端到端 QA 与独立授权边界。
+  - OceanStor M900 将 KV 语义推进到 PB 级共享分层存储，边缘 Agent 基准则凸显跨轮前缀复用与低比特 KV 的价值。
+---
+
+# 今日概览
+
+过去 24 小时内适合直接进入系统研究主线的新论文并不多，因此本期按规范回退到近 72 小时，并只保留能够回到论文原文、官方技术博客或官方仓库验证的材料。今天最值得关注的变化不是单一模型发布，而是三条系统趋势开始汇合：**长上下文访问从“始终读取全部历史”转向条件式读取；Agent 安全从提示级防护转向执行边界；KV Cache 正被进一步抽象成跨计算节点和存储介质共享的数据对象。**
+
+第一，On-Demand Attention（ODA）提出让模型根据当前 decoding state 判断“这一 token 是否值得读取全局历史”，把稀疏化决策从固定窗口或固定 Top-k 推向动态 recall。第二，两项 Agent 研究都表明，仅依赖 LLM 自身判断并不足以建立可靠安全边界：真正需要验证的是工具、记忆、权限和执行链路的端到端行为。第三，华为 OceanStor M900 将 KV cache 明确做成 PB 级共享分层存储对象，而 NVIDIA 的边缘 Agent 基准则把跨轮 prefix KV reuse、FP8 KV 和树式 MTP 放进同一条真实 Agent 执行路径中。
+
+# 重点进展
+
+## 1. On-Demand Attention：不是每个 decode token 都需要读取完整历史
+
+**新增点。** 9 月 17 日公开的 [On-Demand Attention: Language Models Know When to Recall](https://arxiv.org/abs/2609.20734) 针对长上下文 reasoning 与 agentic workload 中一个很直接的浪费：标准 full attention 在每个 decode step 都读取持续增长的历史 KV，即使当前预测实际上只依赖局部上下文。
+
+**核心机制。** ODA 采用 local-first decoding，并训练一个轻量 recall head，根据执行全局读取之前已经存在的 decoding state，预测当前 token 从 global attention 中获得的收益。只有预测需要“recall”时才执行全局 attention；预训练模型权重保持不变，完整历史 KV 也仍然保留，因此它不是永久删除历史，而是把“是否读取历史”变成逐步条件决策。作者进一步在 vLLM 中实现 GPU-side conditional execution，使减少 global read 不只停留在 attention FLOPs 估算，而能转化为实际 decode 加速。
+
+**实验与限制。** 论文覆盖 Qwen、Gemma 以及 hybrid-attention backbone，摘要报告 ODA 在显著减少 global reads 的同时恢复了大部分纯 local attention 损失的性能。当前公开摘要没有给出足够完整的跨硬件收益边界，因此不能把其速度收益外推到所有模型和 batch 规模。更关键的是，ODA 仍保留完整历史 KV：它降低的是读取频率和带宽压力，而不是直接解决 KV 容量随上下文增长的问题。
+
+**为什么重要。** 这项工作把“KV 是否存在”和“KV 是否在当前 step 被访问”明确拆开。对于长上下文系统，这意味着容量管理、驻留管理和访问管理可以是三个独立控制面，而不是把 KV pruning、offload 和 sparse attention 混成一个问题。
+
+## 2. Agent QA：157 个开源项目暴露出执行路径覆盖缺口
+
+9 月 15 日的 [A Large-Scale Empirical Study of Quality Assurance Practices and Gaps in AI Agents](https://arxiv.org/abs/2609.17698) 分析了 157 个至少 100 GitHub stars 的开源 LLM Agent 项目，覆盖文档、源代码、配置与测试。作者关注的不是模型回答是否正确，而是 planning、memory、tool use、code execution 与外部交互组合起来之后，项目实际上如何做质量保障。
+
+论文发现，当前 QA 更多覆盖基础功能和显式高风险动作，但等价执行路径上的 safeguard 并不一致；测试很少系统覆盖边界条件、对抗输入或多步工具失败；已经识别出的风险也很少被落实为端到端检查。这个结果的重要性在于：Agent runtime 的“正确性单元”已经不再是一次模型调用，而是一段跨工具、跨状态、跨权限的 workflow。
+
+限制也很明确：这是对开源项目实践的经验研究，不能直接代表闭源生产系统的成熟度。但它给出了一个值得系统研究采用的评测方向——测试对象应从单个 prompt/response 扩展到**状态写入、工具调用、恢复、重试和最终副作用**。
+
+## 3. 多 Agent 安全：LLM 判断可以失守，但执行层仍可阻断
+
+[Trust propagation and structural containment in Multi-agent LLM pipelines](https://arxiv.org/abs/2609.17648) 同样于 9 月 15 日公开。作者在由 Supervisor、Researcher、Validator 和 Executor 组成的四 Agent LangGraph pipeline 中测试 shared-memory poisoning 与间接 prompt injection，并把 LLM Validator 与独立授权层分离。
+
+实验中，未防护的 memory poisoning 在所有试验里都到达执行阶段；加入 task-bound signed tokens 和独立 policy oracle 后，作者报告在该设置下出现 **100% Judgment Bypass Rate、但 0% Unsafe Action Rate**。这组数字的含义不是“攻击消失”，恰恰相反：Validator 仍然可能被攻破，但最终执行可以由结构化授权边界拦住。作者还报告 Observer 层把 agent hijacking 的 false-positive rate 从 49% 降至 7%。
+
+这项工作规模仍较小——三组随机种子、60 个标注任务、固定四 Agent 拓扑，因此不应把结果视为通用安全保证。但其系统含义很清楚：**memory 与 message propagation 不应自动携带 authority**。共享状态可以被消费，但高权限副作用应由独立、可验证的控制面决定。
+
+## 4. OceanStor M900：把 KV Cache 推到 PB 级共享存储层
+
+华为在 9 月 17 日 HUAWEI CONNECT 2026 上发布 [OceanStor M900 Context Memory Storage](https://www.huawei.com/en/news/2026/9/hc-context-memory-storage)。官方将其定位为面向超长上下文和多轮推理的 KV cache 存储层：通过 UnifiedBus 建立全局共享、多层级 KV pool，并把片上内存、DRAM 与 SSD 纳入统一层次。
+
+根据华为官方材料，单集群容量可达 **64 PB**、聚合访问带宽 **40 TB/s**；其 CPU、网络控制器和 NAND 控制器集成架构用于实现计算侧到 SSD 的 one-hop 路径，官方宣称访问延迟可降至 **60 μs**。在其“典型 AI 编程场景”中，官方报告 token throughput 翻倍、TTFT 减半。以上均为厂商公布结果，目前缺少公开的独立 benchmark，因此应视为特定系统和负载下的官方数据，而不是通用性能结论。
+
+更值得关注的是抽象变化：KV cache 不再只是推理引擎内部的显存结构，而被存储系统赋予原生语义、生命周期预测和跨介质放置策略。华为同时称 KV-aware adaptive storage 会依据数据价值预测 KV 生命周期，以降低 SSD 写入压力。若后续公开更细的接口、trace 与策略细节，这类系统可能直接推动“KV storage”从 connector 机制进一步走向独立基础设施层。
+
+## 5. 边缘 Agent 基准：跨轮 prefix reuse 开始成为完整 Agent 路径的一部分
+
+NVIDIA 9 月 17 日的官方技术博客 [TensorRT Edge-LLM Completes the MLPerf Edge Agentic Benchmark 6.4x Faster on Jetson AGX Thor](https://developer.nvidia.com/blog/tensorrt-edge-llm-completes-the-mlperf-edge-agentic-benchmark-6-4x-faster-on-jetson-agx-thor/) 给出一个较少见的完整 Agent inference workload：基准包含 1,007 个生成轮次，输入上下文增长到约 23.5K tokens，并持续把工具结果追加回会话。
+
+NVIDIA 使用 Qwen3.6-27B，在单台 Jetson AGX Thor 上完成该 workload 用时 24 分 36 秒，官方报告相对 llama.cpp reference 的 2 小时 37 分钟快 6.4 倍。优化不是单点 kernel：包括 NVFP4 权重/激活、FP8 KV cache、跨连续 Agent turn 恢复可复用 prompt prefix 的 KV page，以及 tree-based multi-token prediction。官方还报告 tree MTP 相比三步 linear MTP 在这一特定 workload 上带来约 40% decode performance gain。
+
+这组结果不能简单解释为某一种优化贡献了 6.4 倍，因为 baseline、量化、KV reuse 与 speculative path 同时变化。但它很好地展示了 Agent serving 的真实系统特征：**同一 session 内反复增长的上下文、工具调用产生的新 token、跨轮稳定 prefix，以及长时间运行过程中可重复利用的模型状态**，需要一起进入 runtime 设计。
+
+# 开源项目的重要新闻
+
+[LMCache 官方 Releases](https://github.com/LMCache/LMCache/releases) 在 9 月 20 日继续发布基于 dev 分支的 nightly wheels，覆盖 CUDA 12.9、CUDA 13.0、ROCm 7.2（gfx942/gfx950）以及 Moore Threads MUSA。ROCm nightly 明确与上游 vLLM ROCm 容器的 torch/cp312 ABI 对齐；MUSA wheel 则依赖宿主提供 TorchMUSA、SDK 和驱动。
+
+这不是一个新的缓存算法，也不应被描述为稳定功能发布；这些条目当前均属于 **pre-release/nightly**。它的工程信号在于，独立 KV cache layer 正从 CUDA-only 假设转向多 accelerator runtime 的打包与 ABI 兼容问题。对于跨 GPU/NPU/异构环境的 KV connector，真正影响可部署性的往往不只是数据路径本身，还包括 tensor layout、runtime ABI、设备内存 API 和上游推理框架版本耦合。
+
+# 前沿概念和技术
+
+今天最值得抽象出来的概念是 **conditional state access**。ODA 保留完整历史但按需读取；边缘 Agent workload 跨轮保留并恢复 prefix KV；M900 则把 KV 作为可在 HBM/DRAM/SSD 之间分层管理的数据对象。这三者分别对应“访问”“复用”“驻留”三个维度。
+
+这与传统“把 KV cache 做小”的思路不同。未来长上下文优化未必只有 compression ratio 一个核心指标，还需要同时回答：哪些状态应该继续存在、哪些状态应驻留在快层、哪些状态当前值得读取、哪些状态可跨请求或跨轮共享。对 Agent 而言，还要再加一个维度：状态是否携带权限与可信度。多 Agent 安全论文说明，**可复用状态与可授权状态不能被视为同一个集合**。
+
+# 深度分析
+
+从今天的材料看，推理系统正在形成一个更清晰的“状态控制面”。第一层是模型内部的访问决策，例如 ODA 的 recall head；第二层是 runtime 的 cache identity、prefix reuse 和 conditional execution；第三层是跨设备、跨介质的数据放置；第四层则是 Agent workflow 中状态的可信度与权限边界。
+
+这四层目前仍由不同社区分别处理：稀疏注意力论文关注 token access，serving framework 关注 KV page 和 scheduling，存储系统关注容量与数据移动，Agent security 关注 memory poisoning 与 authority propagation。真正困难的问题是这些控制面发生冲突时如何协调。例如，一个长期保留、命中率很高的 prefix KV 可能在性能上很有价值，但它对应的上层 memory 或 tool result 未必仍然可信；反过来，一个需要强一致验证的 workflow state，也未必值得长期占用最昂贵的 HBM。
+
+因此，评价下一代 Agent serving 系统时，仅给 tokens/s、TTFT 或 cache hit ratio 已经不够。至少还应报告跨轮状态复用比例、状态恢复成本、长 idle gap 后的恢复行为、tool-call 引入的上下文膨胀，以及状态权限变化后的失效机制。今天的论文和工程材料尚未提供统一 benchmark，但已经从不同侧面指向这一缺口。
+
+# 对大模型推理与存储优化的启发
+
+最直接的启发是把 KV 优化拆成 **capacity、placement、access、reuse** 四个相互关联但不等价的问题。压缩解决 capacity，分层存储解决 placement，稀疏/条件注意力解决 access，prefix cache 和跨轮恢复解决 reuse。一个方法如果只优化其中一项，评测时就需要说明是否把代价转移到了另外三项。
+
+第二，Agent workload 应成为独立的 serving workload，而不是继续用普通 chat trace 近似。工具调用会制造 human/tool-paced gap，workflow 会出现 branch、retry 与 rollback，长期 session 会让“暂时不访问”和“未来不再需要”产生明显差别。NVIDIA 的 Edge Agentic benchmark 至少开始把多轮工具结果和持续上下文放进完整执行路径，但更大规模的数据中心级 Agent trace 仍然稀缺。
+
+第三，存储层开始理解 KV 语义后，接口设计会比单一介质性能更重要。M900 的公开材料已经使用 KV-aware lifecycle、global sharing 等表述；LMCache 则从软件层持续扩展硬件兼容。后续值得重点观察的是：KV identity、生命周期、优先级、租户隔离和失效通知能否形成跨框架的稳定接口，而不是继续绑定某个 engine 的内部 block layout。
+
+# 今夜白的观察
+
+今天最强的信号不是“又出现一种 KV 压缩算法”，而是**状态管理开始成为模型、runtime、存储和 Agent 安全共同面对的系统对象**。ODA 说明模型自己可以参与决定何时访问历史；M900 说明存储设备开始试图理解 KV 生命周期；Agent security 研究则提醒我们，状态不仅有热度和价值，还有来源、可信度与权限。
+
+短期内，我会继续关注两类证据。其一是 ODA 这类 conditional attention 在高 batch、混合长度和真实 serving trace 下是否仍能稳定兑现 GPU 收益；其二是 PB 级 KV pool 是否会公开足够细的接口与独立 benchmark，证明 SSD 层不只是容量扩展，而能在真实 Agent session locality 下形成可预测的 token economics。相比继续堆叠单点优化，这两类工作更可能改变推理系统的状态抽象边界。
+
+# 参考资料
+
+## 论文
+
+- Haibo Feng et al., [On-Demand Attention: Language Models Know When to Recall](https://arxiv.org/abs/2609.20734), 2026-09-17。
+- Wuyang Dai et al., [A Large-Scale Empirical Study of Quality Assurance Practices and Gaps in AI Agents](https://arxiv.org/abs/2609.17698), 2026-09-15。
+- Tanzim Hossain Safin et al., [Trust propagation and structural containment in Multi-agent LLM pipelines](https://arxiv.org/abs/2609.17648), 2026-09-15。
+
+## 官方技术材料
+
+- Huawei, [OceanStor M900 Context Memory Storage](https://www.huawei.com/en/news/2026/9/hc-context-memory-storage), 2026-09-17。
+- NVIDIA, [TensorRT Edge-LLM Completes the MLPerf Edge Agentic Benchmark 6.4x Faster on Jetson AGX Thor](https://developer.nvidia.com/blog/tensorrt-edge-llm-completes-the-mlperf-edge-agentic-benchmark-6-4x-faster-on-jetson-agx-thor/), 2026-09-17。
+
+## 开源工程
+
+- LMCache, [GitHub Releases](https://github.com/LMCache/LMCache/releases), 2026-09-20 nightly builds。
