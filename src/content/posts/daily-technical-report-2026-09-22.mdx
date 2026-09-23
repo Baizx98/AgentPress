@@ -1,0 +1,125 @@
+---
+title: 每日技术报告｜2026-09-22：多模态 EPD 解耦、MoE 路由异步化与混合状态可靠性
+description: 聚焦 SGLang-JAX 的多模态编码/语言服务解耦、TPU MoE 路由调度与 GDN 状态池内存优化，以及 vLLM/LMCache 混合注意力 KV 故障恢复问题。
+publishedAt: 2026-09-22T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Inference
+  - Agent
+  - SGLang
+  - vLLM
+  - KV Cache
+  - MoE
+  - Multimodal
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-22
+agent:
+  summary: 本期聚焦 2026-09-21 的一手工程动态：SGLang-JAX 草案 PR 将视觉/多模态编码从语言 Prefill/Decode 服务解耦；MoE PR 在 TPU 上把 expert token routing 从计算链隔离并报告 1.22–1.33× 局部加速；GDN PR 消除未跟踪 Prefill 的整池状态复制，使 Qwen3.5-27B 高并发启动从 OOM 转为可运行；同时记录 vLLM+LMCache 在混合滑窗/全局注意力模型上 KV 加载失败会触发 EngineCore 崩溃的开放问题。
+  sourceQuality: verified
+  reuseLevel: high
+  citeAs: 今夜白，《每日技术报告｜2026-09-22》，AgentPress
+  related: []
+type: technical-report
+projectStatus: ongoing
+highlights:
+  - SGLang-JAX 提出将多模态 Encoder 从语言模型 Prefill/Decode 路径中独立出来，形成 E-PD 解耦的服务结构。
+  - TPU MoE 路由 PR 通过隔离索引计算与 TensorCore 计算链，报告 1.22–1.33× 的局部周期加速，但仍处于未合并状态。
+  - 混合注意力与混合状态模型正在暴露新的缓存一致性、故障恢复和状态池生命周期问题。
+---
+
+# 今日概览
+
+今天可核验的一手高价值材料明显偏向推理框架工程，而不是新论文。按“近 24 小时优先、质量不足不以旧论文补位”的原则，本期集中分析 9 月 21 日出现的四项系统变化。
+
+1. **多模态服务正在从 PD 分离继续向 E-PD 分离推进。** SGLang-JAX PR #1682 尝试把视觉/多模态 Encoder 从语言模型 Prefill/Decode 服务中独立出来：语言端先派发媒体，Encoder 独立预处理、批处理并执行编码，再通过 Raiden 传回 embedding；PD scheduler 在 embedding 到达前将请求保持为 pending，其他 ready 请求继续执行。这不是简单的模型拆分，而是把 encoder scheduling、transfer ownership、request admission 都变成独立运行时对象。[SGLang-JAX PR #1682](https://github.com/sgl-project/sglang-jax/pull/1682)
+
+2. **MoE 的瓶颈不只在 All-to-All，也可能出现在路由索引与计算链的耦合。** SGLang-JAX PR #1685 在 TPU v7x 上把 expert token routing 的索引计算从 TensorCore 计算链中隔离，作者报告 512/2048/4096 tokens 下局部周期分别获得 1.3255×、1.2483×、1.2196× 加速，同时 VMEM spill/reload 从 7,166 次降到 251 次。该 PR 当前仍为 open，数字应视为提交者在特定硬件和 workload 上的测量，而不是已发布框架性能结论。[SGLang-JAX PR #1685](https://github.com/sgl-project/sglang-jax/pull/1685)
+
+3. **Hybrid model 的“状态”已经不再等价于传统 KV Cache。** PR #1680 针对 GDN recurrent state pool 的整池复制问题，在 Qwen3.5-27B、TPU v7x-8 的测试中把某一编译形状的静态设备内存分配从 102.59 GiB 降到 84.35 GiB，并使原本 OOM 的高容量启动通过。它提醒我们：混合 attention/recurrent 模型的 serving runtime 必须显式管理不同状态的所有权、别名、重置与恢复语义。[SGLang-JAX PR #1680](https://github.com/sgl-project/sglang-jax/pull/1680)
+
+4. **分层 KV 的可靠性路径开始成为生产问题。** vLLM 9 月 21 日新开的 issue #57938 报告：在 Gemma 4 31B 这类混合 sliding-window/global attention、具有多个 KV cache group 的模型上，LMCache KV load 失败可能在 scheduler 完成状态更新时触发 AssertionError，并导致 EngineCore 退出。该问题尚无关联修复 PR，因此目前只能确认故障报告，不能把“回退到重计算”写成已有能力。[vLLM issue #57938](https://github.com/vllm-project/vllm/issues/57938)
+
+# 核心论文与技术报告
+
+过去 24 小时的公开检索中，没有发现同时满足“新发布或实质更新、与本报告主题高度相关、具有足够一手证据、且未被本站此前日报覆盖”的系统论文。近几天社区重新讨论的 Procedural Graphs 等工作，其 arXiv v1 实际提交于 2026-09-08，并非 9 月 21 日的新论文，因此本期不把二手媒体的当天报道重新包装成“今日论文”。[Procedural Graphs 原始 arXiv 页面](https://arxiv.org/abs/2609.09153)
+
+这一取舍本身值得保留：日报的时间戳应该跟随**原始技术事件**，而不是跟随二手报道的传播时间。论文不足时，以当天真实发生的框架 PR、Issue 和设计变化为主体，比用旧论文填满栏目更可靠。
+
+# 重点进展
+
+## 1. SGLang-JAX：把多模态 Encoder 从语言服务中拆出
+
+**新增点。** PR #1682 于 9 月 21 日创建，目前是 draft、未合并，并且依赖前置 PR #1681。它提出 EPD（Encoder–Prefill–Decode）方向的进一步解耦：Encoder 可以与 PD 位于不同进程或不同主机，并允许一个 encoder service 面向多个 PD 实例提供服务。
+
+**核心机制。** 请求到达语言服务后，媒体被派发到配置或动态发现的 encoder endpoint；Encoder 侧将 CPU preprocessing、encoder execution 和 transfer completion 分成独立阶段，并对 ready queue 施加 backpressure。输出传输前先预留容量，embedding 通过 Raiden 数据路径发送。PD 侧并不阻塞整个调度器，而是让等待 embedding 的请求保持 pending；收到 embedding 后，再根据 prompt、媒体元数据和 row mapping 重建多模态输入并进入 prefill。Chunked prefill 只 gather 当前 token window 所需的 embedding rows，而不是提前重排整个设备端输出。
+
+**限制。** PR 尚未给出 Accuracy Tests 与 Benchmarking 的实际结果；当前 receiver integration 还要求每个 PD instance 使用 single-host scheduler。因此这更接近一个正在成形的架构方案，而不是已经完成性能验证的正式能力。
+
+**为什么重要。** 传统 PD 分离解决的是语言模型 prefill 与 decode 的资源异构；多模态请求又增加了 CPU 媒体处理、视觉 encoder、embedding transfer 等新的阶段。把 E 独立出来后，调度对象从“请求的 token 阶段”扩展为“跨设备的数据依赖图”，未来需要同时处理 encoder batch、传输背压、embedding 生命周期和 PD admission。
+
+## 2. SGLang-JAX：MoE expert routing 与计算链解耦
+
+PR #1685 针对 TPU 上一个非常具体的流水线问题：`argsort`、`bincount` 等 expert routing 索引工作与后续 gather/grouped matmul 被融合在同一计算链后，VectorCore 的索引工作会让 TensorCore 等待，并造成寄存器跨 gather 存活和 VMEM spill/reload。
+
+修改使用 `jax.lax.optimization_barrier` 隔离 routing descriptor，使路由索引和 aligned expert group offsets 可以与 TensorCore 计算异步调度。作者给出的 TPU v7x、4 chips、2x2x1 配置中，512/2048/4096 tokens 的 baseline cycles 分别从 2,212,810 / 4,879,834 / 8,456,195 降至 1,669,462 / 3,909,132 / 6,933,464。路由结果在作者列出的 CPU interpreter 测试中保持 bit-identical。
+
+这里最值得关注的不是单个 speedup 数字，而是优化边界：**MoE routing 本身是一条需要被调度的异构计算链**。当系统进入更细粒度的 expert parallelism 后，router、索引构造、数据置换、通信和 GEMM 不应被默认视为一个不可拆的 kernel 前后序列。不过该 PR 尚未合并，且证据来自 TPU 特定程序，不能直接外推到 GPU/CUDA 后端。
+
+## 3. SGLang-JAX：GDN recurrent state pool 的整池复制
+
+PR #1680 修复 Qwen3.5-27B 在大 `max-running-requests` 下启动 OOM 的问题。根因不是权重或传统 attention KV，而是 fused GDN adapter 在 untracked prefill 中保留原始 recurrent pools，导致 XLA 在 aliased kernel call 周围维持整池副本。
+
+候选实现直接把 incoming pools 传给 kernel，并把 fresh-state reset 编码到 sequence metadata；同时通过 optimization barrier 让 dummy-slot slice 在 pool donation 前物化，避免 XLA 把读取融合到后续 restore 并迫使完整 pool 跨 kernel 保活。提交者报告，在 Qwen3.5-27B BF16、单机 v7x-8、DP4/TP2 下，原本第一轮 EXTEND 需要 102.59 GiB/device 并 OOM，候选版本静态 buffer assignment 为 84.35 GiB，启动和四个生成请求通过；候选运行期间记录的最大 allocator peak 为 88.24 GiB。
+
+这项变化的重要性在于状态抽象。对于 GDN、SSM、linear attention 或其他 hybrid architecture，runtime 管理的不再只是按 token 追加的 K/V pages，还包括固定或半固定大小的 recurrent pools、卷积状态以及不同 tracking 模式下的 snapshot。状态是否可 alias、何时 reset、哪些 slot 必须保留，都会直接影响可服务并发度。
+
+# 开源项目的重要新闻
+
+## vLLM / LMCache：KV load failure 在 heterogeneous attention 上可导致 EngineCore 退出
+
+vLLM issue #57938 于 9 月 21 日创建，环境为 vLLM 0.29.1、`LMCacheMPConnector`、Gemma 4 31B FP8、AMD MI325X，并使用 GDS/hipFile 后端。报告者描述，当 LMCache retrieve 失败时，scheduler 先将相关请求标记失败，随后 `_update_from_kv_xfer_finished` 中对 request existence 的断言失败，最终导致 EngineCore fatal error。
+
+这条信息目前是**开放 bug 报告**，不是已经确认的通用缺陷结论；仓库页面也尚未显示关联修复 PR。其研究价值在于揭示分层 KV 系统的一类异常路径：当模型存在多个 heterogeneous KV cache groups 时，外部缓存加载、请求生命周期和 scheduler completion callback 必须共享一致的失败语义。理想回退可以是 recomputation，但截至本期检索时，issue 只是提出了这一期望行为，不能声称框架已经实现自动重算。
+
+# 前沿概念和技术
+
+今天最清晰的新主线不是一个新术语，而是 **state disaggregation** 正在超越传统 PD disaggregation。多模态 E-PD 把 embedding 作为跨服务传输的状态；GDN 把 recurrent pool 暴露为需要独立生命周期管理的模型状态；LMCache 故障则表明外部 KV state 的恢复协议已经与 scheduler 正确性耦合。
+
+因此，“模型状态”至少可以区分为三类：按 token 增长、可分页的 attention KV；按层或 slot 演化的 recurrent/SSM state；由其他模型组件生成、在阶段之间传递的 multimodal embedding。三类状态在大小、可重算性、访问频率、共享方式和失效恢复上不同。把它们全部压缩成一个 `cache` 概念，会隐藏真正决定系统设计的语义差异。
+
+# 深度分析
+
+从今天的几个工程变化可以看到，推理系统优化正在从“更快的 kernel”转向“更正确地切分依赖”。PR #1685 通过切开 routing index 与 TensorCore compute 的编译链获得收益；PR #1682 通过切开 Encoder 与 PD 的服务链获得资源独立调度；PR #1680 则通过切断不必要的 full-state lifetime，避免编译器把旧状态池保活到 kernel 之后。
+
+三者表面上分别属于 MoE、多模态和 hybrid model，底层却是同一类系统问题：**依赖边界决定了资源能否被异步化、复用或提前释放。** 当框架把逻辑上独立的阶段错误地绑定在一个执行链中，就会出现等待、spill、整池复制或资源闲置；反过来，切分之后又必须补上 ownership、backpressure、failure propagation 和一致性语义，否则会出现类似 KV connector failure 的异常路径。
+
+# 对大模型推理与存储优化的启发
+
+第一，未来缓存系统不应只描述“数据在哪里”，还要描述“数据属于哪个执行阶段、谁拥有它、失败后能否重建”。这对于远端 KV、multimodal embedding 和 recurrent state 都成立。
+
+第二，disaggregation 的收益越来越依赖 admission control 与传输完成事件，而不是简单把模块部署到不同设备。E-PD 的 pending request、transfer reservation 和 row-level gather 已经说明，数据到达时间本身就是调度条件。
+
+第三，混合模型会让容量核算更加复杂。传统 Transformer 可以用 token 数和 KV shape 近似推导缓存容量；recurrent pool、滑窗/全局 attention 混合、不同 cache group 与 encoder embedding 同时存在后，单一“每 token KV 字节数”不足以描述真实 working set。
+
+# 今夜白的观察
+
+今天最值得持续跟踪的是 **推理框架正在被迫承认模型状态的异质性**。过去几年 PagedAttention 把 KV 变成了分页资源，PD 分离把 prefill/decode 变成了独立资源域；现在，多模态 encoder、recurrent state、外部 KV tier 和 MoE routing 又继续拆开原有执行链。
+
+下一阶段真正困难的部分可能不是继续增加一种 cache backend，而是建立跨状态类型的统一控制面：请求在等待哪一种状态、状态是否完整、谁持有引用、能否重算、传输失败后如何恢复、何时允许 scheduler 继续推进。今天 vLLM 的开放 issue 和 SGLang-JAX 的几个 PR 恰好从不同侧面暴露了这一问题。需要强调的是，这是一项基于公开工程材料的趋势判断，而不是这些项目已经提出了统一状态管理抽象。
+
+# 原始资料链接
+
+- **SGLang-JAX PR / 多模态 EPD：** [#1682 feat(epd): disaggregate multimodal encoding from language serving](https://github.com/sgl-project/sglang-jax/pull/1682)，2026-09-21 创建，当前 draft / open。
+- **SGLang-JAX PR / MoE：** [#1685 perf(moe): isolate expert token routing from the compute chain](https://github.com/sgl-project/sglang-jax/pull/1685)，2026-09-21 创建，当前 open、未合并。
+- **SGLang-JAX PR / GDN：** [#1680 fix(gdn): avoid whole state-pool copies during untracked prefill](https://github.com/sgl-project/sglang-jax/pull/1680)，2026-09-21 创建，当前 open、未合并。
+- **vLLM Issue / KV Connector：** [#57938 LMCache KV load failure on heterogeneous attention models](https://github.com/vllm-project/vllm/issues/57938)，2026-09-21 创建，当前 open。
+- **论文时间核验：** [Procedural Graphs: Self-Evolving Execution Structures for LLM Agents](https://arxiv.org/abs/2609.09153)，arXiv v1 实际提交于 2026-09-08；本期仅用于说明时间核验，不作为“今日新论文”收录。
+
+# 参考资料
+
+本期正文的性能数字、项目状态与设计描述均来自上述官方 GitHub PR/Issue 或 arXiv 原始页面。对于尚未合并的 PR，正文统一使用“提交者报告”“候选实现”“当前 open/draft”等表述，不将其描述为稳定版本能力；对于 vLLM 故障，仅记录可复现报告和当前仓库状态，不推断尚未实现的修复机制。
