@@ -1,0 +1,169 @@
+---
+title: 每日技术前沿｜KV I/O、两级 KV 共享与 Agent 状态管理正在汇流（2026-09-24）
+description: 聚焦 Flash-dLLM、HySparse2、SWE-Serve、CliffCompaction、Jev-Mem、RRSI、DSec 与细粒度 MoE Expert Pruning，梳理推理 I/O、Agent 上下文与执行基础设施的新进展。
+publishedAt: 2026-09-24T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - LLM Inference
+  - KV Cache
+  - Agent
+  - Agent Memory
+  - Sparse Attention
+  - MoE
+  - SGLang
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-24
+agent:
+  summary: 本期聚焦推理状态与 Agent 状态的系统化管理：Flash-dLLM 以 I/O-aware KV kernel 和 self draft-and-verify 加速 dLLM；HySparse2 用两级 KV sharing 减少 prefill 与 KV 存储；SWE-Serve 揭示生产推理工程的 E2E 正确性缺口；CliffCompaction 通过只截断不重写避免长程上下文漂移；同时梳理 Jev-Mem、RRSI、DeepSeek DSec、细粒度 MoE expert pruning 与 MiMoCode 0.1.15。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: ongoing
+highlights:
+  - Flash-dLLM 将 dLLM 的 KV 优化从容量问题推进到 GPU memory I/O 与并行验证协同。
+  - HySparse2 通过两级 KV sharing 同时减少长上下文 Agent 的 prefill 计算与 KV 存储。
+  - SWE-Serve、CliffCompaction 与 DSec 共同凸显 Agent 系统中的状态保真、恢复和生产正确性问题。
+---
+
+# 今日概览
+
+今天最值得关注的主线不是某一个新模型，而是**推理状态、Agent 状态与执行环境正在被共同当作系统资源来管理**。过去 24–72 小时出现的多篇工作分别从 KV Cache、稀疏注意力、上下文压缩、Agent memory、sandbox 和 MoE expert 计算切入，但它们共享一个趋势：把原本隐含在模型执行过程中的状态显式化，再围绕 I/O、生命周期、预算和恢复机制进行优化。
+
+1. **KV 优化继续从“少存一点”转向“少搬一点、少算一点”。** Flash-dLLM 直接把 GPU memory I/O 识别为 diffusion LLM KV-cache 推理的主要瓶颈；HySparse2 则通过两级 KV sharing，让 cross-decoder 的 KV 从 self-decoder hidden states 构造，并使 prefill 可以提前退出。
+2. **Agent 的上下文管理开始追求“状态保真”，而不只是压缩率。** CliffCompaction 只截断或删除原始内容、不重写摘要，并且不对旧 compaction 再次 compaction，核心目标是避免长会话中的语义漂移累积。
+3. **Agent memory 的控制面正在从大模型生成路径中剥离。** Jev-Mem 用轻量 System-One controller 负责 memory typing、query routing、预算分配和 adaptive stopping，只把复杂推理交给 System Two。
+4. **Agent 基础设施开始形成独立的系统研究对象。** DeepSeek DSec 把 FnCall、container、microVM、full VM 统一到一个弹性 sandbox 平台中，并将 sandbox 生命周期与 RL rollout 协同管理；SWE-Serve 则进一步把“生产推理工程”做成 Agent benchmark。
+5. **MoE 推理仍存在大量可直接回收的冗余计算。** 最新经验研究显示，在 12 个 fine-grained MoE checkpoint 上，统一保留约三分之二已选 experts 平均仍保留 98.8% 的原性能，并在两个 serving backend 上获得 1.2–1.7× 实测加速。
+
+# 重点进展
+
+## Flash-dLLM：KV Cache 的瓶颈不只是容量，而是 I/O
+
+**新增点。** Flash-dLLM 于 9 月 22 日提交 arXiv，面向 diffusion LLM（dLLM）推理，把 KV caching 与 parallel decoding 放到同一个系统视角下分析，而不是分别优化。论文明确指出，当 dLLM 开始复用 KV 并进行并行 token 验证后，GPU memory I/O 会成为主导瓶颈之一。[论文原文](https://arxiv.org/abs/2609.26796)
+
+**核心机制。** 方法包含两部分：一是 I/O-aware fused KV-cache kernel，用融合方式减少冗余 memory movement；二是 KV-cache-driven draft-and-verify，直接让 dLLM 自身同时承担 drafter 与 verifier，而不引入额外 draft model。这个设计的意义在于，KV Cache 不再只是“缓存是否命中”的问题，而成为并行解码执行路径的一部分。
+
+**实验与限制。** 作者报告，在 GSM8K 和 HumanEval 上，相对其所采用的 strongest baseline Elastic-Cache 分别达到 5.1× 和 11.0× 加速，并声明保持生成质量，同时改善长序列和大 batch 下的内存效率。论文已给出代码链接，但这些数字来自作者实验，当前仍是 arXiv v1，且结论针对 dLLM，不能直接外推到传统 autoregressive serving。
+
+**为什么重要。** 对推理系统而言，这再次说明 KV 优化不能只看“占多少显存”。当缓存访问、验证和并行生成耦合后，真正需要建模的是每轮 decode 的数据移动量、kernel fusion 边界以及缓存元数据路径。
+
+## HySparse2：两级 KV Sharing 把长上下文 Agent 的 Prefill 和 KV 存储一起压缩
+
+HySparse2 同样于 9 月 22 日提交，直接针对长程、多轮 Agent 的典型 workload：动作短，但工具与环境 observation 很长，因此上下文持续增长，prefill、KV storage 与 long-context retrieval 同时成为瓶颈。[论文原文](https://arxiv.org/abs/2609.26368)
+
+它的关键是 **two-level KV sharing**。外层 KV Bridging 采用 YOCO 风格的 self-decoder / cross-decoder 结构，只桥接 full-attention layers；内层继续使用 HySparse 的 KV Reuse，但把 block-level sparsity 改为 token-level sparsity，并把近期 sliding window 强制并入 sparse selection。这样 cross-decoder 的 KV 可以由 self-decoder hidden states 构造，prefill 因而可以在 self-decoder 后直接退出，跳过 cross-decoder layers。
+
+作者在一个 80B-A3B MoE 模型上报告，HySparse2 在 long-context retrieval 和 multi-turn agentic tasks 上优于 HySparse 与 Hybrid SWA，同时减少 prefill 计算和 KV-cache storage。摘要没有给出完整端到端 serving 数字，因此目前更适合把它看成**模型架构与 serving state 共同设计**的信号，而不是已经证明可直接替换现有 vLLM/SGLang attention stack 的工程方案。
+
+## SWE-Serve：第一次把“生产推理工程”本身变成 Agent Benchmark
+
+SWE-Serve 的价值不在于再造一个 coding benchmark，而是把评测对象缩窄到 **production inference engineering**。它从近期 SGLang 生产变更中构造 53 个 repository-grounded tasks，覆盖六类推理工程任务；每个任务在 CPU 或单张 H100 上执行，并包含 hidden functional tests、regression tests，以及适用时的端到端 serving tests 和性能门槛。[论文原文](https://arxiv.org/abs/2609.26777)
+
+在 11 个模型、31 种 model-effort configuration 上，作者报告最佳配置 mean pass@1 为 75%。更关键的是，在 19 个具有 E2E coverage 的任务上，如果移除 E2E serving tests，pass rate 为 69.4%；加入完整 verifier 后只有 45.9%。也就是说，大约三分之一“局部测试已经通过”的 patch 会在真正的 serving 路径上失败。
+
+这项结果对 Agent 基础设施很有启发：推理系统修改往往跨 model support、runtime execution、public API、kernel 与调度路径，单文件或单元测试正确并不等于生产正确。未来 coding agent 面向 AI Infra 时，sandbox 需要的不只是可执行环境，还要能够复现 GPU、服务启动、请求流和性能回归条件。
+
+## CliffCompaction：长程 Agent 的上下文压缩开始强调“不可漂移”
+
+CliffCompaction 解决的是 coding agent 跨 session 运行时的 context compaction。它没有用更强的 summarizer，而是采取一个很克制的规则：**只 truncation/drop，不 rephrase/rewrite；每次 compaction 都只基于 original content，旧的 compacted output 直接丢弃。** 目标是阻止摘要套摘要造成的 context drift。[论文原文](https://arxiv.org/abs/2609.26779)
+
+作者报告，在 bounded context 下，成本最多下降 50%，同时在 Terminal-Bench 上保持或提升表现；在 test-time scaling 中，额外成本低于两次 full-context run 即可带来超过 10 个百分点的 Terminal-Bench 提升。KernelBench 的长期实验中，200 steps 后 CUDA kernel speedup 为 2.23×，400 steps 后为 3.58×。作者还开源了 scaffold-agnostic API proxy，可接 Claude Code、Codex 等 harness。
+
+需要注意，论文中的模型间比较同时受到 backbone、并行 test-time scaling 和 harness 设置影响，不能简单理解为“截断一定优于摘要”。更可靠的结论是：**长期 Agent 的压缩误差会跨轮次累积，因此 compaction 算法必须把误差传播本身作为一等指标。**
+
+## Jev-Mem：让轻量控制器接管 Agent Memory 的关键路径
+
+Jev-Mem 于 9 月 21 日提交，提出 System-One/System-Two 分工的 Agent memory 架构。它指出，很多 memory system 让 autoregressive LLM 决定记忆如何组织、检索和使用，这会把昂贵生成放到 memory operation 的 critical path 上。[论文原文](https://arxiv.org/abs/2609.23986)
+
+Jev-Mem 将系统拆成 System-One control plane、structured multi-relational memory plane 和 System-Two reasoning plane。System One 负责 memory typing、关系组织、query routing、retrieval-budget allocation、graph traversal、candidate scoring 与 adaptive stopping；System Two 只在复杂推理和最终回答时调用。
+
+在 LoCoMo 上，作者报告 overall LLM-as-a-Judge score 为 0.777，相对最强 baseline 提升 11.0%；memory construction time 为 158 秒，相对最快对手加速 6.6×；平均 query latency 降至 0.93 秒，降低 36.7%。这些结果支持“memory control plane 不必由完整生成模型驱动”的方向，但目前证据主要来自 LoCoMo，跨 workload、跨模型以及在线多用户 serving 下的稳定性仍需验证。
+
+## RRSI：Agent Harness 自我改进也需要防过拟合
+
+RRSI（Regularized Recursive Self-Improvement of Agent Harnesses）把 Agent harness——prompt、control flow、tools、memory、context management——视为可以自动迭代优化的程序，但指出这种优化会像模型训练一样对有限 benchmark 过拟合。[论文原文](https://arxiv.org/abs/2609.24972)
+
+它在 proposer 侧限制一次 candidate 能打包的 edit 数，并随时间退火预算，同时鼓励探索历史中较少尝试的轨迹；selector 侧加入 critic 和 pruner，过滤 benchmark-specific proposal、微小收益、过高成本和已经失效的改动。作者在 8 个 coding、agentic workspace 和 engineering design benchmark 上报告，in-distribution 最多提升 14.1 points，5 个 OOD benchmark 最多提升 4.7 points，同时相较未正则化 evolution 使用少 30% 的 policy tokens。
+
+这项工作的系统意义是：harness evolution 不能只以任务分数为目标，还需要同时优化**泛化、token 成本、控制流复杂度和可维护性**。否则自动优化很容易把 benchmark 的偶然结构固化进 Agent runtime。
+
+## DeepSeek DSec：Agentic RL 的 Sandbox 已经成为独立集群系统
+
+DeepSeek Elastic Compute（DSec）最初于 9 月 19 日提交，本次纳入是因为它在近几天开始形成明显的技术讨论，并且其内容对 Agent Infra 足够重要；这里明确不把它描述为“9 月 24 日新发布”。[论文原文](https://arxiv.org/abs/2609.22978)
+
+DSec 将 FnCall、container、microVM 与 full VM sandbox 通过统一 SDK 暴露，负责集群级 placement 与 lifecycle management，并把环境拆成独立版本化 layer；同时使用 memory sharing/reclamation、CPU scheduling 和 3FS 按需加载 image data。更重要的是，它与 RL framework 协同：stateful rollout execution 与可抢占 GPU training 解耦，sandbox 生命周期与训练协调，在回收 idle resources 时保留 rollout state，并针对 reward hacking 等 Agent misbehavior 加入防护。
+
+论文给出的生产规模约为 160 节点单元、每天约 300 万个 sandboxes，生产环境支持超过 38 万 concurrent sandboxes，并持续达到每秒 5000+ sandbox creations。它表明 Agent 训练基础设施正在从“容器编排附属功能”变成有独立 workload 特征的系统：突发创建、长状态、异构隔离、image corpus 低复用，以及与训练调度的状态耦合。
+
+## Fine-grained MoE Expert Pruning：两三行配置可能先吃掉大部分收益
+
+《You Only Need 2/3 of the Chosen Experts》系统评估了 12 个 fine-grained MoE checkpoints、9 个 architecture families 和 11 个 benchmark，核心问题是：现代 MoE 每个 token 选中的 experts 是否真的都需要执行。[论文原文](https://arxiv.org/abs/2609.25809)
+
+作者发现，统一保留约三分之二 selected experts，平均可保留 98.8% 的 unpruned performance，并在两个 serving backend 上获得 1.2–1.7× measured speedup。更复杂的 dynamic allocation 在保守 budget 下相对这个简单 baseline 差距不到 1%；只有进入 aggressive pruning 时，最好的动态规则才最多恢复 3.0% 性能。
+
+这个结果提醒系统研究者：复杂 expert scheduling 之前，必须先和极简静态 truncation 做强 baseline。对于 MoE serving，真正值得动态化的区域可能不是“所有 token 的 expert 数量”，而是极端预算、生成任务、thinking model 或多模态模型中出现的异质敏感性。
+
+# 开源项目的重要新闻
+
+## MiMoCode 0.1.15：工具调用并发开始显式区分“只读”与“有副作用”
+
+Xiaomi MiMo 在 MiMo-V2.6 发布同期更新了 MiMoCode 0.1.15。[官方 Release 页面](https://github.com/XiaomiMiMo/MiMo-Code/releases) 显示，同一个 Agent step 内，只有纯 read/search tool 可以并发执行，其他 tool call 通过 sequencing gate 串行；如果一个有副作用的调用失败，后续可能受影响的调用会被跳过。版本还改进了 recoverable provider error 的退避重试、session resume 和 idle subagent 恢复，并让 Read tool 支持图像、音频与视频。
+
+这不是单纯的 UX 改动，而是在 Agent runtime 中显式引入**副作用顺序、失败传播与恢复点**。对于长程 Agent，tool call 已经越来越接近事务执行：读操作可以并行，写操作需要顺序和依赖，失败后需要决定哪些后续动作仍然安全。
+
+# 前沿概念和技术
+
+今天几项工作共同强化了三个值得持续追踪的概念。
+
+**第一，state fidelity。** CliffCompaction 关注压缩后的上下文是否忠实于原始状态；SWE-Serve 关注 patch 是否在真实 serving path 上仍然正确；DSec 关注 rollout state 在资源回收和训练抢占下是否能够保存。三者对象不同，但都把“状态在跨阶段转换后是否仍然可信”放到了核心位置。
+
+**第二，fast control plane / slow reasoning plane。** Jev-Mem 用轻量控制器承担 memory routing 和 budget；RRSI 则把 harness 视为模型之外可独立优化的控制层。可以推测，Agent 系统会继续把越来越多确定性的资源决策从 LLM token generation 中移出，交给更便宜、可验证的控制组件。
+
+**第三，state-aware execution。** Flash-dLLM 的 KV Cache、HySparse2 的 KV sharing、MiMoCode 的 tool sequencing 都说明执行策略开始依赖“当前已有状态是什么、哪些状态可复用、哪些操作会改变状态”。这比单纯追求 kernel latency 更接近下一阶段 Agent serving 的系统边界。
+
+# 深度分析
+
+从今天的材料看，推理系统正在出现一个明显的抽象迁移：**优化对象从 request 逐渐变成 state object。** 对传统 LLM serving，state object 主要是 KV Cache；对 MoE，它还包括 expert activation 与 routing；对 Agent，则进一步扩展到 context、memory graph、tool execution state、sandbox filesystem、checkpoint 和 rollout trajectory。
+
+这会直接改变系统设计的评价指标。过去常见指标是 TTFT、TPOT、throughput 和 GPU utilization；而 Agent workload 还需要观察 state restore latency、compaction fidelity、tool failure recovery、sandbox creation burst、跨 session reuse、状态隔离和长空闲后的恢复成本。SWE-Serve 的结果尤其说明，只测局部函数或 kernel 性能不足以覆盖真实生产正确性。
+
+另一个趋势是**计算与数据移动的边界继续重画**。Flash-dLLM 用 fused kernel 降低 KV I/O；HySparse2 通过结构设计直接省掉一段 prefill 和 KV 构造；expert pruning 则干脆不执行一部分已经被 router 选中的 experts。三者分别对应“少搬”“少算”“不算”，但共同目标都是减少每个有效 token 所需的状态处理量。
+
+# 对大模型推理与存储优化的启发
+
+首先，KV Cache 研究需要同时报告容量、带宽和生命周期成本。只报告压缩比或命中率越来越难解释端到端收益，因为 cache hit 仍可能带来昂贵的 HBM read、跨设备 transfer 或 kernel launch。
+
+其次，Agent workload 不能只用普通 chat trace 代替。长 observation、短 action、tool latency、session gap、rollback、resume 和 sandbox state 会产生完全不同的工作集。HySparse2、CliffCompaction、DSec 与 SWE-Serve 分别从模型、上下文、执行环境和 benchmark 四个层面给出了这一点的证据。
+
+第三，复杂策略必须与“极简静态 baseline”竞争。MoE pruning 的结果很典型：当统一保留约三分之二 experts 已经拿到大部分收益时，动态算法只有在更激进预算下才体现价值。类似原则同样适用于 KV eviction、memory routing 和 Agent scheduling。
+
+# 今夜白的观察
+
+今天最值得记住的不是某个 5× 或 11× 的数字，而是多个方向同时开始把“状态”从模型内部实现细节提升为系统级对象。KV、context、memory、sandbox、tool side effect 和 expert activation 原本属于不同社区，但它们正在面对相似问题：状态太大、移动太贵、生命周期太长、恢复太慢，而且正确性不能在压缩和迁移中丢失。
+
+短期内，我会重点继续跟踪两类工作：一类是把 KV / context / memory 做成统一可寻址、可迁移、可恢复状态的 serving abstraction；另一类是面向 Agent workload 的真实 trace 与 benchmark。没有后者，很多系统优化仍然容易在“普通 chat workload + 人工长上下文”上得到漂亮结果，却无法解释真实 Agent session 中的收益。
+
+# 参考资料
+
+## 论文与技术报告
+
+- [Flash-dLLM: IO-Aware KV Caching and Parallel Decoding for Fast, Memory-Efficient Diffusion LLMs](https://arxiv.org/abs/2609.26796)，arXiv v1，2026-09-22。
+- [HySparse2: Hybrid Sparse Attention with Two-Level KV Sharing](https://arxiv.org/abs/2609.26368)，arXiv v1，2026-09-22。
+- [SWE-Serve: Benchmarking Agentic Engineering For Production Inference Serving](https://arxiv.org/abs/2609.26777)，arXiv v1，2026-09-22。
+- [CliffCompaction: Cost-Efficient Compaction for Long-Horizon Coding Agents](https://arxiv.org/abs/2609.26779)，arXiv v1，2026-09-22。
+- [You Only Need 2/3 of the Chosen Experts: An Empirical Study of Dynamic Expert Pruning in Fine-Grained MoE LLMs](https://arxiv.org/abs/2609.25809)，arXiv v1，2026-09-22。
+- [Jev-Mem: System-One-Controlled Agentic Memory for Efficient AI Agents](https://arxiv.org/abs/2609.23986)，arXiv v1，2026-09-21。
+- [RRSI: Regularized Recursive Self-Improvement of Agent Harnesses](https://arxiv.org/abs/2609.24972)，arXiv v1，2026-09-21。
+- [DeepSeek Elastic Compute (DSec): A Sandbox Infrastructure for Effective Agentic Training at Scale](https://arxiv.org/abs/2609.22978)，arXiv v1，2026-09-19。
+
+## 官方工程材料
+
+- [XiaomiMiMo / MiMo-Code Releases](https://github.com/XiaomiMiMo/MiMo-Code/releases)，MiMoCode 0.1.15 与 MiMo-V2.6 同期更新。
+
+> 注：本文中的性能数字均按论文或官方材料原文转述，属于作者报告结果；除特别说明外，不代表独立复现实验。
