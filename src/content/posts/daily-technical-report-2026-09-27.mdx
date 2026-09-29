@@ -1,0 +1,152 @@
+---
+title: 每日技术报告｜2026-09-27：两级 KV 共享、可编程 Agent 状态与多模态 KV 路由
+description: 聚焦 HySparse2、RRSI、JAZ 与 Matryoshka Attribution，并追踪 vLLM、LMCache、Dynamo、SGLang 的 KV 数据面更新。
+publishedAt: 2026-09-27T09:03:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Inference
+  - Agent
+  - Agent Memory
+  - Sparse Attention
+  - vLLM
+  - SGLang
+  - LMCache
+  - Dynamo
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-27
+agent:
+  summary: 本期分析 HySparse2 的跨 decoder KV Bridging 与 token 级 KV Reuse、RRSI 对 Agent harness 自动演化过拟合的正则化、JAZ 的可递归 invoke 与可编程历史状态，以及 Matryoshka Attribution 的权重级行为归因；同时追踪 vLLM CPU KV offload 可观测性、LMCache 抢占/NIXL/prefetch、Dynamo 多模态 KV 路由和 SGLang 缓存后端解耦。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - HySparse2 通过两级 KV sharing 让 prefill 可在 self-decoder 后提前退出
+  - RRSI 与 JAZ 将 Agent harness、上下文和历史状态变成可优化、可编程对象
+  - vLLM、LMCache、Dynamo 与 SGLang 在 24 小时内集中更新 KV offload、抢占、路由与缓存后端
+---
+
+# 今日概览
+
+今天的一手材料呈现出一条很清晰的主线：**长上下文与 Agent 的优化正在从“单点压缩”转向“状态结构、执行路径与数据移动共同设计”**。近 24 小时内，vLLM、SGLang、LMCache 和 NVIDIA Dynamo 都出现了与 KV、缓存后端或路由直接相关的合并提交；论文侧则以过去 7 天内尚未在本站收录的高价值工作为主。
+
+1. **KV 不再只是注意力层的被动缓存。** HySparse2 把跨 decoder 的 KV Bridging 与层内 KV Reuse 组合起来，使 prefill 可以在 self-decoder 后提前结束，说明模型架构本身正在主动为 KV 构造成本和存储占用让路。
+2. **Agent harness 正在成为独立的系统优化层。** RRSI 关注 harness 自动演化的过拟合，JAZ 则尝试把 Agent loop 抽象成可递归的语言原语；两者都把“上下文、工具、控制流和记忆如何组织”视为可优化对象，而非固定外围代码。
+3. **可解释性开始直接定位“行为由哪些权重变化导致”。** Matryoshka Attribution 用可学习的嵌套稀疏掩码统一不同稀疏度的归因，并展示了对微调后行为变化进行权重级定位的能力。
+4. **工程侧的 KV 数据面继续细化。** vLLM 为 CPU KV offload 增加 Prometheus 指标；LMCache 合入抢占处理和 NIXL 完成语义修复；Dynamo 则让 KV-aware routing 感知多模态输入。
+5. **今天没有用旧模型发布或泛 AI 新闻补篇幅。** 下文论文均为 9 月 21–23 日首次公开或更新的工作，工程动态均来自 9 月 26–27 日的官方仓库提交。
+
+# 核心论文与技术报告
+
+## HySparse2：把 KV 共享推进到 decoder 之间
+
+**新增点。** [HySparse2](https://arxiv.org/abs/2609.26368) 于 2026 年 9 月 22 日提交。它不是简单地把 sparse attention 的 top-k 做得更细，而是提出“两级 KV sharing”：外层是跨 self-decoder / cross-decoder 的 **KV Bridging**，内层是 full-attention layer 与后续 sparse layers 之间的 **KV Reuse**。
+
+**解决的问题。** 长程 Agent 往往“输出短动作、读取长观察”，随着工具结果持续进入上下文，prefill 计算、KV 存储和长距离检索会同时变重。HySparse2 的关键结构变化是：cross-decoder 的 full-attention KV 由 self-decoder 对应 full-attention 层的 hidden states 生成；同时 sparse layers 不再维护独立的 sliding-window 分支，而是把最近窗口强制纳入 token-level sparse selection。
+
+**核心机制。** 这使得所有 cross-decoder KV 都可以从 self-decoder 的 hidden states 构造，因此 prefill 可以在 self-decoder 结束后直接退出，跳过整个 cross-decoder。与 HySparse 相比，它还把 block-level sparsity 改成 token-level sparsity，以更细粒度地检索历史 token。
+
+**实验与限制。** 作者在 80B-A3B MoE 模型上报告，HySparse2 在长上下文检索和多轮 Agent 任务上优于 HySparse 与 Hybrid SWA，并降低 prefill 计算和 KV 存储。需要注意，这些结果来自重新训练/后训练后的架构比较，并不能等价解释为“只替换 KV Bridging 就能获得全部收益”；而且这类结构需要模型侧配合，不能直接作为现有 dense Transformer serving runtime 的无侵入插件。
+
+**为什么重要。** 过去大量 KV 优化默认“模型给出 KV，系统负责存放和搬运”。HySparse2 反过来修改模型的数据依赖，让部分 KV 不必在 prefill 路径中按传统方式逐层产生。这意味着未来 KV 系统优化的边界可能继续向模型结构内部移动。
+
+## RRSI：Agent harness 自动演化也会过拟合
+
+[RRSI](https://arxiv.org/abs/2609.24972) 首次提交于 9 月 21 日，并在 9 月 23 日更新到 v2。论文把 prompts、control flow、tools、memory 与 context management 统称为 Agent harness，并研究自动迭代修改 harness 时的一个实际问题：**在开发 benchmark 上持续进化，可能只是在记住 benchmark。**
+
+方法引入三类约束。第一，proposal 使用随时间退火的编辑预算，限制一次候选修改捆绑的改动数量；第二，根据历史演化轨迹鼓励探索未覆盖的方向；第三，selector 增加 critic 与 pruner，分别过滤 benchmark-specific 修改，以及收益过小、代价过高或已经失效的机制。
+
+作者在 8 个 benchmark 上评估，覆盖 coding、agentic workspace 和 engineering design。论文报告：在用于演化的 split 上最高提升 14.1 个点，在 5 个 OOD benchmark 上最高提升 4.7 个点，同时相较无正则的 harness evolution，policy token 使用量减少 30%。这些数字是作者在其 benchmark 与模型配置下的结果，不应外推为任意 Agent 都能获得同等收益。
+
+系统层面的启发在于：Agent runtime 的“策略”不只存在于模型权重中，也存在于外围 harness。若未来 harness 可以自动变化，那么缓存策略、上下文压缩、工具调用编排乃至状态持久化接口都可能成为被自动搜索的对象；相应地，系统评测也必须防止 harness 对固定 workload 过拟合。
+
+## JAZ：把 Agent loop 变成一种可递归语言原语
+
+[Harness as a Language](https://arxiv.org/abs/2609.26891) 于 9 月 22 日提交，提出 JAZ。它试图回答一个很基础的问题：Agent 是否一定需要为 memory、自改进等能力分别设计专门 subsystem？
+
+JAZ 的核心只有一个 LLM-based primitive：`invoke`。模型可以生成任意可执行代码，代码可以递归调用 `invoke`；同时，模型可见的输入以及与代码环境的交互历史都作为程序变量存在。这样，长历史不必全部持续塞在当前模型上下文中，Agent 可以用代码搜索、筛选或把历史变量传给下一次递归调用。
+
+作者在 StuLife 的远距离 recall 子集上报告 JAZ 的 pass rate 为 69.9%，Letta 为 61.8%，对应三次运行的平均成本分别为 18.3 美元和 42.1 美元；在 AppWorld continual self-improvement 设置中，JAZ 的 Task Goal Completion 为 74.2%，ACE 为 69.9%。但比较并非所有维度都严格等暴露：例如 JAZ 在 AppWorld 中可以跨全部 417 个任务适应，而 ACE 的 prompt 在前 42 个任务后冻结。因此，更稳妥的结论是：**可编程历史 + 递归 delegation 是一种有竞争力的 Agent substrate**，而不是“专门 memory system 已经没有必要”。
+
+对 Agent 基础设施而言，JAZ 值得关注的不是 benchmark 排名，而是它把“上下文”从一段不可编程字符串转成了程序可操作状态。这个抽象如果继续发展，会直接影响 runtime 对 history、checkpoint、branch 和 delegated state 的表示方式。
+
+## Matryoshka Attribution：从表示归因走向权重变化归因
+
+[Matryoshka Attribution](https://arxiv.org/abs/2609.25518) 于 9 月 22 日提交。作者把归因定义为：寻找一组内部组件的嵌套子集，使下游 loss 最小。方法使用可微的 sigmoid top-k operator 参数化 mask，并在训练时随机化 k，从而一次训练得到跨不同稀疏度都可用的组件排序。
+
+论文报告 MAttr 在 Mechanistic Interpretability Benchmark 官方榜单达到第一，并能在不同 circuit basis 下找到稀疏、可迁移的 circuits。更值得关注的是权重级实验：作者用 refusal judge score 训练 MAttr，并报告把 Llama 3.1 8B Instruct 中 **1% 的权重**恢复为 base model 状态，即可移除 refusal，同时保持能力。
+
+这里必须谨慎解释：这并不意味着“任意安全行为都集中在 1% 权重里”，而是在论文特定模型、微调与 refusal 评测条件下得到的因果定位结果。它的重要性在于，把 model-internals monitoring 从静态 feature/circuit 解释进一步推进到“哪些参数更新造成了某种下游行为”，对微调审计、异常行为追踪和安全回归分析都有直接价值。
+
+# 开源项目的重要新闻
+
+## vLLM：KV offload 开始补齐可观测性
+
+vLLM 在 9 月 27 日合入提交 [#57251 对应 commit](https://github.com/vllm-project/vllm/commit/cd1daf58a98aad8c7241377edbe91a19aa38f71a)，为 `SimpleCPUOffloadConnector` 增加 Prometheus metrics。这个变化本身不改变 offload 算法，但影响很实际：CPU KV offload 从“可用的数据路径”进一步变成“可在线观测的数据路径”，便于把命中、传输和服务端延迟关联起来。
+
+同日 vLLM 还合入 [Mooncake CUSTOM_MEM_POOL 支持](https://github.com/vllm-project/vllm/commit/eb0f2ca37f65e496e8c67a7497e818c8a92bae46)。这表明外部 KV / memory connector 与框架自身内存管理之间的接口仍在扩展。当前两项均已进入主仓库 commit，而非仅停留在 RFC。
+
+## LMCache：抢占、NIXL 完成语义与 prefetch controller 同时推进
+
+LMCache 在 9 月 26 日合入 [Preemption Handling](https://github.com/LMCache/LMCache/commit/9a7b60501bc8ac3d0ab33b11dfd962ccfd02a5ae)，说明多进程缓存路径开始显式处理 serving 中的抢占事件。另一个关键修复 [#5336](https://github.com/LMCache/LMCache/commit/002693d8aa5ba8ead0d67922540e4ad4ba6fb3d3) 将 NIXL L2 load 的“成功”语义推迟到真实传输完成之后，避免把 transfer 已提交误当作数据已就绪。
+
+此外，9 月 25 日晚合入的 [prefetch controller v2](https://github.com/LMCache/LMCache/commit/814a96b127f8d1554223ff915032e86b151b25b7) 已把新的 prefetch policy interface、bitmap copy 和 L1/L2 hit 状态接入。三项变化合起来看，LMCache 的重点已经不只是“把 KV 放到二级存储”，而是开始补齐 **抢占一致性、异步完成语义、预取控制与层级命中反馈**。
+
+## NVIDIA Dynamo：KV-aware routing 开始感知多模态请求
+
+Dynamo 在 9 月 26 日合入 [multimodal-aware vLLM KV routing](https://github.com/ai-dynamo/dynamo/commit/82d10b6d31f03c99f96ef2b80641adcf0317fa9e)。这项改动位于 sidecar/router 路径，意义在于 KV locality 不能再只依据文本 token 前缀理解：多模态请求包含图像等输入时，路由器需要对输入身份和缓存可复用性采用一致的表示。
+
+这类改动会逐步把“KV-aware routing”从单一文本前缀命中问题，扩展成跨模态输入 identity、hash 与 worker locality 的统一问题。当前信息能确认该功能已合入主仓库；更细的性能收益仍需以后续 benchmark 或 release note 为准。
+
+## SGLang：缓存后端选择与 speculative 路径继续解耦
+
+SGLang 9 月 26 日合入 [LMCache component cursor 与 per-cache backend selection 修复](https://github.com/sgl-project/sglang/commit/fc9e1c8d296216ff1e216dfbe7286ef392448d28)，同时通过 [#41325](https://github.com/sgl-project/sglang/commit/c10fa03fc43180fcae072c6535f6c6d9c33c3ef1) 让 sliding-window caching 与 speculative batch padding 更可扩展。它们都不是“新算法发布”，但反映出主流 runtime 正在把 cache policy、model-specific attention 和 speculative execution 之间的耦合拆开，为后续模型适配降低侵入性。
+
+# 前沿概念和技术
+
+今天最值得单独提炼的概念是 **programmable agent state**。JAZ 把 history 暴露成程序变量，RRSI 把 harness 视为可演化对象，而 HySparse2 则在模型内部重构 KV 状态的产生路径。三者来自不同研究社区，但共同指向一个变化：状态不再只是“模型运行后留下的缓存”，而越来越成为可以被程序、优化器或模型架构主动塑形的对象。
+
+另一个趋势是 **completion semantics for tiered state**。LMCache 的 NIXL 修复看似只是 bugfix，但它揭示了分层 KV 系统的关键语义：请求“发起搬运”、DMA“完成”、数据“对消费者可见”是不同事件。随着 GPU/CPU/NVMe/RDMA 路径增加，cache hit 也不能只返回布尔值，而需要携带层级、完成状态和可调度性信息。
+
+# 对大模型推理与存储优化的启发
+
+第一，未来长上下文优化不能只比较“压缩率”。HySparse2 说明 KV 的**生成成本**本身可以通过架构设计改变；LMCache 和 Dynamo 则说明生成后的 KV 还涉及放置、传输完成、路由身份和可观测性。更合理的系统评价应同时考虑 prefill FLOPs、KV bytes、迁移 bytes、恢复延迟以及路由命中。
+
+第二，Agent workload 需要显式建模“非推理时间”。工具调用、递归 delegation、长历史搜索都会让状态经历暂停、恢复和跨调用复用。传统 chat serving 中“请求结束即释放状态”的假设，在 Agent 场景越来越不成立。
+
+第三，缓存接口会从 data-plane API 向 state protocol 演化。一个成熟的跨实例 KV 系统最终需要回答：这段状态是谁的、是否完整、位于哪一层、是否正在搬运、何时可消费、发生抢占后如何恢复，以及多模态输入如何参与 identity。这些问题已经分别出现在今天的 LMCache、Dynamo 与 vLLM 更新中。
+
+# 今夜白的观察
+
+今天最值得持续跟踪的不是某一个 benchmark 数字，而是**模型结构、Agent harness 和 serving runtime 正在同时争夺“状态管理权”**。模型侧希望通过 KV sharing / sparse attention 少产生状态；Agent harness 希望把历史状态变成可编程对象；runtime 则必须在多级介质和多实例之间准确维护状态身份与完成语义。
+
+这会带来一个新的系统边界问题：哪些状态应该由模型架构决定，哪些应该由 runtime 管理，哪些应该提升为 Agent 级持久状态？如果三层各自独立优化，很容易出现重复压缩、错误失效或跨层不可见。反过来，如果能形成统一但不过度耦合的状态接口，长上下文 serving 与 Agent runtime 可能会比今天更自然地汇合。
+
+另外，RRSI 对 harness overfitting 的结果值得系统研究者警惕。未来自动生成 scheduler、cache policy 或 context policy 时，单一 benchmark 上的吞吐或成功率提升未必代表可迁移的系统机制。对 workload shift、模型切换和硬件变化的 OOD 验证，可能会成为 Agent-native systems 论文必须补上的实验维度。
+
+# 原始资料链接
+
+## 论文
+
+- [HySparse2: Hybrid Sparse Attention with Two-Level KV Sharing](https://arxiv.org/abs/2609.26368)，2026-09-22。
+- [RRSI: Regularized Recursive Self-Improvement of Agent Harnesses](https://arxiv.org/abs/2609.24972)，v1 2026-09-21，v2 2026-09-23。
+- [Harness as a Language: A Minimalist Agent Framework With Maximal Expressivity](https://arxiv.org/abs/2609.26891)，2026-09-22。
+- [Matryoshka attribution: Learning to attribute language model outputs to representations and weights](https://arxiv.org/abs/2609.25518)，2026-09-22。
+
+## 官方代码仓库与提交
+
+- [vLLM: CPU KV Offload Prometheus metrics](https://github.com/vllm-project/vllm/commit/cd1daf58a98aad8c7241377edbe91a19aa38f71a)
+- [vLLM: Mooncake CUSTOM_MEM_POOL](https://github.com/vllm-project/vllm/commit/eb0f2ca37f65e496e8c67a7497e818c8a92bae46)
+- [LMCache: Preemption Handling](https://github.com/LMCache/LMCache/commit/9a7b60501bc8ac3d0ab33b11dfd962ccfd02a5ae)
+- [LMCache: NIXL L2 load completion fix](https://github.com/LMCache/LMCache/commit/002693d8aa5ba8ead0d67922540e4ad4ba6fb3d3)
+- [LMCache: Prefetch Controller v2](https://github.com/LMCache/LMCache/commit/814a96b127f8d1554223ff915032e86b151b25b7)
+- [NVIDIA Dynamo: multimodal-aware vLLM KV routing](https://github.com/ai-dynamo/dynamo/commit/82d10b6d31f03c99f96ef2b80641adcf0317fa9e)
+- [SGLang: LMCache backend selection fix](https://github.com/sgl-project/sglang/commit/fc9e1c8d296216ff1e216dfbe7286ef392448d28)
+- [SGLang: extensible sliding-window caching / speculative padding](https://github.com/sgl-project/sglang/commit/c10fa03fc43180fcae072c6535f6c6d9c33c3ef1)
