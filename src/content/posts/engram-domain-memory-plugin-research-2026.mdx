@@ -1,0 +1,340 @@
+---
+title: Engram 与垂直领域大模型：参数化知识插件的可行性及相关研究综述
+description: 综述垂直领域模型发展、Engram 条件记忆机制、领域知识插件化的可行性，并系统评述 15 篇相关论文与推理系统研究机会。
+author: 今夜白
+tags:
+  - Research
+  - DeepSeek
+  - MoE
+  - LLM Architecture
+  - LLM Inference
+  - Knowledge Base
+  - Hierarchical Memory
+draft: true
+featured: false
+language: zh-CN
+sourceKey: research:engram-domain-memory-plugin:2026-10-09
+agent:
+  summary: 以垂直领域模型发展、DeepSeek Engram、领域参数外挂及其计算—存储收益为主线，覆盖九篇核心论文与五篇补充研究。
+  sourceQuality: curated
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: ongoing
+highlights:
+  - 领域 Engram 可以独立存储，但尚难取代 LoRA、RAG 和领域 Agent
+  - 跨基模共享记忆仍需解决表示对齐和融合训练
+  - 重点机会在领域感知的 MoE—条件记忆—分层存储协同
+publishedAt: 2026-10-09T11:18:22.664Z
+---
+
+# Engram 与垂直领域大模型：参数化知识插件的可行性及相关研究综述
+
+> 调研时间：2026 年 10 月 9 日。本文区分已发表/公开的研究结果、尚未充分验证的技术假设，以及面向系统研究的个人判断。主要讨论 DeepSeek Engram 所代表的条件记忆，而不是一般意义上的 Agent 长期记忆。
+
+## 摘要：先说结论
+
+“通用基模 + 不同行业的 Engram 插件”是值得验证的技术方向，但目前并不是实现完整垂直领域大模型的成熟路线。
+
+原因很直接：垂直领域能力不只有事实和术语，还包括专业判断、长程推理、领域流程、外部数据和工具调用。Engram 的主要作用是通过 N-gram 查表，为模型提供一条高容量、低计算强度的条件记忆路径。它可以帮助模型学习局部、重复出现的知识模式，却不能直接替代 CPT/SFT、LoRA、RAG 和领域 Agent。
+
+后续工作已经开始验证冻结基模外挂条件记忆（Engram Adapter、Lngram）、离线生成记忆（Memory Grafting）、免训练短语记忆与 SSD 分层（TF-Engram），说明“外挂”并非完全不可行；但是跨模型零训练复用、多领域无干扰组合，以及真实的成本收益，仍未得到充分证明。
+
+**更有研究价值的定位是：把 Engram 视作与 MoE 互补的稀疏资源——MoE 负责按需计算，Engram 负责按需访问参数记忆；通过模型容量重新分配、领域感知路由和存储层次优化，在给定质量约束下降低整体推理成本。** Engram 表访问稀疏，不等于给现有模型外挂一张表就能直接加速。
+
+## 一、垂直领域模型的最佳实践如何发展
+
+### 1.1 从领域专用模型到共享基模
+
+早期思路是用行业语料训练专用模型，或在通用基模上进行领域持续预训练（CPT/DAPT），例如金融模型 BloombergGPT、医学模型 Meditron。这适合大规模、相对稳定的专业知识与语言分布，但训练成本高，领域更新和多行业维护都比较重。
+
+随后 LoRA、Adapter 等参数高效微调方法兴起：大部分基模权重冻结，为不同任务训练小型增量参数。它们擅长领域任务格式、分类抽取、表达风格和推理行为适配。多 LoRA 可以共享基模服务，但训练出的参数通常绑定特定模型，知识也不容易被直接定位、编辑和引用。
+
+再往后，RAG 与 Agent 工具链成为实际业务中的重要路径。RAG 负责可更新、可溯源的文档事实；Tools/MCP/Skills 负责查数据库、执行专业计算和业务流程；必要时再用 CPT、SFT 或 LoRA 增强模型本身的任务能力。
+
+| 需求 | 更现实的首选技术 | 主要代价 |
+|---|---|---|
+| 领域术语、专业语言与稳定知识 | CPT/DAPT | 训练成本及通用能力保持 |
+| 领域任务行为、输出格式 | SFT、LoRA、Adapter | 需要领域任务数据，往往绑定基模 |
+| 经常变化、需要引用的事实 | RAG、数据库 | 检索质量、上下文开销 |
+| 能执行的专业业务流程 | Agent + Tools/MCP/Skills | 工具集成与可靠性 |
+| 大规模重复局部模式的参数容量 | Engram 等条件记忆 | 寻址、训练耦合和访存开销 |
+
+**当前比较成熟的垂直领域系统并不是用一种模块承载所有东西，而是让参数知识、外部知识、专业行为和业务工具分工。**
+
+## 二、Engram 是什么，解决什么，不能解决什么
+
+### 2.1 设计目标与原理
+
+DeepSeek 在 [Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models](https://arxiv.org/abs/2601.07372) 中提出 Engram。其出发点是：Transformer 既负责复杂推理，也不得不反复计算术语、局部搭配和常见模式等较静态的信息；对后一类信息，直接查表可能更划算。
+
+Engram 根据局部 token N-gram 构造哈希地址，从大型可训练 Embedding Table 中读取少量向量，再通过投影与上下文门控将这些向量注入 Transformer 隐状态。
+
+这与 MoE 的关系可以概括为：
+
+- MoE：**条件计算**，选择少量 Expert 执行神经网络计算。
+- Engram：**条件记忆**，选择少量 Embedding 条目读取已有参数表示。
+- 两者都能用稀疏激活扩大总参数容量，但分别消耗计算与存储带宽/访问能力。
+
+### 2.2 原论文证明了什么
+
+Engram 在严格匹配总参数及 FLOPs 的实验中优于 MoE 基线。其 27B 规模实验报告 MMLU 提升 3.4 个百分点、BBH 提升 5.0 个百分点等结果；收益不只发生在事实题，也延伸到部分推理任务。论文还讨论在固定稀疏参数预算内如何分配 MoE 计算容量与 Engram 记忆容量。
+
+从系统角度看，Engram 的访问地址由局部 token 确定，具备提前计算和预取的可能。因此大表有机会放在主机内存等较低层级，而非全部驻留 HBM。
+
+但这些结论来自**包含 Engram 的训练体系**，并非冻结一个已有的普通基模，临时加一张新表就能获得相同收益。
+
+### 2.3 四个限制
+
+1. **记忆粒度是局部模式。** N-gram 很适合术语、固定实体和高频短语，却难以独自表示带条件的法规、因果关系和多跳专业推理。
+2. **训练耦合。** Embedding 表、融合投影、门控与基模隐状态共同适配；没有专门训练过的基模不一定会正确使用新记忆。
+3. **插件不天然兼容。** 原始查表依赖 tokenizer，融合依赖模型表示空间；不同领域、不同模型之间不能仅靠复制文件实现等价行为。
+4. **事实不可控。** 一个向量槽位不等于一条可审计的数据库记录。精确更正、删除、溯源和版本治理仍困难。
+
+因此，把 Engram 直接称作“领域知识库”并不准确。它更像一种**模型内部的参数化记忆容量**。
+
+## 三、基模外挂领域参数插件：两种兼容问题
+
+### 3.1 一个基模，挂多个领域插件
+
+可设想医学、金融、法律各有独立 Engram Table。最稳妥的第一版是请求进入时先选定一个领域插件，并在整个 Prefill/Decode 过程中保持配置不变；比在单次生成中频繁切换多个插件更容易保证正确性。
+
+真正的难点不在“能否按领域加载表”，而在：
+
+- 插件能否在冻结基模时独立学到有效知识；
+- 未命中或误命中的领域记忆会不会干扰原本正确的答案；
+- 多插件同时启用时，表示分布和门控能否稳定组合；
+- 不同插件或版本影响隐状态时，Prefix/KV Cache 能否安全跨配置复用；
+- 大量插件的驻留、切换和并发访问是否值得。
+
+其中“同基模多插件共存”与“同一次请求融合多个领域”必须分开实验。前者主要是隔离与切换，后者还要研究路由、加权和知识冲突。
+
+### 3.2 一个领域插件，挂多个基模
+
+这里有三个独立的兼容关口：
+
+1. **寻址兼容**：相同文本在不同 tokenizer 下，是否访问同一知识条目；
+2. **表示兼容**：领域向量与不同基模的 hidden size、隐空间语义是否匹配；
+3. **行为兼容**：目标基模是否学会何时、如何利用这条外部记忆路径。
+
+Tokenizer-Agnostic Engram 开始解决第一点，但不能自动跨过后两点。一个较现实的中间方案是 **共享领域记忆表 + 模型专属轻量 Bridge（投影、门控或少量适配参数）**，而非追求完全零训练的任意模型外挂。
+
+### 3.3 与 LoRA、Adapter、RAG 的比较
+
+| 维度 | LoRA | Adapter | Engram | RAG |
+|---|---|---|---|---|
+| 作用机制 | 低秩权重增量 | 中间可训练计算模块 | 大规模稀疏向量查表与融合 | 检索显式外部数据 |
+| 最适合 | 任务和行为适配 | 模块化计算适配 | 高频静态模式和参数容量扩展 | 动态事实、引用、更新 |
+| 同基模领域切换 | 已较成熟 | 已较成熟 | 有初步论文探索 | 成熟 |
+| 跨基模直接复用 | 通常不行 | 通常不行 | 寻址部分可共享，融合仍需适配 | 通常较容易 |
+| 推理成本 | 低，可融合 | 额外模块计算 | 查表、投影、门控、传输 | 检索与上下文处理 |
+| 事实可编辑和溯源 | 弱 | 弱 | 仍较弱 | 强于参数化方案 |
+
+LoRA/Adapter 修改“模型怎么计算和表现”；Engram 主要提供“模型能按需读取哪些已学参数表示”；RAG 则提供“外部事实和证据”。Engram 和 LoRA 不应简单互相替代。
+
+## 四、九篇核心论文：目的、方法、结果与限制
+
+### 4.1 Tokenizer-Agnostic Engram Module（2026）
+
+**论文：** [Tokenizer-Agnostic Engram Module](https://arxiv.org/abs/2607.29065)。
+
+**研究目的：** 消除原始 Engram 对特定 tokenizer 的依赖，使不同 tokenizer 的模型有机会共享同一份参数化记忆。
+
+**核心方法：** 从 Token ID 哈希转向对字节序列的多项式哈希，并在不同 N-gram 阶数之间共享地址空间。只要对应字节相同，就有机会命中相同记忆地址。
+
+**实验效果：** 新哈希方式保持了与原始 Engram 相近的模型质量；还探索将来源模型训练好的 Embedding 冻结，迁移给不同 tokenizer、不同架构的目标模型使用。
+
+**限制与启发：** 目标模型仍需大量训练，解决的是地址兼容，不是目标模型隐空间和融合行为的自动兼容。这项工作是跨基模知识表复用的基础，不代表“一个领域插件任意基模零训练可用”。
+
+### 4.2 Memory Layers at Scale（ICML 2025）
+
+**论文：** [Memory Layers at Scale](https://proceedings.mlr.press/v267/berges25a.html)。
+
+**研究目的：** 为模型增加大量可训练知识容量，而不成比例扩大神经网络 FLOPs。
+
+**核心方法：** 通过当前 Hidden State 生成查询，在大规模可训练 Key-Value Memory 中检索 Top-K 项；与 Engram 的局部确定性 N-gram 地址不同，它是由上下文隐状态驱动的记忆选择。
+
+**实验效果：** 研究将记忆扩至 128B 参数，完成最高 1T token 的预训练，事实知识任务收益突出；在论文设置中优于部分计算预算更高的稠密模型及同预算 MoE。
+
+**限制与启发：** 查询地址依赖隐状态，通常要等前面计算完成才能知道读哪些项，因此难像原始 Engram 一样从输入直接安排预取。说明条件记忆未必只能做 N-gram，但更动态的检索往往意味着更复杂的访存路径。
+
+### 4.3 SCONE（NeurIPS 2025）
+
+**论文：** [Scaling Embedding Layers in Language Models（SCONE）](https://arxiv.org/abs/2502.01637)。
+
+**研究目的：** 把部分知识表示的计算放在离线阶段，以更大的存储空间换取更低的在线计算开销。
+
+**核心方法：** 从语料中筛选高频 N-gram，用额外的 f-gram 模型学习上下文化 Embedding；训练后预计算并存储，推理时只查表，不再运行 f-gram 模型。
+
+**实验效果：** 约 1B 加速器驻留参数的配置超过了 1.9B 稠密基线，推理 FLOPs 和加速器显存需求约为后者的一半，说明“离线计算—在线查表”的架构确有潜力。
+
+**限制与启发：** 离线构建和大规模表存储不是免费的，也依赖主模型与这些输入表示协同训练。其最有价值的结论是计算与存储的重新分工，而不是领域知识可随意外挂。
+
+### 4.4 Engram Adapter（2026）
+
+**论文：** [When to Adapt: Conditional Memory Adapters for Retention-Preserving Domain Specialization](https://arxiv.org/abs/2608.29327)。
+
+**研究目的：** 在冻结基模上训练条件记忆模块，使模型增加领域能力，同时尽量保留原来的通用能力。
+
+**核心方法：** 领域 N-gram 查表、已训练槽位的 Occupancy Tracking，以及根据隐状态抑制无关记忆的动态门控。
+
+**实验效果：** 在 Qwen3-4B/8B、AG-News 和 MedMCQA 等设置中，领域任务有一定提升，域外任务的平均表现保持率约 99.4%–100.1%。但部分领域任务准确率并未超过相应 LoRA 基线。
+
+**限制与启发：** 最直接验证了“冻结基模 + 条件记忆 Adapter”的可能性，却没有证明大型专业推理能力、多插件无干扰组合，也没有证明总体推理成本更低。单纯做一份领域 Engram Adapter，创新空间已经相对有限。
+
+### 4.5 Lngram（2026）
+
+**论文：** [Lngram: N-gram Conditional Memory in Latent Space](https://arxiv.org/abs/2605.24869)。
+
+**研究目的：** 从表面文本 N-gram 拓展到模型隐空间中的离散模式，以减少 tokenizer 依赖并支持多模态。
+
+**核心方法：** 将 Hidden State 投影和离散化成符号，构造 Latent N-gram，再进行查表、融合和相应训练。
+
+**实验效果：** 在已预训练模型中后插入 Lngram，可以提升部分领域任务表现；联合训练还可进一步提高质量。论文也报告了长上下文与视觉语言相关结果。
+
+**限制与启发：** 动态隐状态确定地址，提高了表示灵活性，却失去了原始 Engram 最直接的静态地址预知优势；部分实验还出现通用能力下降。适合研究条件记忆表达能力，但对异步分层预取未必友好。
+
+### 4.6 Memory Grafting（2026）
+
+**论文：** [Memory Grafting: Scaling Language Model Pre-training via Offline Conditional Memory](https://arxiv.org/abs/2605.20948)。
+
+**研究目的：** 不让目标模型从头训练每一个记忆向量，而是利用一个已训练模型离线生成外部记忆。
+
+**核心方法：** 筛选高频 N-gram，用 Donor Model 离线计算隐藏表示；目标模型做最长后缀匹配读取，经过轻量投影和门控融合，未命中则回退到哈希 Engram。
+
+**实验效果：** 在论文报告的 2.8B 实验中，平均下游分数从 MoE 的 51.95、原始 Engram 的 52.43 提升至 53.86。
+
+**限制与启发：** Donor 的计算搬到了离线，目标模型仍需适配。它为领域强模型生成共享知识表提供可能，但不能证明由一个模型生成的隐向量可以被任意基模直接解释。
+
+### 4.7 TF-Engram（2026）
+
+**论文：** [TF-Engram: A Train-Free Engram with SSD-Backed Memory for Large Language Models](https://arxiv.org/abs/2607.07388)。
+
+**研究目的：** 不再专门训练新的 Engram 表，将外部语料构造成短语记忆，并利用 SSD 保存大容量表。
+
+**核心方法：** 抽取短语，用已有 Embedding 模型离线生成向量；通过精确索引与 GPU/DRAM/SSD 分层存储提供查询；使用预测预取隐藏部分慢速存储访问。
+
+**实验效果：** 在 Qwen3-0.6B 实验中，平均下游分数从 57.6 提升至 59.4，高于文中参数预算匹配的 LoRA 结果。但 SSD 路径引入吞吐损失，预取只能恢复其中一部分。
+
+**限制与启发：** “Train-Free”不代表向量不依赖预训练模型；当前质量和系统实验规模都有限。它给存储系统研究提供直接切入点：请求访问集合、缓存、预取和数据搬运，而不是假设增加记忆就等于加速。
+
+### 4.8 Tensorizing Engram（2026）
+
+**论文：** [Tensorizing Engram: Sharing Latents Across N-Gram Embeddings is Beneficial in LLMs](https://arxiv.org/abs/2606.08347)。
+
+**研究目的：** 压缩不同 N-gram 阶数之间重复的参数表示，降低独立记忆表的存储开销。
+
+**核心方法：** 使用 CP 张量分解，将 N-gram 向量表示为共享低秩因子的组合，不同长度或模式能够复用部分参数。
+
+**实验效果：** 小规模 Transformer 实验显示，在部分设置下，以少于原始 Engram 的附加参数获得相近或更好的任务指标。
+
+**限制与启发：** 大模型、跨领域以及真实吞吐表现尚需检验，因子组合也有额外计算。若要同时维护医学、法律、金融表，跨领域共享一部分低秩因子可能比每个领域复制完整大表更经济。
+
+### 4.9 Memory Is Not Always Needed（2026）
+
+**论文：** [Memory Is Not Always Needed: Characterizing Conditional Memory in Scientific Reasoning](https://arxiv.org/abs/2608.23982)。
+
+**研究目的：** 回答“什么任务、什么层真正需要外部条件记忆”，避免记忆反而干扰已有推理。
+
+**核心方法：** 研究科学问题对条件记忆的收益与干扰，设计 Knowledge Boundary-Aware Router，按输入和任务选择是否激活记忆、注入哪些层和以多大强度融合。
+
+**实验效果：** 在生物、化学相关任务与两个基模系列上，相比固定开启或随机路由，能更稳定地保留有益记忆并抑制部分质量下降。
+
+**限制与启发：** 重点是质量而非真实端到端加速。多领域系统不应只判断“选择哪个行业的表”，还要判断“当前任务根本需不需要读参数记忆”。
+
+## 五、其他值得补充的 Engram 衍生研究
+
+上述九篇构成主线。还有几篇工作分别覆盖知识编辑、个性化、行业特有序列和硬件存储，但与“通用领域插件”主线的距离稍远。
+
+| 工作 | 主要想法 | 与本文的关系 |
+|---|---|---|
+| [Engram-Nine](https://arxiv.org/abs/2601.16531) | 对高频 N-gram 建立无碰撞热点表，发现提高寻址精度未必改善损失 | 提醒不能把“更精确命中”直接等同于更好的知识利用 |
+| [Gengram](https://arxiv.org/abs/2601.22203) | 为 DNA K-mer / motif 设计领域特定条件记忆 | 结构化、重复模式明显的领域比开放式专业推理更适合查表 |
+| [User as Engram](https://arxiv.org/abs/2606.19172) | 在带 Engram 的模型中用用户专属记忆覆盖表存储事实 | 提供多租户隔离、局部参数编辑的探索，但不是完整专业推理方案 |
+| [Pooling Engram via CXL](https://arxiv.org/abs/2603.10087) | 将稀疏 Embedding 放在 CXL Memory Pool 并接入 SGLang | 表明细粒度远端存储有机会接近本地 DRAM；需注意其系统实验使用模拟 Engram 访问，不等于完整模型验证 |
+| [ComeIR](https://arxiv.org/abs/2605.11447) | 在生成式推荐中用条件记忆表示离散商品 ID 与局部组合 | 适合探索行业特定重复模式，不代表通用知识插件 |
+
+这类研究也提示：参数记忆可以做知识编辑、用户个性化、序列模式表示和多级存储，但不同场景的目标完全不同，不宜把它们笼统归入“实现垂直领域大模型”。
+
+## 六、综合判断与值得尝试的研究问题
+
+### 6.1 对“Engram 插件构建垂直领域大模型”的判断
+
+需要区分三个层次：
+
+- **独立存储领域表：** 技术上相对直接；表可以隔离、版本化、按需装载。
+- **独立训练后保持领域能力：** 已有 Engram Adapter、Lngram 等初步结果，但质量、通用能力保持和数据效率有较大不确定性。
+- **同一表跨基模直接复用：** 仍困难。统一哈希解决不了隐空间语义及行为适配问题。
+
+因此，“领域知识作为可加载参数资产”值得研究；“一份 Engram 插件等于一个成熟领域大模型”则证据不足。真实垂直 Agent 仍需 RAG、专业工具和任务行为训练。
+
+### 6.2 Engram 最可能贡献的不是外挂本身，而是计算—记忆分工
+
+可以把推理代价拆为神经网络计算、记忆查询、数据传输、缓存驻留和调度开销。新增 Engram 一定会引入部分额外开销，只有至少满足以下一种条件才可能形成真正的端到端收益：
+
+1. 用更小的基模 + Engram 达到较大基模的质量；
+2. 固定参数/FLOPs 预算下，把部分 MoE 计算容量转成记忆容量，达到更好质量；
+3. 通过领域条件路由跳过不必要的计算或记忆路径；
+4. 多用户共享领域记忆，在批量服务时形成可复用的工作集，降低总体成本。
+
+单纯宣称 Embedding 查询是 O(1)，不能忽略随机访存、门控、加载延迟和模型并发。
+
+### 6.3 优先验证的三个研究问题
+
+**问题 A：多领域请求的 Engram 工作集到底有多强的时间局部性？**
+
+测量不同领域的活跃表地址、复用距离、请求间共享程度和冷热分布。比较按领域装载大表、按条目缓存、基于输入提前预取三种策略，在 HBM/DRAM/SSD 预算变化下的效果。若不存在明显局部性，缓存系统的研究价值可能有限。
+
+**问题 B：记忆与 MoE Expert 的最优资源分配是否随领域变化？**
+
+不同专业任务对于静态知识检索和动态推理的依赖不同。可探索统一预算下的 Expert/Memory 联合路由，以及质量约束下的最少活跃计算量。关键是必须有真正支持两种路径的模型，不能仅靠模拟查表开销声称模型加速。
+
+**问题 C：跨领域共享 Engram 是否比分领域复制整表划算？**
+
+比较每领域独立表、共享表加领域路由、共享低秩基础因子加领域专属因子，关注领域准确率、负迁移、冲突、额外存储容量和推理访存成本。
+
+### 6.4 推荐的最小对照实验
+
+在同一基模、同一批领域数据和可比训练预算下，至少比较：
+
+| 对照 | 检验的问题 |
+|---|---|
+| 冻结基模 | 原始能力基准 |
+| LoRA / Adapter | 成熟领域参数适配 |
+| RAG | 显式外部知识的真实竞争方案 |
+| Engram Adapter | 冻结基模的领域参数记忆 |
+| Engram + Bridge | 目标模型适配的价值 |
+| Engram + LoRA | 静态知识与领域任务行为是否互补 |
+| 多领域路由 Engram | 条件激活与系统开销是否有益 |
+
+质量与系统指标要同时测量：领域任务准确率、通用能力保持、跨领域干扰、训练成本、额外参数量、HBM/DRAM/SSD 用量、TTFT、TPOT、吞吐、P99 和跨请求共享率。
+
+**结论：** 以“多领域外挂插件”作为工程构想可以继续，但如果要形成有竞争力的研究，最好将核心问题转向“模型何时应该计算、何时应该访问参数记忆，以及这些资源如何在多个领域和请求之间共享”。这才是 Engram 与 MoE 并行发展的真正价值。
+
+## 七、主要参考文献
+
+### 原始 Engram 与核心比较工作
+
+1. [DeepSeek — Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models（2026）](https://arxiv.org/abs/2601.07372)
+2. [Tokenizer-Agnostic Engram Module（2026）](https://arxiv.org/abs/2607.29065)
+3. [Memory Layers at Scale（ICML 2025）](https://proceedings.mlr.press/v267/berges25a.html)
+4. [Scaling Embedding Layers in Language Models / SCONE（NeurIPS 2025）](https://arxiv.org/abs/2502.01637)
+
+### 领域适配、记忆构建与结构优化
+
+5. [When to Adapt: Conditional Memory Adapters for Retention-Preserving Domain Specialization（2026）](https://arxiv.org/abs/2608.29327)
+6. [Lngram: N-gram Conditional Memory in Latent Space（2026）](https://arxiv.org/abs/2605.24869)
+7. [Memory Grafting: Scaling Language Model Pre-training via Offline Conditional Memory（2026）](https://arxiv.org/abs/2605.20948)
+8. [TF-Engram: A Train-Free Engram with SSD-Backed Memory for Large Language Models（2026）](https://arxiv.org/abs/2607.07388)
+9. [Tensorizing Engram: Sharing Latents Across N-Gram Embeddings is Beneficial in LLMs（2026）](https://arxiv.org/abs/2606.08347)
+10. [Memory Is Not Always Needed: Characterizing Conditional Memory in Scientific Reasoning（2026）](https://arxiv.org/abs/2608.23982)
+
+### 其他衍生研究
+
+11. [A Collision-Free Hot-Tier Extension for Engram-Style Conditional Memory（2026）](https://arxiv.org/abs/2601.16531)
+12. [Beyond Conditional Computation: Retrieval-Augmented Genomic Foundation Models with Gengram（2026）](https://arxiv.org/abs/2601.22203)
+13. [User as Engram: Internalizing Per-User Memory as Local Parametric Edits（2026）](https://arxiv.org/abs/2606.19172)
+14. [Pooling Engram Conditional Memory in Large Language Models using CXL（2026）](https://arxiv.org/abs/2603.10087)
+15. [Conditional Memory Enhanced Item Representation for Generative Recommendation（2026）](https://arxiv.org/abs/2605.11447)
+
+> 阅读顺序建议：先读原始 Engram，再读 Engram Adapter 与 Memory Grafting；如果关注推理系统，接着读 SCONE、TF-Engram 和 CXL Pooling；如果关注模型结构，继续读 Memory Layers、Lngram、Tensorizing Engram 和选择性路由。文中的论文实验数字均为各自配置下的结果，不能直接把跨模型、跨数据集的数字当成统一排名。
