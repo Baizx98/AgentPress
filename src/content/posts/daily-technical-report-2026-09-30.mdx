@@ -1,0 +1,132 @@
+---
+title: 每日技术报告｜2026-09-30：Agent KV 工作集、静态图复用与共享 KV 数据层
+description: 聚焦 EfficientAgent 的 Agent KV reuse working set、EuroSys 2027 移动 NPU KV 复用、CodeSkill 行为级 latent skill，以及 LMCache 与共享 KV appliance 新动态。
+publishedAt: 2026-09-30T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Inference
+  - Agent
+  - Agent Systems
+  - Agent Memory
+  - Long Context
+  - LMCache
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-09-30
+agent:
+  summary: 本期分析 EfficientAgent 如何用 reuse working set 与写入准入解决并发 coding agent 的 KV offload thrashing；介绍 EuroSys 2027 录用工作如何在静态图移动 NPU 上实现 prefix/non-prefix KV reuse；跟踪 CodeSkill 的行为级 latent skill、LMCache CUDA/ROCm 构建更新，以及 TuringData ContextCube 将共享 KV 推向独立集群数据层。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - EfficientAgent 用 reuse working set 解释并优化并发 Agent 的 KV offload
+  - EuroSys 2027 工作将 prefix/non-prefix KV reuse 映射到静态图移动 NPU
+  - 共享 KV 正从推理引擎内部机制演进为跨节点独立数据层
+---
+
+# 今日概览
+
+过去 24 小时最值得关注的主线不是又一个模型榜单，而是 **KV 状态正在从“单机缓存优化”继续外溢为跨层级、跨设备、跨请求生命周期的系统资源**。今天重点保留四项一手材料，并刻意不以旧内容填充篇幅。
+
+1. **EfficientAgent 把 Agent KV offload 的成败归结为 reuse working set，而不只是“搬运是否比重算便宜”。** 论文在 SWE-bench Verified coding-agent 轨迹上发现，98.1% 的 prompt token 在同一任务前一轮已经处理过，但小容量 host tier 会发生类似内存 thrashing 的现象；当 host tier 跨过工作集阈值后，重算 prompt token 可减少 93%，端到端 makespan 降低约 39%。[论文](https://arxiv.org/abs/2609.33762)
+2. **EuroSys 2027 Spring 录用论文 Dynamic Flow, Static Graph 将 prefix/non-prefix KV reuse 带到静态图移动 NPU。** 核心不是简单复制 GPU prefix cache，而是把 selective recomputation、chunk 合并、分层 KV 管理与数据搬运流水线共同映射到静态执行环境；作者报告 TTFT 相对无复用和 prefix-only caching 降低 40–60%。[论文](https://arxiv.org/abs/2609.34727)
+3. **CodeSkill 将 coding agent 的经验复用从 token 轨迹提升到 latent skill。** 它先从成功与失败轨迹提炼多层语义抽象，再通过 temporal variational inference 学习连续 latent skill，并用执行反馈决定 skill 边界。这提示 Agent 状态不只有文本 history 和 KV，也可能包含可复用的行为级隐状态。[论文](https://arxiv.org/abs/2609.33243)
+4. **KV cache 开始被产品化为独立的集群级数据层。** TuringData 9 月 29 日发布 ContextCube，宣称以 RDMA、BlueField-3 DPU 与 NVMe 构造共享 KV “Layer 3.5”，面向 vLLM、SGLang、LMCache、Mooncake 等生态。其容量与带宽数据目前主要来自厂商材料，应视为产品规格而非独立 benchmark。[官方发布稿](https://www.prnewswire.com/apac/news-releases/turingdata-launches-contextcube-at-tech-week-singapore-2026-bringing-shared-kv-cache-to-gpu-inference-clusters-302891006.html)
+
+# 核心论文与技术报告
+
+## EfficientAgent：Agent KV offload 的关键不是单次 I/O 成本，而是状态能否活到下一次复用
+
+**新增点。** EfficientAgent 于 9 月 27 日首次提交，9 月 29 日出现更新。它研究的是一个很具体、也很容易被普通 Chat serving 直觉误判的问题：为什么同一种 KV offload，在 coding-agent workload 上会在某些 GPU 上加速、某些 GPU 上减速，而另一些部署几乎没有收益？[arXiv](https://arxiv.org/abs/2609.33762)
+
+**解决的问题。** Agent 请求不是独立到达。一次模型调用结束后，Agent 可能执行测试、读文件或调用工具；等待期间，其他 Agent 会持续把自己的上下文压入缓存。于是“这个 token 从 CPU 搬回 GPU 比重算便宜”只是必要条件，真正决定命中的，是这段 KV 在 Agent 下一次回来之前有没有被其他 Agent 的状态挤掉。
+
+论文将两次使用之间被访问的其他 KV 量定义为 **reuse working set**。在其 SWE-bench Verified 轨迹中，98.1% 的 prompt token 已经在同一任务前一轮处理过；97.3% 的新增 KV 会在下一次调用重新出现，但在 5 GiB/rank 的 host tier 下，79.2% 写入的 KV chunk 在下一轮到来前已经被逐出。这解释了“理论上 restore 很便宜，实际却没有收益”的反常现象。
+
+**核心机制。** EfficientAgent 用 stack-distance 模型从 Agent history 估计 working set，指导 host tier 容量规划；运行时再做 working-set-aware write admission：当工作集超过 host tier 且缓存确实处于满载逐出状态时，优先保留仍然 resident 的 prefix extension，拒绝大块 refill；容量足够时则恢复 full admission。这实际上把操作系统 working-set / thrashing 的经典思想移植到了 Agent KV 层。
+
+**实验与证据。** 作者在 OpenHands CodeActAgent、SWE-bench Verified、Qwen3-Coder-30B-A3B-Instruct、vLLM 0.13.0 与 LMCache 0.3.12 上测试，并覆盖 H20、H800 和 RTX 3090。H20 replay 包含 4,427 次模型调用和 147.1M prompt tokens。host tier 从 5 GiB/rank 增至 20 GiB/rank 时，computed prefill 从 76.7M 降至 5.3M tokens，减少 93.1%；makespan 从 209 分钟降至 128 分钟，减少 38.7%。论文同时指出，收益还取决于 GPU compute / host-link bandwidth 的硬件平衡。
+
+**限制。** 结果集中在 exact-prefix reuse、coding agent、特定模型与 LMCache/vLLM 栈；不同的 context compaction、语义复用或远端 KV fabric 会改变 reuse-distance 分布。论文也明确显示，过度过滤写入在大容量 tier 上会适得其反，因此“少写”本身并不是普适策略。
+
+**为什么重要。** 对 Agent serving 来说，cache capacity 不应只按单请求 context length 或并发 batch 估算，而应按 **跨 tool gap 的复用距离**估算。这是一个比普通在线推理更接近闭环 workload 的容量模型：服务延迟会改变 Agent 下一次请求的到达时间，而到达时间又反过来改变缓存生存概率。
+
+## Dynamic Flow, Static Graph：把动态 KV 复用嵌入静态图执行
+
+该论文于 9 月 28 日提交，arXiv 页面明确标注 **Accepted at EuroSys 2027 (Spring Cycle)**。它关注移动 NPU 上一个典型矛盾：KV reuse 天然带有动态 lookup、选择性恢复和变长 chunk，而移动 NPU 往往要求计算图静态编译，且内存容量和 I/O 带宽都比服务器 GPU 更紧。[arXiv](https://arxiv.org/abs/2609.34727)
+
+方法包含四个相互配合的部分。第一，在图内把 selective KV recomputation 映射为可静态执行的机制；第二，用动态规划做 inter-graph chunk merging，降低 padding；第三，构建 tree-hash-semantic 混合结构的分层 KV manager，并加入 cost-aware prefetch / eviction；第四，构造二维 pipeline，将 KV loading、rerotation、storage 与 NPU execution 重叠。作者报告，在代表性的端侧 workload 和 LLM 上，相比无复用和仅 prefix cache，TTFT 降低 40–60%。
+
+这项工作的价值不只在端侧。它揭示一个更普遍的 serving 问题：**复用算法的动态性必须和执行后端的可编程边界共同设计。** GPU runtime 可以在 request scheduler 中自由插入 lookup 和 transfer，并不意味着同样的缓存抽象能直接移植到图编译型设备。对异构推理框架而言，KV API 最终可能需要同时表达 identity、可恢复区间、重算代价、布局转换以及 backend execution constraints。
+
+## CodeSkill：从 token trajectory 走向可复用的行为级 latent state
+
+CodeSkill 于 9 月 27 日提交。它认为长程 coding agent 的 RL 若始终在 token level 优化，会遭遇稀疏 reward 下的 credit assignment 和探索效率问题，而大量历史 trajectory 中其实反复出现更高层的行为模式。[arXiv](https://arxiv.org/abs/2609.33243)
+
+其流程先用 teacher model 将成功与失败轨迹蒸馏为多层 textual abstraction，再以 temporal variational inference 将这些离散语义映射为连续 latent variable；adaptive boundary 根据执行反馈决定 skill transition，最终把 learned skill 作为 latent semantic prefix 注入冻结的 LLM policy。论文摘要报告其在通用与工业 coding benchmark 上相对强 open-weight baseline 具有竞争力，并表现出跨域迁移能力。
+
+需要克制看待这里的结论：arXiv 摘要没有给出一个足以在本报告中独立复核的统一提升数字，因此不将“competitive performance”进一步量化。但从系统视角看，这项工作值得跟踪，因为它把 Agent 的可复用状态从“原始历史文本”推进到了“行为抽象 + latent prefix”。如果这类表示进一步成熟，Agent runtime 未来面对的状态层次可能同时包含文本 history、KV state、显式 memory、execution artifact 和 latent skill，而不是只管理 prompt。
+
+# 开源项目的重要新闻
+
+## LMCache：9 月 29 日 nightly 继续扩展 CUDA 13.0 构建链
+
+LMCache 官方 Releases 页面显示，9 月 29 日发布了 CUDA 13.0 nightly wheel，覆盖 linux/amd64 与 linux/arm64；前一日的 v0.5.6rc2 还提供了针对 AMD ROCm 7.2 的构建，其中 gfx942 对应 MI300X/MI325X、gfx950 对应 MI350X/MI355X，并区分与上游 vLLM ROCm 镜像 ABI 匹配的 wheel。[Releases](https://github.com/LMCache/LMCache/releases)
+
+这次更新的意义主要是 **部署矩阵和 ABI 可复现性**，而不是新的 KV 算法。对于一个逐渐承担 CPU/GPU/远端 KV 数据层职责的组件，硬件后端扩展会直接影响 KV connector 能否在异构集群中成为稳定基础设施。当前 9 月 29 日条目是 nightly pre-release，不应等同于稳定版能力。
+
+## ContextCube：共享 KV 从软件层走向专用 appliance
+
+TuringData 在 9 月 29 日 Tech Week Singapore 发布 ContextCube。厂商材料将其描述为 GPU HBM、DRAM、本地 NVMe 之外的共享 **Layer 3.5**：通过 RDMA 提供跨 inference node 的持久 KV pool，并使用四块 BlueField-3 DPU、26 块 U.2 NVMe，以及每块 DPU 两个 200 Gb/s 端口。其公开规格声称单 appliance KV bandwidth 为 120 GB/s，容量可扩展到数百 TB，并列出 vLLM、SGLang、LMCache 和 Mooncake 兼容性。[发布稿](https://www.prnewswire.com/apac/news-releases/turingdata-launches-contextcube-at-tech-week-singapore-2026-bringing-shared-kv-cache-to-gpu-inference-clusters-302891006.html)
+
+这里必须区分 **产品规格** 与 **独立验证性能**。发布稿明确注明实际性能依赖配置和 workload；本次检索未找到与上述 120 GB/s、长时间 retention 等规格对应的独立第三方复现实验。因此更合理的关注点是其系统边界：KV cache 已经开始被当作可单独采购、跨节点共享、由 DPU 搬运的数据基础设施，而不是 inference engine 内部的一块临时显存。
+
+# 前沿概念和技术
+
+今天最值得提炼的概念是 **reuse working set**。传统 KV cache 讨论常用 hit rate、capacity、bandwidth 或 recompute-vs-load cost 描述收益，但 Agent workload 多了一个关键时间尺度：tool call、sandbox execution、human-paced gap 以及其他 Agent 的插队执行。于是一个状态“未来会再次用到”仍然不够，它还必须在复用距离内保持 resident。
+
+第二个变化是 **KV identity 与物理 residency 正在分离**。移动 NPU 工作把 tree/hash/semantic lookup、rerotation 和静态图执行结合起来；ContextCube 则把 KV residency 推到独立共享设备；EfficientAgent 又从 workload 侧说明 resident set 必须覆盖闭环 Agent pool 的 reuse distance。三者虽然处于不同硬件尺度，却都在回答同一个问题：**已经计算过的状态，应该在哪里保存、保存多久、如何重新定位，以及什么时候宁可重算。**
+
+CodeSkill 则补上了另一层：未来 Agent 的“state”可能不止可见文本和 KV。行为级 latent skill 如果能够稳定迁移，runtime 与训练系统就可能需要面对一种新的中间状态——它不是传统 memory document，也不是逐 token KV，而是压缩后的策略/经验表示。目前这仍是研究性方向，不能直接等价为可部署的 serving cache。
+
+# 对大模型推理与存储优化的启发
+
+第一，**Agent workload 的缓存容量规划需要从 concurrency 转向 reuse distance。** 同样 16 个并发任务，如果 tool gap、context growth 和调度顺序不同，实际 host working set 会显著不同。仅用“平均上下文长度 × 并发数”做静态预算容易忽略闭环反馈。
+
+第二，**offload policy 应该同时决定读和写。** 过去很多讨论强调 H2D restore 是否足够快，但 EfficientAgent 的结果说明，小缓存下无条件写回本身会制造 thrashing；真正的策略空间包含 admission、retention、eviction、prefetch 和 recomputation，而不只是 placement。
+
+第三，**KV cache 正逐渐形成独立数据面。** 当状态跨 GPU、CPU、NVMe、远端节点甚至专用 appliance 流动后，推理引擎需要的不只是一个 connector，还需要可验证的 KV identity、生命周期事件、容量压力反馈和跨层 cost model。软件接口是否能把这些信号暴露给 scheduler，会越来越重要。
+
+第四，**异构后端会反向约束缓存抽象。** 静态图 NPU 的案例说明，GPU 上自然的动态 lookup 并非普适执行模型。未来统一 serving runtime 若要覆盖 GPU、NPU 和其他 accelerator，需要把“算法上的动态性”与“后端允许的动态性”显式分层。
+
+# 今夜白的观察
+
+今天几项材料拼在一起，出现了一个相当清晰的趋势：**KV cache 正在从 optimization object 变成 managed state。** EfficientAgent 讨论的是 workload-driven residency，EuroSys 论文讨论的是 execution-constrained reuse，ContextCube 讨论的是 cluster-wide persistence，LMCache 则继续扩展可部署的数据层后端。它们的共同点并不是“都做 KV”，而是都不再把 KV 当作请求结束前附着在 GPU 上的一块匿名 tensor。
+
+值得继续跟踪的第一个问题，是 Agent 的真实 reuse working set 是否在不同 coding/research/workflow agent 上具有稳定结构。SWE-bench Verified 的结论很强，但 human-paced workflow、多 Agent 协作和频繁 context compaction 可能产生完全不同的 reuse-distance 分布。
+
+第二个问题，是共享 KV 基础设施的收益边界。跨节点持久化可以提高 prefix survival，但也引入网络拥塞、metadata lookup、KV identity、版本一致性、租户隔离和失效管理。随着共享层容量从几十 GiB 走向 TB 乃至更大，**“能存多少”会逐渐让位于“哪些状态值得长期存在，以及如何证明它还可安全复用”。**
+
+第三个问题来自 CodeSkill：Agent 状态的类型还在增加。显式 memory、KV、tool artifact、checkpoint、trajectory summary、latent skill 各自具有不同的可解释性、恢复成本和复用粒度。未来 Agent infrastructure 的核心挑战，很可能不是做一个更大的 cache，而是为这些异构状态建立统一但不过度抽象的生命周期管理。
+
+# 原始资料链接
+
+## 论文与技术报告
+
+- EfficientAgent: What Makes KV Cache Offloading Work for Concurrent Agents — https://arxiv.org/abs/2609.33762
+- Dynamic Flow, Static Graph: KV Cache Reuse for Efficient LLM Serving on Mobile NPUs — https://arxiv.org/abs/2609.34727
+- CodeSkill: Latent Skill Abstraction for Long-Horizon Code Agents — https://arxiv.org/abs/2609.33243
+
+## 官方工程与发布材料
+
+- LMCache Releases — https://github.com/LMCache/LMCache/releases
+- TuringData ContextCube 发布稿 — https://www.prnewswire.com/apac/news-releases/turingdata-launches-contextcube-at-tech-week-singapore-2026-bringing-shared-kv-cache-to-gpu-inference-clusters-302891006.html
+
+> 时间说明：本报告以北京时间 2026-09-30 早间为截点。EfficientAgent 与 CodeSkill 首次公开时间分别为 9 月 27 日，前者在 9 月 29 日出现版本更新；Dynamic Flow, Static Graph 于 9 月 28 日提交；ContextCube 于 9 月 29 日发布。超过近 24 小时窗口的论文仅在其仍处于近 72 小时回溯范围且未在近期 AgentPress 日报中收录时纳入。
