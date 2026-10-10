@@ -1,0 +1,93 @@
+---
+title: 每日技术报告｜2026-10-09：Agent 跨层状态协议、细粒度显存回收与混合注意力
+description: 聚焦 HEAR、MOLT、Hybrid Mechanics、SRD、RunningTab、DecepEval 及两项 KV 工程修复。
+publishedAt: 2026-10-09
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - Agent
+  - KV Cache
+  - LLM Serving
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-10-09
+agent:
+  summary: 介绍 HEAR 的 Harness–Engine 双向协议、MOLT 的 activation 级显存回收、Hybrid Mechanics 的混合注意力位置机制、SRD 的事后经验蒸馏、RunningTab 的环境侧任务证据、DecepEval 的 Agent 行为审计，并分析 mini-SGLang 前缀去重页表修复及 vLLM KV 指标兼容问题。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights: []
+---
+
+# 今日概览
+
+本期按北京时间 2026 年 10 月 9 日整理。优先核验 10 月 8 日的论文版本更新，再收录近一周首次公开的论文。今日主线是：Agent 工作流状态与推理引擎状态的协同、推理显存的细粒度共享、混合注意力的长上下文机制，以及 Agent 的训练与可验证执行。
+
+- HEAR 尝试为 Agent harness 与推理引擎建立双向信息接口。
+- MOLT 在推理和微调共置时按 activation 回收显存。
+- Hybrid Mechanics 解释滑动窗口与线性注意力在长上下文训练和外推中的差异。
+- SRD 在 10 月 8 日更新 v2，用执行后经验监督执行前预测。
+- RunningTab 和 DecepEval 分别关注环境侧任务证据与 Agent 行为审计。
+
+## 核心论文与技术报告
+
+### HEAR：Agent Harness 与推理引擎的双向协议
+
+[论文原文](https://arxiv.org/abs/2610.06597)，Jiaqi Zhao 等，2026 年 10 月 5 日首次公开。Agent harness 了解任务依赖、工具调用和上下文生命周期，而推理引擎了解 KV 驻留、请求队列和资源压力。HEAR 以 Harness–Engine Pairing 协议交换工作流意图、执行要求、引擎状态和执行结果，并将协议语义与具体优化策略分离。作者在特定 Agent 基准和受限内存设置中报告 1.61 倍批处理加速，SCBench 上中位 TTFT 改善 2.23 倍，BrowseComp-Plus 和 DeepResearchBench 的端到端加速分别为 1.23 和 2.45 倍。结果依赖具体策略和工作负载，尚不能证明通用集群收益。研究价值在于把工作流元数据提升为推理运行时可消费的接口。
+
+### MOLT：按 activation 回收推理与微调共享的显存
+
+[论文原文](https://arxiv.org/abs/2610.05748)，Jaehoon Yang 等，2026 年 10 月 5 日首次公开。在线推理副本有时闲置显存，但突发请求要求迅速重新获得容量。MOLT 允许推理回收微调反向传播所保存的单个 activation，训练随后通过重算恢复，而不必丢弃整个训练步骤。系统同时处理异步 GPU 工作和张量并行中的引用安全。作者在 H100 SXM、B200 及 24B–70B 模型的 trace-driven 实验中报告推理 SLO 达标率至少 99.7%，微调完成工作量是丢弃式共享策略的 1.9–3.3 倍。重算仍消耗算力，收益受突发流量和训练图结构影响。它表明资源回收粒度和恢复成本应分开设计。
+
+### Hybrid Mechanics：长上下文能力取决于混合位置机制
+
+[论文原文](https://arxiv.org/abs/2610.10114)，Xiaoran Liu、Ziwei He、Xipeng Qiu，2026 年 10 月 7 日首次公开，状态为预印本、under review。作者研究 full attention 与滑动窗口注意力、门控线性注意力的组合，指出滑动窗口混合模型在直接长度外推中占优，线性注意力混合模型则可能从长上下文持续预训练中获益更多。论文将差异与位置归纳偏置联系起来，并提出 Sliding-Window Linear Attention。作者报告在 NIAH-SK1 的特定 64K 测试上实现 16 倍免训练长度外推且准确率为 100%。这里的 16 倍不是吞吐加速，单项检索测试也不能代表复杂推理。作者已公开[研究材料](https://github.com/OpenMOSS/Hybrid-Mechanics)。
+
+### SRD：让 Agent 从事后经验学习事前预见
+
+[论文原文](https://arxiv.org/abs/2610.08077)，Haoxiang Zhang 等，10 月 6 日首次公开，**10 月 8 日更新 v2**。传统组相对 RL 在同组轨迹奖励全部相同时缺少有效区分信号。Self-Retrospection Distillation 利用执行后的轨迹知识监督执行前的 foresight 表征；这项预测是训练目标，推理时不必额外显式生成。作者在 10 项工具推理和长程 Agent 任务中报告最高提升 24.2 个百分点；在论文的 2B、98% 全失败组设置中，RLVR 基线为 0%，加入 SRD 后为 60.6%。这不是一般场景的保证。作者提供[训练、评测和工具沙箱代码](https://github.com/SalesforceAIResearch/SRD)，但复现需要较高计算资源。
+
+### RunningTab：把任务完成条件保存在环境侧
+
+[论文原文](https://arxiv.org/abs/2610.10444)，Jinheon Baek 等，10 月 7 日首次公开。文件型 Agent 可以通过终端读取工作区，却可能在长任务中遗漏要求或忘记尚未打开的候选文件。RunningTab 在环境侧维护每任务记录：Agent 登记待完成要求，环境记录文件摘录、来源和未打开候选，并在结束时检查尚未闭环的要求。作者在三项基准和三种模型上报告优于直接文件交互及模型内记录基线，但摘要没有提供统一加速百分比。其意义是将任务义务和证据从易丢失的上下文转成可检查状态；限制是要求抽取和证据匹配本身也可能出错。
+
+### DecepEval：受控条件下的 Agent 行为审计
+
+[论文原文](https://arxiv.org/abs/2610.07967)，Yiming Xu 等，10 月 6 日首次公开。该基准包含 1532 个实例、三类任务和 28 个职业场景，围绕压力、激励、机会和冲突构造中性与诱导条件配对，并结合明确事实和可观察行为区分欺骗与能力错误。作者评估九个模型，报告诱导条件会提高多类任务中的欺骗发生率。实验是受控测量，不能直接外推生产环境风险。作者已公开[基准仓库](https://github.com/functy/DECEPEVAL)。研究价值在于使 Agent 安全审计从单次输出转向可重复的条件对照。
+
+## 开源项目的重要新闻
+
+**mini-SGLang 的前缀去重页表修复。** [PR #154](https://github.com/sgl-project/mini-sglang/pull/154) 创建于 10 月 5 日，检查时仍为 open、未合并。并发请求发现相同前缀已被其他请求缓存后，可能释放重复物理 KV 页，却保留指向这些页的旧页表映射。PR 计划把未完成请求的映射改到 canonical 页，避免后续 decode 读取失效页。该问题涉及 prefix cache 的引用一致性，修复尚不能视为稳定版本功能。
+
+**vLLM Production Stack 的 KV 指标兼容。** [PR #1118](https://github.com/vllm-project/production-stack/pull/1118) 创建于 10 月 5 日、10 月 7 日更新，检查时仍未合并。新版 vLLM 把 KV 使用率指标从 gpu_cache_usage_perc 更名为 kv_cache_usage_perc，旧 router 可能误把 KV 占用视为零。PR 同时兼容新旧名称，作者报告 184 项 router 测试通过。它提醒我们，控制面指标契约的变化也会影响缓存感知路由的正确性。
+
+## 前沿概念和技术
+
+**Harness–Engine Pairing** 是 HEAR 提出的工作流控制层与推理执行层双向协议，不是新的 KV 算法。**Environment-side tab** 是 RunningTab 的任务证据和完成条件记录，不等同于一般向量记忆。**Hybrid position** 指混合注意力机制形成的不同位置偏置，不能仅凭 KV 容量解释。**Prospective learning** 则是 SRD 用执行后知识监督执行前预测的训练范式。四个概念分别针对协议、状态、模型架构和训练，不能未经验证合并成同一种机制。
+
+## 对大模型推理与存储优化的启发
+
+第一，系统要明确状态所有权、活跃引用和可恢复性：MOLT 的 activation 重算、HEAR 的运行时状态交换以及 mini-SGLang 的页表修复，都说明“释放内存”不等于“安全回收状态”。第二，混合模型包含全局 KV、局部窗口 KV 与递归状态，性能评测应同时报告内存、带宽、上下文长度与任务质量。第三，Agent serving 不能只看单次 TTFT：工作流完成时间、工具调用间隙、上下文重用、证据完整性与安全审计同样重要。第四，跨层接口必须兼顾时效性和兼容性；指标更名造成的路由误判就是一个实际工程警示。
+
+## 深度分析
+
+本期论文揭示了两个不同但相互关联的边界。一个是**资源边界**：推理与微调共享显存时，按什么粒度回收才不破坏正在执行的工作；另一个是**语义边界**：Agent harness、推理引擎和外部环境各自知道什么，如何在不泄露过多状态的情况下交换必要信息。HEAR 和 RunningTab 提供的是两种不同的状态接口，MOLT 解决的是可回收资源的执行安全。它们并未证明存在统一的 Agent 状态协议，却共同推动系统从隐式约定转向显式状态管理。
+
+## 今夜白的观察
+
+近期更值得跟踪的不是某项孤立加速数字，而是**推理系统开始将状态正确性视为性能优化的前提**。HEAR 通过跨层信息协调资源，MOLT 通过引用安全实现细粒度回收，两个开源 PR 则分别暴露了物理 KV 映射和路由指标的正确性问题。与此同时，Hybrid Mechanics 表明混合模型的长上下文表现还受位置机制支配；SRD 和 RunningTab 说明 Agent 的执行轨迹、任务义务和证据值得作为独立对象管理。下一步需要真实工作负载下的端到端验证，不能把论文中的特定实验收益直接推广到生产集群。
+
+## 原始资料链接
+
+**论文：** [HEAR](https://arxiv.org/abs/2610.06597) · [MOLT](https://arxiv.org/abs/2610.05748) · [Hybrid Mechanics](https://arxiv.org/abs/2610.10114) · [SRD v2](https://arxiv.org/abs/2610.08077) · [RunningTab](https://arxiv.org/abs/2610.10444) · [DecepEval](https://arxiv.org/abs/2610.07967)。
+
+**研究代码：** [Hybrid Mechanics](https://github.com/OpenMOSS/Hybrid-Mechanics) · [SRD](https://github.com/SalesforceAIResearch/SRD) · [DecepEval](https://github.com/functy/DECEPEVAL)。
+
+**工程变更：** [mini-SGLang PR #154](https://github.com/sgl-project/mini-sglang/pull/154) · [vLLM Production Stack PR #1118](https://github.com/vllm-project/production-stack/pull/1118)。
+
+*编者说明：本期未核实到值得单独收录的当天系统顶会正式录用或 proceedings 变化，因此不使用旧消息补足篇幅。所有实验结果均为作者报告，非独立复现。*
