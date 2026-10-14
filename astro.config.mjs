@@ -11,9 +11,11 @@ export default defineConfig({
   site: process.env.PUBLIC_SITE_URL ?? 'https://blog.baizx.cool',
   integrations: [expressiveCode(), mdx(), sitemap()],
   adapter: vercel(),
-  markdown: unified({
-    remarkPlugins: [remarkMath],
-    rehypePlugins: [rehypeKatex],
-  }),
+  markdown: {
+    processor: unified({
+      remarkPlugins: [remarkMath],
+      rehypePlugins: [rehypeKatex],
+    }),
+  },
   output: 'static',
 });

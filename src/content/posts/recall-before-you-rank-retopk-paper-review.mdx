@@ -59,15 +59,15 @@ ReTopK 关注动态 Top-K 稀疏注意力中的索引发现成本。即使最终
 
 设 Decode Step `t` 的 Query 为 `q_t`，当前 KV Cache 中共有 `L_t` 个 Key。Exact Top-K 首先计算完整 QK 分数：
 
-```math
+$$
 e_{t,i}=\frac{q_t^T k_i}{\sqrt{d}},\quad i=1,\ldots,L_t
-```
+$$
 
 随后从全部 `L_t` 个分数中选出最大的 `K` 个索引：
 
-```math
+$$
 S_t=\operatorname{TopK}_{i\in[1,L_t]}(e_{t,i},K)
-```
+$$
 
 尽管最终 Softmax 和 Value 聚合只处理 `K` 个位置，索引发现仍包含两个随上下文增长的步骤：完整 Key Cache 的 QK 扫描，以及在完整长度上执行全局 Top-K。论文的延迟分解显示，随着上下文从 4K 增长至 128K，这两部分在 Exact Top-K 注意力中的占比持续上升。
 
@@ -77,9 +77,9 @@ ReTopK 因此试图回答：能否在不扫描完整历史 Key 的情况下，�
 
 论文用下面的指标衡量两个 Query 的 Top-K 重叠率：
 
-```math
+$$
 \operatorname{Overlap}(t,j)=\frac{|S_t\cap S_j|}{K}
-```
+$$
 
 在 Qwen2.5-7B 上，Query 余弦相似度与 Exact Top-K 支持重叠率表现出明显相关性。论文报告，对全部历史 Query 对以及当前 Query 与最相似历史 Query 两种统计方式，相关系数分别约为 0.70 和 0.73。
 
@@ -89,9 +89,9 @@ ReTopK 因此试图回答：能否在不扫描完整历史 Key 的情况下，�
 
 设与当前 Query 最相似的 `R` 个历史 Query 为 `j_1...j_R`，其支持并集为：
 
-```math
+$$
 U_t(R)=\bigcup_{r=1}^{R}S_{j_r}
-```
+$$
 
 论文报告的覆盖率如下：
 
@@ -118,9 +118,9 @@ U_t(R)=\bigcup_{r=1}^{R}S_{j_r}
 
 ReTopK 为每个 Query Head 独立维护一个容量为 `C` 的 FIFO 缓存：
 
-```math
+$$
 \mathcal{B}_t=\{(\bar q_c,\hat S_c)\}_{c=1}^{|\mathcal{B}_t|}
-```
+$$
 
 其中，`q̄_c` 是归一化后的历史 Query，`Ŝ_c` 是该 Query 当时最终选中的 Top-K 索引集合。缓存由 Prefill 阶段最后 `C` 个 Query 初始化，并在每个 Decode Step 后更新。无论当前 Step 走 Reuse Path 还是 Exact Path，新的 Query-Support Pair 都会写入缓存。
 
@@ -130,9 +130,9 @@ ReTopK 为每个 Query Head 独立维护一个容量为 `C` 的 FIFO 缓存：
 
 对于当前归一化 Query，ReTopK 计算其与缓存中所有历史 Query 的余弦相似度：
 
-```math
+$$
 \rho_{t,c}=\bar q_t^T\bar q_c
-```
+$$
 
 然后选取最相似的 `R` 个缓存项，默认 `R=4`。该阶段只在固定容量 `C` 的 Query Cache 中检索，而不是扫描长度为 `L_t` 的全部 Key。
 
@@ -140,17 +140,17 @@ ReTopK 为每个 Query Head 独立维护一个容量为 `C` 的 FIFO 缓存：
 
 ReTopK 将召回的历史支持集合取并集，并强制加入最近 `W` 个 token：
 
-```math
+$$
 \mathcal{A}_t=\operatorname{Unique}\left(\bigcup_{c\in\mathcal{R}_t}\hat S_c\cup\mathcal{L}_t\right)
-```
+$$
 
 默认 `W=32`。Recent Window 不是普通的局部性增强，而是必要的正确性保护：新追加的 token 尚未出现在任何历史支持集合中，如果不显式加入最近窗口，它们可能长期无法进入候选集。论文消融中，当 `W=0` 时，PG19 PPL 从 9.178 恶化到 716.0，模型几乎失效。
 
 候选规模满足：
 
-```math
+$$
 M_t\le RK+W
-```
+$$
 
 默认 `R=4`、`K=512`、`W=32` 时，理论上限为 2080；由于历史支持之间存在大量重叠，64K 实验中的平均候选数约为 701。
 
@@ -158,15 +158,15 @@ M_t\le RK+W
 
 历史支持只负责召回，不直接决定最终结果。ReTopK 对候选 Key 重新计算当前 Query 的精确分数：
 
-```math
+$$
 \hat e_{t,i}=\frac{q_t^T k_i}{\sqrt d},\quad i\in\mathcal{A}_t
-```
+$$
 
 再在候选集合内部执行 Top-K：
 
-```math
+$$
 \hat S_t=\operatorname{TopK}_{i\in\mathcal{A}_t}(\hat e_{t,i},K)
-```
+$$
 
 因此，只要当前真实 Exact Top-K 全部包含在候选集合中，ReTopK 就可以精确恢复 Exact Top-K。即使候选覆盖不完整，最终分数、Softmax 和 Value 聚合也仍然基于当前 Query 和原始 KV，而不是历史近似值。
 
@@ -359,9 +359,9 @@ IndexCache、Kascade 等方法主要利用 Layer 间 Top-K 索引相似性；ReT
 
 对于每个候选 KV 索引 `i`，可以结合 Query 相似度与其在多个历史支持中的出现频率定义访问置信度：
 
-```math
+$$
 f(i)=\sum_{c\in\mathcal R_t}w_c\cdot\mathbf{1}[i\in S_c]
-```
+$$
 
 随后按照置信度决定 HBM、DRAM 和 SSD 层级，而不是将所有候选统一拉入高层缓存。
 
