@@ -31,19 +31,19 @@ publishedAt: 2026-10-14T07:09:40.206Z
 
 传统 Dense Attention 在每次 Decode 时需要访问全部历史 KV。DSA 将这一过程拆成：**当前层 Hidden State → Lightning Indexer 全历史评分 → Top-k Selection → KV Gather / Swap-in → Sparse Core Attention**。
 
-设历史上下文长度为 \(L\)，每个 Query 选择 \(k\) 个 token。对于 Prefill，Dense Attention 的复杂度为 \(O(L^2)\)，而 DSA 的 Core Attention 为 \(O(Lk)\)；对于单步 Decode，前者为 \(O(L)\)，后者为 \(O(k)\)。**但 Indexer 仍然扫描完整历史**：它在 Prefill 的复杂度仍是 \(O(L^2)\)，在单步 Decode 中仍是 \(O(L)\)。实际常数依赖头数、向量维度和算子实现。
+设历史上下文长度为 $L$，每个 Query 选择 $k$ 个 token。对于 Prefill，Dense Attention 的复杂度为 $O(L^2)$，而 DSA 的 Core Attention 为 $O(Lk)$；对于单步 Decode，前者为 $O(L)$，后者为 $O(k)$。**但 Indexer 仍然扫描完整历史**：它在 Prefill 的复杂度仍是 $O(L^2)$，在单步 Decode 中仍是 $O(L)$。实际常数依赖头数、向量维度和算子实现。
 
 | 阶段 | Dense Attention | DSA Core Attention | DSA Indexer |
 | --- | --- | --- | --- |
-| Prefill | \(O(L^2)\) | \(O(Lk)\) | \(O(L^2)\) |
-| 单步 Decode | \(O(L)\) | \(O(k)\) | \(O(L)\) |
+| Prefill | $O(L^2)$ | $O(Lk)$ | $O(L^2)$ |
+| 单步 Decode | $O(L)$ | $O(k)$ | $O(L)$ |
 | 历史 KV 的逻辑保留量 | 完整历史 | 完整历史仍可能需要保留 | Indexer 还需额外索引状态 |
 
 对于一个层，逻辑上可将时延拆解为：
 
-\[
+$$
 T_{\mathrm{layer}} = T_{\mathrm{index}} + T_{\mathrm{topk}} + T_{\mathrm{gather}} + T_{\mathrm{attention}} + T_{\mathrm{other}}
-\]
+$$
 
 这里是依赖链的描述，并不表示优化后的各阶段一定严格串行。流水线、异步预取和融合 Kernel 会重叠其中部分时间。对分层存储而言，Gather 又包含命中匹配、未命中处理和 Host-to-Device 传输。
 
@@ -83,9 +83,9 @@ T_{\mathrm{layer}} = T_{\mathrm{index}} + T_{\mathrm{topk}} + T_{\mathrm{gather}
 
 **问题。** 原生 DSA 通常需要先利用当前 Query 完成打分与 Top-k，才能知道当前层应该加载哪些 KV。在纯 HBM 模式下，这体现为 GPU 内部算子依赖；在 HBM/DRAM 或 HBM/DRAM/SSD 模式下，会进一步成为外部数据传输处于关键路径的问题。
 
-\[
+$$
 \mathrm{Index}(h_l,K_l^I) \rightarrow \mathrm{TopK} \rightarrow \mathrm{LoadKV} \rightarrow \mathrm{Attention}
-\]
+$$
 
 **现有方法各有不同预测对象。**
 
@@ -144,19 +144,19 @@ T_{\mathrm{layer}} = T_{\mathrm{index}} + T_{\mathrm{topk}} + T_{\mathrm{gather}
 
 **问题。** Decode 通常每请求每步只有一个 Query，更多关注 Step 间重叠；Prefill 或 Append Prefill 一次处理多个 Query，更关注它们所需历史 KV 的并集。
 
-设一个追加 Chunk 有 \(Q\) 个 Query，所需位置集合为：
+设一个追加 Chunk 有 $Q$ 个 Query，所需位置集合为：
 
-\[
+$$
 \mathcal{S}=\bigcup_{i=1}^{Q}\operatorname{TopK}(q_i)
-\]
+$$
 
-假设每个 Query 都有 \(k\) 个有效历史候选，且最多从同一大小为 \(L\) 的历史集合中选择，则：
+假设每个 Query 都有 $k$ 个有效历史候选，且最多从同一大小为 $L$ 的历史集合中选择，则：
 
-\[
+$$
 k \le |\mathcal{S}| \le \min(L,Qk)
-\]
+$$
 
-因此，虽然每个 Query 只关注 \(k\) 个 token，整个 Chunk 的活跃 KV Working Set 仍可能大得多。
+因此，虽然每个 Query 只关注 $k$ 个 token，整个 Chunk 的活跃 KV Working Set 仍可能大得多。
 
 **现有方法。** ECHO 同时设计 Decode 的 Intra-query Prefetch 和 Prefill 的 Inter-query Prefetch；PIVOT 主要利用附近 Query 选择重叠；Janus 则着重优化 Agent 多轮 Append Prefill 中对 SSD 历史 KV 的加载。
 
@@ -235,9 +235,9 @@ k \le |\mathcal{S}| \le \min(L,Qk)
 
 实验应尽可能分开报告：
 
-\[
+$$
 T_{\mathrm{I/O\,exposed}}, \qquad T_{\mathrm{I/O\,hidden}}, \qquad T_{\mathrm{management}}
-\]
+$$
 
 如果未命中已被高度重叠，继续提高预取 Recall 很难得到大幅端到端收益；如果命中率很高却仍出现同步等待，瓶颈可能是碎片化搬运、Kernel Pipeline 或管理依赖。
 
