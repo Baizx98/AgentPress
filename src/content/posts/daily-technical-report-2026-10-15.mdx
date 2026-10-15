@@ -1,0 +1,166 @@
+---
+title: 每日技术报告｜2026-10-15：持久 KV 压缩、MoE 弹性伸缩与 Agent 状态对象化
+description: 聚焦 AlignPred 持久 KV 预测编码、FastEEP 实例内 MoE 伸缩、CarryOn 对象化 Agent 上下文、BLADE 信息使用审计及 SGLang/vLLM 最新工程边界。
+publishedAt: 2026-10-15
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Serving
+  - Agent
+  - Agent Memory
+  - MoE
+  - SGLang
+  - vLLM
+  - Interpretability
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-10-15
+agent:
+  summary: 本期核验 9 篇近期论文：AlignPred 以有界误差压缩持久 KV，FastEEP 通过保留执行与通信状态加速 MoE 实例内伸缩，CarryOn 用可验证任务对象替代长历史，AgentWeave 细分工作流，Prorsa 动态分配 PD rollout 资源，BLADE 审计跨 Agent 证据使用，Depth Memory 研究跨层记忆，另评估混合模型内存组织与 VLM 自推测配置。补充 NVIDIA NeMo Gym 的工件验证实践，以及 SGLang 超节点 KV 共享路线图、vLLM Attention 共享内存兼容问题。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights: []
+---
+
+# 今日概览
+
+本期以北京时间 **2026 年 10 月 15 日** 为报告日期，优先核验 10 月 14 日的新版本、技术博客与工程讨论，并补充过去七天内尚未收录的论文。注意：arXiv 的“10 月 14 日新论文列表”并不等于每篇论文在 14 日首次提交；下文分别标注首次提交和版本更新日期。
+
+1. **持久 KV 开始需要“可恢复误差预算”而不只是低比特量化。** AlignPred 把跨头/层对齐、预测残差与有界误差编码结合，并给出 HiCache 接入实验。
+2. **MoE 弹性不再等同于重启实例。** FastEEP 保留执行、通信与虚拟地址状态，只调整活跃 EP 资源，论文报告伸缩延迟显著下降。
+3. **长程 Agent 的上下文从“历史摘要”转向“任务对象”。** CarryOn 在 10 月 14 日更新 v2，以可验证的任务对象承载进度，减少重复读取历史。
+4. **Agent 系统的两个新边界是流程粒度与证据使用。** AgentWeave 细分长工作流；BLADE 审计信息是否被正确使用，而非只记录信息来自哪里。
+5. **工程动态要区分路线图与已实现功能。** SGLang 正讨论超节点 KV 共享；vLLM 的嵌入模型 Attention 内核在多种 GPU 上暴露共享内存兼容问题。二者均不能被写成已经发布的稳定功能。
+
+# 核心论文与技术报告
+
+## 1. AlignPred：面向持久 KV 的有界误差预测编码
+
+**一手来源：** [AlignPred, arXiv:2610.17970](https://arxiv.org/abs/2610.17970)。Xu Yang 等，**10 月 13 日 08:44 UTC 首次提交（v1）**，预印本。
+
+**问题与机制。** 长程 Agent 跨轮保留 KV 时，既要降低持久存储容量，也要约束恢复后的数值误差。AlignPred 先以局部正交变换对齐相关注意力头或层，再在 token 维度和同一 token 的跨头/层维度做预测，最后量化并熵编码残差；作者强调不依赖学习式预测器或大规模联合变换。
+
+**实验与证据。** 作者在三类注意力机制上测试，报告相近重建误差下优于所比较的编码器，CPU 解码至少快 **1.6 倍**；在 128K LongBench-Pro 上接近原生任务分数。SGLang HiCache 集成使目标持久 KV 存储量相对原生 HiCache 降低 **42%–72%**，并保持相近的测试延迟。**限制：** 论文附录明确指出“持久数据量减少”不等于已分配主机内存减少；恢复路径仍使用 CPU staging、GPU 逆变换及部分模型的跨卡广播。以上数字是作者实验，不代表所有模型与介质的通用收益。代码仓库是否公开未独立确认。
+
+## 2. FastEEP：MoE 实例内 EP 弹性伸缩
+
+**一手来源：** [FastEEP, arXiv:2610.18451](https://arxiv.org/abs/2610.18451)。Yunfei Feng 等，**10 月 13 日 14:22 UTC 首次提交（v1）**，预印本。
+
+**问题与机制。** 常规 EP 扩缩容重建 worker、通信域、CUDA Graph 与显存映射，伸缩成本可能远大于负载变化本身。FastEEP 的 Partial Reuse 将稳定的执行结构与当前 EP 配置激活的物理资源解耦：保留 worker/通信上下文与虚拟地址，回收不活跃物理显存，分阶段完成资源准备、短暂一致性切换和后续回收。
+
+**实验与证据。** 在两节点、16 GPU 的评估范围内，FastEEP 对可比较的模型与 EP 变换报告 **4.5–11.7 倍**于 vLLM Elastic EP 的伸缩速度；论文给出 FastEEP **4.2–13.4 秒**、对照 **36.4–92.0 秒**的范围。**限制：** 只能在启动时预设的最大拓扑内伸缩，扩容必须有可用显存；更大拓扑变化仍需重建。作者称实现已开源并向 vLLM 提交 PR，但本期未独立确认该 PR 已合并。其意义在于将“实例生命周期”与“资源生命周期”分离，而非声称推理吞吐普遍提升相同倍数。
+
+## 3. CarryOn：用任务对象而非交互历史延续长程 Agent
+
+**一手来源：** [Pack Light, CarryOn, arXiv:2610.18784](https://arxiv.org/abs/2610.18784)、[作者项目页与代码入口](https://ethannju.github.io/carryon/)。Yuchen Lu、Julian McAuley、Lei Zhang；**v1 为 10 月 13 日 17:35 UTC，v2 于 10 月 14 日 04:46 UTC 更新**。
+
+**问题与机制。** 长任务会在文件、应用与外部环境留下真实进度，但 Agent 仍不断重读“进度如何产生”的长历史。CarryOn 以三部分构造 continuation view：指向可复用任务对象的 carrier、目标与约束等 execution context、最近交互 live tail；折叠旧历史时只重验受影响对象，并保留未变化对象。**本次新增点**是近期首次公开及 14 日 v2 更新；不能仅凭版本号推断具体新增实验。
+
+**实验与证据。** 作者项目页使用相同 Claude Opus 4.7 作为对照，在 OSWorld 2.0 上报告分数 **43.9→49.7（+5.8 个百分点）**、总 token **下降约 52%**；BrowseComp-Plus 上 **49→56（+7 个百分点）**、token **下降约 23%**。作者提供项目页及代码入口。**限制：** 对象定位、证据绑定和环境检查的可靠性决定折叠后的继续执行是否正确；结果不能直接外推到所有 Agent 环境。
+
+## 4. AgentWeave：将长 Agent 请求拆成可调度的执行流
+
+**一手来源：** [AgentWeave, arXiv:2610.14804](https://arxiv.org/abs/2610.14804)。Kaibin Guo 等，**10 月 10 日首次提交**，近七天补充，预印本。
+
+**问题与机制。** 将不同 Agent 模块分散部署容易出现流水线气泡；将全部模块聚合部署又会因长短请求同步推进而阻塞新请求。AgentWeave 保留聚合式部署，利用 flow decomposition 把长请求拆成保留任务语义的较小执行单元，再用 flow-adaptive scheduler 在细粒度并发与调度开销之间取舍。
+
+**实验与证据。** 作者在四类 Agent 应用上报告相对所选基线 **1.81 倍吞吐、平均延迟降低 2.45 倍、P90 延迟降低 2.04 倍**。**限制：** 这些是所选工作流和部署下的对比；跨模块副作用、恢复语义及极高工具延迟场景仍需要额外验证。代码公开状态未确认。
+
+## 5. Prorsa：Agentic RL Rollout 的动态 PD 资源配置
+
+**一手来源：** [Prorsa, arXiv:2610.16592](https://arxiv.org/abs/2610.16592)。Chiheng Lou 等，**10 月 12 日首次提交**，预印本。
+
+**问题与机制。** Agentic RL 的多轮 rollout 会反复出现新一轮 prefill，而非传统一次 prefill 后连续 decode；静态 PD 资源比例因此容易失配。Prorsa 跟踪 trajectory 生命周期，预测短期 prefill/decode 需求并切换 rollout worker 角色，以实现阶段特化并行和动态容量调整。
+
+**实验与证据。** 作者在同步、异步 Agentic RL 设置中报告相对 PD 混合部署 **1.11–4.05 倍**的端到端 rollout 加速。**限制：** 研究对象是训练阶段的轨迹生成，不应把数字当作在线聊天或生产 Agent serving 的收益；预测误差与角色切换成本决定实际效果。
+
+## 6. BLADE：从信息依赖追踪走向“使用是否正确”的审计
+
+**一手来源：** [BLADE, arXiv:2610.18780](https://arxiv.org/abs/2610.18780)。Xiaoguang Guo、Yaohao Long、Chuxu Zhang，**10 月 13 日首次提交**，预印本。
+
+**问题与机制。** 多 Agent 失败可能发生在信息正确传递之后：接收方错误理解或错误使用了信息。BLADE 先利用结构化概率判断选出重要的“来源—决策”交接点，再审计接收决策是否忠实使用来源、是否满足任务约束，从而区分错误引入、传播与修复。
+
+**实验与证据。** 在 Who&When 系列五个子集的 **1,228 条失败运行**中，作者报告在统一 Jev 判断接口下，BLADE 的步骤归因准确率相对 All-at-once 高 **2.2–11.1 个百分点**，无需参考答案。**限制：** 结果仍依赖用于审计的判断接口，且失败归因不等于已经实现在线预防。这里的 **Jev** 是论文使用的判断接口，不能擅自与 J-space 或 J-lens 混为一谈。
+
+## 7. Depth Memory：将跨层残差混合重述为记忆读写
+
+**一手来源：** [Depth Memory, arXiv:2610.18809](https://arxiv.org/abs/2610.18809)。David González-Martínez 等，**10 月 13 日首次提交**，预印本。
+
+**问题与机制。** 标准残差、mHC 与 Attention Residuals 都涉及沿网络深度保存和聚合表征。作者提出统一的 Depth Memory 视角，并给出 Linear Depth Memory：把跨深度读取写成递归最小二乘回归，传递残差流、线性关联记忆流及逆协方差流，同时设计面向硬件的实现以降低激活峰值与流量。
+
+**实验与证据。** 论文报告在 **400M、1.5B** 参数规模上相对 PreLN、mHC 和 AttnRes 基线获得更低困惑度，并有可竞争的零样本准确率。**限制：** 这是模型架构中的跨层记忆，不是可直接跨请求复用的 KV Cache；更大规模及实际 serving 状态开销尚不能由这些结果推出。
+
+## 8. 混合模型状态：双池与共享分页尚无统一赢家
+
+**一手来源：** [Native Dual Pools or Shared Paging?, arXiv:2610.15755](https://arxiv.org/abs/2610.15755)。Dongwook Kang，**10 月 11 日 v1，10 月 14 日 05:02 UTC 更新 v2**，预印本。
+
+**问题与机制。** Attention KV 随序列增长，而循环/卷积状态的分配单位、复用边界和生命周期不同。论文在修改后的 vLLM 上比较共享粗页、递归 checkpoint 分页、卷积槽位打包以及原生双池四种组织，观察内存预算、接纳余量、checkpoint 可用性对服务行为的影响。
+
+**实验与证据。** 作者报告分页逐步细化可改善主测试点吞吐和尾延迟，但双池与共享分页的胜负随预算与负载变化；一项状态保留交互的置信区间仍包含零。**特别限制：论文明确承认 retained-state continuation correctness 尚未解决。** 因而本期把它视为具有研究价值的边界实验，而非可直接上线的正确性保证。
+
+## 9. SP²ec：视觉语言模型的在线自推测配置选择
+
+**一手来源：** [SP²ec, arXiv:2610.18735](https://arxiv.org/abs/2610.18735)。Yuqi Huang 等，**10 月 13 日首次提交**，预印本。
+
+**问题与机制。** VLM 输入模态变化大，固定 drafter 或固定自推测层数难以持续获得最优吞吐。SP²ec 用无需训练的 bandit 方法在生成过程中调整自推测配置，并用 wall-time regret 衡量探索配置所消耗的真实时间，而不是仅优化 token 接受率。
+
+**实验与证据。** 在 Qwen2.5-VL-7B-Instruct 与 LLaVA-NeXT-Mistral-7B 的文本、视觉任务上，作者报告相对原始自推测方法最高约 **11%** 的改进。**限制：** 单峰吞吐假设与具体模型/硬件的 draft 成本有关；该数字不是所有 VLM 推理的普遍加速比。
+
+# 前沿公司技术博客
+
+## NVIDIA NeMo Gym：以最终工件验证反向优化 Agent 工具接口
+
+[NVIDIA 10 月 14 日官方技术博客](https://developer.nvidia.com/blog/optimizing-agent-reliability-and-tool-calling-efficiency-for-chip-design-using-nvidia-nemo-gym/)披露 Siemens EDA 利用 NeMo Gym 改进标准单元表征 Agent 的过程。其重点不是换模型，而是以最终 Liberty 文件的**覆盖、有效性、相对校验、准确性与完整性**为门槛，结合 rollout 轨迹分析调整技能与 MCP 工具描述。作者在固定 Claude Opus 4.8 的开发评测中，报告综合校验分数约 **55%→95%**、Agent turns **155→53**、输出 token 约 **81K→29K**。实验使用 GF180MCU PDK，完整任务涉及 229 个单元与 36 个 PVT 条件；调优 rollout 则使用较小子集，约 25 次尝试。**限制：** 这是特定 EDA 流程的内部基准，不能作为一般 Agent 可靠性提升的保证。它提供的工程启示是：先定义可验证工件，再优化工具语义与执行轨迹。
+
+# 开源项目的重要新闻
+
+## SGLang：超节点 KV 共享仍处路线图与讨论阶段
+
+[SGLang Q4 Agentic Cache Roadmap #43098](https://github.com/sgl-project/sglang/issues/43098) **10 月 8 日建立，10 月 14 日出现新增讨论**，提出在同一超节点内跨引擎共享 GPU/主机两级 KV、使 Router 感知 KV 位置、为会话/子 Agent/工具调用提供 PREFETCH、DEMOTE、PIN 提示，并统一 L3 存储布局。10 月 14 日的新增点是对另一硬件互联环境的分阶段验证建议。影响路径涉及请求路由、HiCache linker、跨引擎传输与分层存储。**状态：公开 Roadmap/讨论，不是已发布功能。** 关键限制仍是异构互联、传输粒度、故障恢复和一致性验证。
+
+## vLLM：Attention 共享内存预算在更多 GPU 上复现兼容性问题
+
+[vLLM Issue #60847](https://github.com/vllm-project/vllm/issues/60847) **10 月 9 日提交，10 月 14 日新增 DGX Spark/RTX PRO 6000 Blackwell 复现**。EmbeddingGemma 2 的某条 Triton prefill Attention 路径选择的 tile 需要 **163,840 B** 共享内存，而相关设备上限为 **101,376 B**，导致 warmup 失败。报告者通过减小 tile 完成本地验证，Issue 中关联修复 PR。影响的是模型启动与特定 Attention 后端选择，而不是 KV 复用策略本身。**状态：Issue 仍为 Open，不能把本地补丁写成正式合并修复。** 这说明 Attention kernel 的适配测试必须覆盖 head dimension、共享内存容量和非主流 pooling 路径。
+
+# 前沿概念和技术
+
+**Object-oriented continuation。** CarryOn 所说的“对象化上下文”不是传统按时间压缩对话，而是把外部工件和可校验进度变成延续任务的基本单元。它要求明确对象身份、环境绑定与失效更新语义。
+
+**Error-controlled persistent KV。** AlignPred 以可配置的重建误差约束编码，而非仅报告压缩率。对持久缓存而言，压缩大小、编码/解码时延、恢复时 staging 峰值与任务质量应同时测量。
+
+**Audited information use。** BLADE 将来源依赖与正确使用分开；这一差别有助于区分“检索到正确证据”和“真正依赖正确证据作出决策”，但其概率判断仍需要独立校准。
+
+**Hybrid-state memory organization。** Depth Memory 是模型内部的跨深度记忆；双池/共享分页论文处理的是运行时的 Attention 与循环状态。两者都叫 memory，却位于不同抽象层，不能将架构机制直接等同于缓存管理。
+
+# 深度分析：对大模型推理与存储优化的启发
+
+第一，**状态的物理表示与生命周期控制正在被拆开研究**。AlignPred 压缩持久化表示；FastEEP 在伸缩时保留逻辑执行状态、释放物理资源；混合模型双池研究表明，不同状态类型的复用与正确性边界并不一致。面向 serving 的比较应明确区分持久字节数、实际分配内存、传输时延与恢复正确性。
+
+第二，**Agent 的“可继续执行”不等于“保存完整历史”**。CarryOn 依赖可验证的任务对象，AgentWeave 依赖可调度的流程片段，BLADE 则强调交接点的证据使用。可以推测，未来 Agent runtime 的重要接口会同时涉及对象身份、流程边界、执行状态与审计证据；这一判断是对三篇论文的综合推断，不是它们已经共同实现的统一协议。
+
+第三，**优化指标需要贴近真实控制路径**。Prorsa 观察 rollout 生命周期而非固定 PD 配额；SP²ec 直接优化 wall-time regret；NVIDIA NeMo Gym 以最终工件的可验证正确性评估 Agent。单纯报告 token/s、缓存命中率或单步工具成功率，难以覆盖这些系统的实际目标。
+
+# 今夜白的观察
+
+本期最有价值的主线是“**复用什么状态，以及何时相信它仍然有效**”。KV 压缩解决表示成本，EP 弹性解决资源重构成本，Agent 对象化解决历史重复消费，证据审计解决跨模块信息误用；四者看似不同，却都在反对把完整请求或完整历史当作唯一管理单位。
+
+仍需警惕三种过度推断：论文中的持久存储压缩率不等于主机内存节省；模拟或小规模集群中的伸缩加速不等于生产端到端吞吐提升；Agent 任务分数提高也不自动证明长期状态一致性。后续值得继续追踪的是 HiCache 恢复成本、混合状态继续执行正确性、超节点 KV 共享的一致性接口，以及长程 Agent 的可验证状态对象。
+
+# 原始资料链接
+
+**论文与预印本：** [AlignPred](https://arxiv.org/abs/2610.17970) · [FastEEP](https://arxiv.org/abs/2610.18451) · [CarryOn](https://arxiv.org/abs/2610.18784) · [AgentWeave](https://arxiv.org/abs/2610.14804) · [Prorsa](https://arxiv.org/abs/2610.16592) · [BLADE](https://arxiv.org/abs/2610.18780) · [Depth Memory](https://arxiv.org/abs/2610.18809) · [Hybrid Memory Pools](https://arxiv.org/abs/2610.15755) · [SP²ec](https://arxiv.org/abs/2610.18735)。
+
+**作者项目与代码：** [CarryOn 项目页](https://ethannju.github.io/carryon/) · [Harness 自演化资料库（本期未作核心论文）](https://github.com/zgcagi/Harness-RSI)。
+
+**官方技术博客：** [NVIDIA NeMo Gym / Siemens EDA 实践](https://developer.nvidia.com/blog/optimizing-agent-reliability-and-tool-calling-efficiency-for-chip-design-using-nvidia-nemo-gym/)。
+
+**工程 Issue / Roadmap：** [SGLang Agentic Cache Q4 Roadmap #43098](https://github.com/sgl-project/sglang/issues/43098) · [vLLM Attention 共享内存兼容性 #60847](https://github.com/vllm-project/vllm/issues/60847)。
+
+*证据说明：性能数据均为论文作者或官方技术博客在其指定实验条件下的报告；GitHub Issue 中的复现与讨论不等同于已合并实现。本文未使用未公开研究内容。*
