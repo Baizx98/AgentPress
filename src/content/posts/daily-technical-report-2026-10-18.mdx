@@ -1,0 +1,72 @@
+---
+title: 每日技术报告｜2026-10-18：KV 驱逐质量、Agent 升级与缓存一致性
+description: 聚焦 DropKV、LEASH、HTN-Orchestrate 和 ETH，分析异步 KV 加载、缓存回收语义与可插拔 KV 规划。
+publishedAt: 2026-10-18
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - Agent
+  - vLLM
+  - LMCache
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-10-18
+agent:
+  summary: 报告介绍 DropKV 基于残差输出扰动的 KV 驱逐及 Triton 内核、LEASH 的隐状态动作级模型升级、HTN-Orchestrate 的分层多 Agent 任务依赖、ETH 的异构训练流水线优化，并分析 vLLM HiSparse 异步加载僵持、LMCache 按 key 数回收的缺陷和可插拔 KV 规划 RFC。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights: []
+---
+
+## 今日概览
+
+北京时间 2026 年 10 月 18 日。周末论文更新较少，本期优先选取 10 月 15 日 UTC 首发、16 日进入 arXiv 学科列表的技术论文，并追踪 17—18 日的新工程记录。主要趋势是：KV 驱逐从访问热度转向输出质量；Agent 从静态模型路由转向动作级控制；混合 KV 的异步准入与容量回收仍存在可复现的问题。以下性能数字为作者报告。
+
+## 核心论文与技术报告
+
+### DropKV：输出扰动驱动的 KV 驱逐
+
+[DropKV](https://arxiv.org/abs/2610.22130)（Aozhong Zhang 等，10 月 15 日 UTC）把 KV 驱逐的质量目标定义为残差输出扰动，而非仅根据注意力权重打分。联合选择困难，因此方法将目标解耦为逐 token 评分，并在特定条件下给出常数因子近似保证。作者用融合 Triton kernel 避免生成完整注意力矩阵，报告评分阶段 **19.8×** 加速、匹配 batch 的 prefill 最高 **9.9%** 加速。RULER 和 LongBench 的同预算对照支持其质量优势。限制在于理论保证依赖假设，内核性能不能直接等同于端到端 serving 吞吐，代码公开状态尚未独立核实。
+
+### LEASH：用隐状态决定何时升级强模型
+
+[LEASH](https://arxiv.org/abs/2610.22280)（Qingni Wang 等，10 月 15 日 UTC）关注长程 computer-use Agent 的成本与可靠性。它将弱模型当前 hidden state 与历史成功、失败轨迹的表征比较，分别用于任务初始路由、动作级升级以及强模型接管后的影子监督。方法复用动作生成已有的 activation。作者在 OSWorld 报告同升级率下较随机策略提升 **6.55—11.94 个百分点**；特定配置成功率 **73.66%**，平均成本 **0.4117 美元/任务**。局限是表征相似性不一定跨任务分布稳定，模型切换开销也受部署方式影响。
+
+### HTN-Orchestrate：显式维护多 Agent 任务依赖
+
+[HTN-Orchestrate](https://arxiv.org/abs/2610.22195)（Yanchen Deng 等，10 月 15 日 UTC）以分层任务网络连接全局 Planner 和局部 Orchestrator。前者维护任务层级、前置依赖和延迟分解，后者执行叶子任务；必要时可重建任务网络。作者报告 BrowseComp **89.73%**、SUPERChem **73.44%**，分别较 Agent Team 高 **2.45**、**4.69 个百分点**。该结果说明任务结构有助于复杂协作，但没有直接证明更低的服务时延；任务图更新、worker 通信与 checkpoint 成本仍需量化。
+
+### ETH：异构训练流水线的负载平衡
+
+[ETH](https://arxiv.org/abs/2610.22035)（Mianjie Yu 等，10 月 15 日 UTC）不再仅依赖各阶段分配不同层数来均衡异构设备，而是联合调整流水线之间和阶段内部的数据负载，采用 block-wise gradient aggregation 降低不对称同步成本，并优化配置搜索。作者报告最高 **2×** 训练加速、配置搜索开销最高降低 **56×**。[公开仓库](https://github.com/YuMJie/ETH) 包含 profiling、搜索、训练和测试代码。作者标注 NSDI 2027 录用，尚未从会议官方名单独立核实。该工作属于训练系统，不能直接推断推理吞吐收益。
+
+## 开源项目的重要新闻
+
+**vLLM HiSparse**：[Issue #62217](https://github.com/vllm-project/vllm/issues/62217) 在 10 月 17 日 19:27 UTC 新建，当前 open。报告者用纯 CPU 调度器复现两个异步 KV 加载请求都已获准，但完成加载后队首缺少 host block，等待队列提前停止，后面可执行请求也无法推进的情况。尚无已合并修复证据。这提醒异步准入必须考虑后续保留量，而不仅是当前空闲容量。
+
+**LMCache**：[Issue #5837](https://github.com/LMCache/LMCache/issues/5837) 在 10 月 17 日 23:53 UTC 新建，当前 open。报告指出 MP L1 的驱逐比例按文档应基于字节，执行却按 key 数回收。其对照实验中，混合大小对象首轮释放 8 KiB，而同总量的等大小对象释放 16 KiB。字节目标原型不是正式补丁；不能据此推断生产故障率。
+
+**vLLM KV 规划**：[RFC #62100](https://github.com/vllm-project/vllm/issues/62100) 仍处于 experimental draft，讨论平台 builder、模型 grouping hook 和核心统一校验。示例中添加 drafter 后，Kimi-K3 的 KV group 数由 4 增至 20，增加每步 metadata 开销。该 API 尚未成为稳定功能。
+
+## 前沿概念和技术
+
+本期的三个关键词是“输出扰动重要性”“动作级模型升级”和“模型定制 KV plan”。它们分别衡量缓存删减对模型输出的影响、长任务中模型切换的时机，以及不同注意力类型和精度下的状态布局。三者作用于不同执行层次，不应混为一个统一优化指标。
+
+## 对大模型推理与存储优化的启发
+
+KV 系统不能只追求命中率：输出质量、容量单位、异步请求的资源承诺以及请求能否持续前进，都应纳入验证。混合模型还需要可检查的 KV 规划接口。Agent 系统则应把任务依赖和动作级决策信号分别管理，不能简单套用普通聊天服务的单请求模型。
+
+## 今夜白的观察
+
+本期的共同主线是“优化收益需要可验证的成立条件”。DropKV 的近似保证依赖假设，ETH 的训练加速依赖异构配置，LEASH 的成本收益依赖任务与模型组合；缓存 Issue 则展示了语义错误可能抵消性能优化。值得继续跟踪的是异步 KV 前进性、字节级回收一致性和模型定制 KV 规划的接口成熟度。
+
+## 原始资料链接
+
+论文：[DropKV](https://arxiv.org/abs/2610.22130)、[LEASH](https://arxiv.org/abs/2610.22280)、[HTN-Orchestrate](https://arxiv.org/abs/2610.22195)、[ETH](https://arxiv.org/abs/2610.22035)。代码：[ETH](https://github.com/YuMJie/ETH)。工程：[vLLM #62217](https://github.com/vllm-project/vllm/issues/62217)、[LMCache #5837](https://github.com/LMCache/LMCache/issues/5837)、[vLLM #62100](https://github.com/vllm-project/vllm/issues/62100)。
