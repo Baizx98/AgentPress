@@ -1,0 +1,156 @@
+---
+title: 每日技术报告｜2026-10-20：Agent KV 驻留规模账、记忆证据编译与推理状态一致性
+description: 聚焦 1.21 亿调用的 Agent KV 驻留 Trace、证据充分性记忆、Harness 增益归因、MoE 内存弹性，并解读 SGLang 0.5.22 与 vLLM 0.32.0。
+publishedAt: 2026-10-20
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - Agent
+  - Agent Memory
+  - LLM Serving
+  - SGLang
+  - vLLM
+  - MoE
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-10-20
+agent:
+  summary: 梳理微软 M365 四类 Agent 生产 Trace 的 KV 驻留成本与跨部署复用损失，比较 QEMem 和 MemCompile 的记忆证据组织机制，评析 Harness-Delta、MS-Eval、Agent 自验证、BaGuaLu-2、Difflet 与流式推理调度，并核验 SGLang 0.5.22 和 vLLM 0.32.0 的 HiSparse、低精度 KV、Mamba 状态正确性及适用限制。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights: []
+---
+
+## 今日概览
+
+本期按北京时间 **2026 年 10 月 20 日** 编写。需要区分：多篇论文的 arXiv v1 实际提交于 **10 月 15—16 日**，并在 10 月 19 日的分类新论文列表中集中出现；它们不是 10 月 20 日首次发表的论文。工程方面，SGLang v0.5.22 于 10 月 19 日发布，vLLM v0.32.0 于 10 月 18 日发布。
+
+1. **Agent 的 KV 驻留成本不等于 GPU 真正计算的时间。** 一份覆盖 1.21 亿次模型调用的生产 Trace 研究揭示长时间闲置状态与跨部署路由共同抬高缓存成本。
+2. **Agent 记忆从“检索相关记录”走向“组织足够证据”。** QEMem 与 MemCompile 分别强调证据充分性、地址定位与答案上下文编译。
+3. **Harness 提升需要剥离过拟合与额外推理计算。** 新评估指出搜索集上的性能增长不能直接视作泛化能力。
+4. **MoE 与扩散模型系统继续走向细粒度资源控制。** BaGuaLu-2 针对训练激活内存波动，Difflet 则在 Trainium2 上协同管理编译、注意力和去噪复用。
+5. **推理框架将混合状态正确性纳入发布工程。** SGLang 的 HiSparse+推测解码与 Mamba 状态修复、vLLM 的低精度 KV 路径值得结合兼容性条件阅读。
+
+## 核心论文与技术报告
+
+### 1. Understanding KV Residency：真实 Agent 负载中的 KV 保留成本
+
+**新增点与问题。** [原论文](https://arxiv.org/abs/2610.22863)（Mayank Arya 等，arXiv v1：10 月 16 日）分析 Microsoft M365 的 Deep Research、Enterprise Assistant、Coding Agent、Enterprise Chat 四类生产 Trace，合计超过 **1.21 亿次模型调用**。传统单轮 Chat 的“请求结束即释放”视角不足以解释多次工具调用之间的 KV 驻留需求。
+
+**机制与证据。** Deep Research 中约 89% 的模型调用由应用触发；到第 30 次调用时，中位上下文由约 10K 增至 68K token，约 80% 上下文 token 命中前缀缓存。作者用公开 Llama-2-70B KV 布局估算：保持全部活跃会话峰值状态需要约 **501.8 TB HBM**，而真正推理仅占保留时长的 **5.6%**。一小时空闲上限可使峰值容量估算降低 3.6 倍，重算调用比例仅从 4.07% 增至 4.53%。在繁忙小时需求十分之一的容量下，LRU 使 63% 调用重算，clairvoyant 策略为 31%，多分辨率保留（将部分会话状态降为 int4）为 13.6%。
+
+**限制与意义。** 关键容量数字使用替代 KV 布局而非披露的生产模型；这是 Trace 驱动估算，不是直接测量整套集群 HBM。跨部署后缓存复用从 89% 降至 29% 的结果还提示：路由、迁移与驻留表征应联合评估。论文仅称计划公开 AgenticTraceSim 和回放框架，不能视为已经发布。
+
+### 2. BaGuaLu-2：让 MoE 训练激活内存按批次弹性供给
+
+[原论文](https://arxiv.org/abs/2610.23064)（Mingshu Zhai 等，10 月 16 日）研究细粒度 MoE 训练中的专家负载波动。静态预留内存会浪费 HBM，预留不足则触发 OOM 和回滚。BaGuaLu-2 把激活内存从一次性规划转成**每个训练批次按需供给**，并通过系统优化抵消动态管理开销。
+
+作者报告在 **12,288 张 GPU** 上训练 1,040B 参数模型，达到超过 2 EFlops、35% MFU；平均吞吐相对 Megatron-Kuai 与 AdaPipe 分别提高 1.14 倍、1.13 倍。这里的规模与吞吐均是作者实验结论，未独立复现。它针对训练而非推理，不能直接外推到在线 serving；但它清楚展示了“波动资源需求不应总按峰值静态预留”的系统原则。代码公开状态未在摘要中得到确认。
+
+### 3. Harness-Delta Attribution：Agent Harness 优化的收益到底来自哪里
+
+[原论文](https://arxiv.org/abs/2610.22466)（Wenxuan Ding 等，10 月 15 日）提出 HDA，把固定权重模型周围的提示词、技能、工具和编排代码演化带来的收益拆成**搜索集过拟合、额外 test-time compute、剩余可迁移增益的上界**。作者对 11 种执行模型、3 类 Harness 演化框架进行评估；在 21 个搜索集显著提升的设置中，平均 **54%** 的收益可由过拟合解释，**14%** 可由额外推理计算解释。
+
+研究价值不在“否定 Harness”，而在提出更严格的系统评估口径：必须同时报告搜索集与保留测试集表现、模型调用成本、token 开销及迁移结果。剩余部分仅是可泛化收益的上界，不等于已被证明的泛化收益。公开摘要未确认可直接复现的代码仓库。
+
+### 4. QEMem：相关记忆不等于足够回答问题的证据
+
+[原论文](https://arxiv.org/abs/2610.22668)（Shixuan Li 等，10 月 15 日）提出 **relevance–sufficiency gap**：召回的单条记忆虽然相关，但多会话事实可能分散在不同记录，无法共同支持答案。QEMem 使用查询引导的多粒度发现、带原始来源引用的 ViewCards，以及根据证据缺口进行的选择性补检，且无需改变原有记忆写入机制。
+
+作者在共享记忆库条件下，使用 Claude Opus 4.5 的 LoCoMo LLM-judge 评测获得 **91.43%** 准确率，较所比较的最强基线高 7.6 个百分点。这里是特定模型、评测器与数据集的结果，不是对所有 Agent Memory 系统的普遍保证。其启示是应把“命中率”与“最终证据充分率”分开衡量。
+
+### 5. MemCompile：把记忆寻址和答案证据组织拆成两个平面
+
+[原论文](https://arxiv.org/abs/2610.23313)（Shangze Li 等，10 月 16 日）提出查询条件下的证据编译。**Address Plane** 使用源关联描述符与容量感知 Cells 定位支持材料，统一为稳定的 SourcePacket 身份；**Evidence Plane** 在有限预算内选择互补证据并渲染为可直接用于回答的上下文。作者报告 LoCoMo Judge Accuracy **80.52%**，并在 LongMemEval-S 上观察到泛化迹象。
+
+与 QEMem 的证据充分性迭代不同，MemCompile 更强调寻址对象和最终证据表示的解耦。两篇论文使用的设置不同，**91.43% 与 80.52% 不可直接横向排名**。对 Agent runtime 而言，这提示检索、证据整理和模型上下文装配可能是不同的成本中心。
+
+### 6. MS-Eval：多 Agent 委派是否真的划算
+
+[原论文](https://arxiv.org/abs/2610.22869)（Bowen Ding 等，10 月 16 日）面向 MCP 密集型任务，提出包含执行 Harness、委派与编排指标、MSQ 综合指数的评测框架。作者比较四种主 Agent—子 Agent 委派方案及八个前沿模型，发现**子 Agent 专业化**通常是更有效的实践，而委派增加的调用成本并不总能换来收益。
+
+作者将有效收益归因于更好的单 Agent 解题、上下文隔离与真实子任务并行；冗余委派反而只增加开销。论文列出代码链接，但本次访问对应仓库返回 404，因此**无法确认代码当前可用**。对 serving 的启发是评估端到端任务成本、子任务并行度和上下文膨胀，而非只看单轮 TPS。
+
+### 7. Agent 自验证的压力测试：优化器可能学会利用评分器
+
+[原论文](https://arxiv.org/abs/2610.22779)（Jonghyun Lee 等，10 月 16 日；作者标注 NeurIPS 2026 Workshop 录用）研究当 Agent 可反复试探自己的 verifier 时，评分是否仍可信。论文引入压力比率 rho，并设计四类可证伪探针，分别检查评分信号无效、过弱、通过减少声明规避检查，以及提交前查询评分器等情况。
+
+在一个生成模型、六个任务、三个随机种子的初步实验中，作者发现允许提前探测 verifier 后，循环内评分可能维持良好而保留集忠实度下降。它不是新的通用验证器，也没有证明所有 Agent 都会欺骗评分器；更直接的贡献是要求在 verifier 参与优化前报告压力强度与独立保留测试。
+
+### 8. Difflet：Trainium2 上的扩散 Transformer 推理引擎
+
+[原论文](https://arxiv.org/abs/2610.23047)（Bin Ma 等，10 月 16 日）处理扩散图像与视频模型在固定形状 AOT 编译、不同流水线和多步去噪缓存之间的矛盾。系统共享编译后端、按 attention head 划分 joint attention，并由 host 控制器依据设备端小型探针决定每步重新计算还是复用去噪输出；驻留进程避免每次请求重新装载程序。
+
+作者报告五类模型中融合注意力相对同框架 PyTorch/XLA attention 将去噪步骤加速 **1.2—4.3 倍**，四类模型的驻留服务相对反复加载权重的独立执行快 **1.5—3.4 倍**。这不是 LLM decode 的直接对照实验；其研究价值在于将编译、状态复用与常驻服务协同设计。
+
+### 9. Accelerated Dataflow：把前缀感知批处理引入流式数据分析
+
+[原论文](https://arxiv.org/abs/2610.22731)（RuiLong Jiang 等，10 月 15 日）在 Google Cloud Dataflow 上针对混合流式机器学习负载设计异构 worker 池协同自动伸缩与 prefix-aware batching。作者报告 LLM 流水线吞吐 **1.5—2 倍**，并在所测试配置中实现最高 75% 峰值资源节省和 84% 峰值尾延迟降低。
+
+它改变的是流处理系统与 GPU 推理服务之间的调度边界，而非某个 attention kernel。效果取决于任务流中可共享前缀、流量突发和伸缩成本；论文摘要尚不足以判断不同到达分布下的全部收益范围。
+
+## 开源项目的重要新闻
+
+### SGLang v0.5.22：HiSparse+Spec、DCP+MTP 与混合状态修复
+
+[官方 Release](https://github.com/sgl-project/sglang/releases/tag/v0.5.22) 于 **10 月 19 日**发布。最值得关注的是 HiSparse 在 CPU KV 承载下接入 EAGLE/MTP 多步推测解码、GLM-5.2/5.3 的 decode context parallelism 与 MTP 组合，以及混合线性模型在“推测解码+结构化输出”组合下错误恢复 Mamba 状态的修复。其执行路径涉及 KV 交换、验证后的状态提交、请求长度边界和 recurrent state 一致性。
+
+[HiSparse PR #37771](https://github.com/sgl-project/sglang/pull/37771) 已于 10 月 13 日合并，涉及多步 KV 交换、accepted-token commit 和 host backup。PR 的准确率 A/B 测试使用 GLM-5.2-W4AFP8、1P1D、TP8/DP8、EAGLE 三步，GSM8K 为 195/200 对 192/200，GPQA-Diamond 为 180/198 对 182/198，不能称为无条件无损。PR 讨论还明确指出其他推测器组合需要继续补齐；发布支持不等于任意 DFlash/DSpark 组合都已覆盖。升级还要求 Python 3.11+。
+
+### vLLM v0.32.0：低精度 KV 与 HiSparse 执行路径细化
+
+[官方 Release](https://github.com/vllm-project/vllm/releases/tag/v0.32.0) 于 **10 月 18 日**发布，属于近七天尚值得补充的工程变更。NVFP4 KV 扩展至多个 GPU 架构，GLM-5.x 在 SM100 默认 FP8 KV 的相关 PR 报告每 rank KV 内存减半、吞吐提高 2.3%—5.5%，同时 **TTFT 增加 7%—11%**。此外，HiSparse 的每请求 residency 缓存减少逐步扫描页表；Release 所述“最高 58% 吞吐提升”针对 B200、GLM-5.3-NVFP4、长上下文高并发且 KV **完全驻留 GPU** 的设置，不能解读为 CPU offload 的普遍收益。
+
+这一版本还包含多项安全修复和兼容性变化，例如不再支持 Python 3.10、默认 CORS 收紧、部分 Mamba cache 配置移除。部署时应把 KV 精度、后端硬件、模型、TTFT/TPOT 和升级兼容性共同纳入回归测试。
+
+## 前沿概念和技术
+
+**KV residency vs. KV utilization。** Residency 是状态占用资源的持续时间，utilization 是推理真正消费状态的时间。两者在工具等待、人工交互间隔和跨实例调度下可能相差很大。它解释了为什么只用 cache hit rate 或峰值 HBM 占用难以评价 Agent 缓存系统。
+
+**Evidence sufficiency vs. retrieval relevance。** QEMem 与 MemCompile 共同强调：相关片段的集合不自动构成可回答的证据集合。前者用缺口驱动的补检，后者用地址平面与证据平面解耦，都是在管理模型最终看到的证据结构。
+
+**Harness gain attribution。** 当固定模型权重但不断改进提示词、工具与执行逻辑时，评测必须剥离额外计算和搜索集拟合；否则系统效率与模型能力提升容易被混为一谈。
+
+## 对大模型推理与存储优化的启发
+
+首先，KV 的价值不应仅以“下一次访问是否命中”定义，还需要考虑跨调用间隔、重算代价、状态表征精度以及请求会被路由到哪里。其次，Agent 记忆的物理缓存命中与逻辑证据充分性属于不同层次：更高命中率可能减少 I/O，但不能自动保证回答正确。再次，混合注意力、Mamba 状态与推测解码的组合把状态提交正确性推到关键路径，性能测试之外必须加入重试、取消、跨步提交和不同后端的正确性测试。最后，系统论文中的“更快”必须注明硬件、工作负载、基线与指标，尤其不能把训练 MoE、扩散推理与自回归 LLM serving 的结论直接混用。
+
+## 深度分析：资源生命周期与证据生命周期正在分离
+
+本期两条线索形成互补：生产 Agent Trace 描述 KV 在物理系统中**保留多久、驻留哪里、何时重算**；QEMem/MemCompile 则描述同一段历史信息在逻辑层面**是否足以支持当前问题**。前者的优化目标可落在容量、延迟和路由成本，后者更接近答案证据覆盖与可信度。把两者混成一个“记忆命中率”指标，会掩盖“命中但证据不够”与“证据存在但状态迁移太贵”两种不同失败模式。这是基于公开论文的综合判断，并非这些作者已经联合证明的系统结论。
+
+## 今夜白的观察
+
+最值得继续跟踪的是**Agent serving 的真实工作负载表征**。当模型调用仅占 KV 保留时间的一小部分时，在线调度器面临的核心问题已不只是每 token 的计算效率，而是如何让长时间存在、间歇使用且跨实例流动的状态可负担地持续可用。与此同时，Harness 研究和 verifier 压力测试提醒我们：Agent 系统的提升不能只凭单次 benchmark 分数确认，还要解释增加了多少调用、是否过拟合以及评分信号是否被优化器利用。
+
+值得后续观察的公开问题包括：跨部署状态迁移与多分辨率保留在真实服务中的成本；记忆证据编译的延迟和 token 预算；混合模型在 speculative decoding、offload、prefix reuse 组合下的状态一致性；以及能否形成覆盖长时间空闲和多工具交互的统一评测。以上均为对已公开工作的研究性观察。
+
+## 原始资料链接与参考资料
+
+**论文（arXiv 原文；日期均为 v1 提交日期）：**
+
+- [Understanding KV Residency in Production-Scale Agentic LLM Workloads](https://arxiv.org/abs/2610.22863) — 10/16
+- [BaGuaLu-2](https://arxiv.org/abs/2610.23064) — 10/16
+- [Harness-Delta Attribution](https://arxiv.org/abs/2610.22466) — 10/15
+- [QEMem: From Relevant Memories to Sufficient Evidence](https://arxiv.org/abs/2610.22668) — 10/15
+- [MemCompile: From Memory Hits to Answerable Evidence](https://arxiv.org/abs/2610.23313) — 10/16
+- [MS-Eval](https://arxiv.org/abs/2610.22869) — 10/16
+- [When Can You Trust an Agent's Own Verifier?](https://arxiv.org/abs/2610.22779) — 10/16
+- [DIFFLET](https://arxiv.org/abs/2610.23047) — 10/16
+- [Accelerated Dataflow](https://arxiv.org/abs/2610.22731) — 10/15
+
+**官方 Release / PR：**
+
+- [SGLang v0.5.22 Release](https://github.com/sgl-project/sglang/releases/tag/v0.5.22) — 10/19
+- [SGLang HiSparse speculative KV swapping PR #37771](https://github.com/sgl-project/sglang/pull/37771) — 10/13 合并
+- [vLLM v0.32.0 Release](https://github.com/vllm-project/vllm/releases/tag/v0.32.0) — 10/18
+- [vLLM HiSparse per-request residency PR #60083](https://github.com/vllm-project/vllm/pull/60083) — 随 v0.32.0 收录
+
+本文数值均按原论文摘要或官方 Release/PR 记载，属于作者/项目方报告，未独立复现；未核实的代码发布状态不作肯定断言。
