@@ -1,0 +1,216 @@
+---
+title: 每日技术前沿｜2026-10-22：稀疏 Tile 压实、MTP 运行时控制与 Agent 记忆状态边界
+description: 聚焦 KPage、Token-Energy Law、BitMTP、AMTP、Agent S4、MemT、隐空间因果探针与 MemCurrent，并追踪 SGLang、vLLM、LMCache 的状态正确性 PR。
+publishedAt: 2026-10-22
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Inference
+  - Sparse Attention
+  - Speculative Decoding
+  - Agent Memory
+  - Agent
+  - Interpretability
+  - vLLM
+  - SGLang
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-10-22
+agent:
+  summary: 本期梳理 2026-10-20 至 22 日的一手技术材料：KPage 通过跨块 KV page 压实减少稀疏注意力 tile 空洞；Token-Energy Law 将 decode 能耗关联活跃字节与实际耗时；BitMTP 和 AMTP 分别解决低比特多 token 预测的 KV/图状态对齐及动态草稿跨度；Agent S4 从轨迹演化工具接口，MemT-1.0 探索模型内生长期记忆，MemCurrent 将 Agent 原始轨迹与派生记忆分离；隐空间探针论文区分可读性与因果使用；追踪 SGLang DSA+DCP+HiCache、vLLM MRV2 speculator hooks 和 LMCache LoRA 缓存键隔离的未合并 PR，并分析适用条件与风险。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - KPage 揭示稀疏注意力的物理 tile 空洞成本，Token-Energy Law 拆解 decode 能耗。
+  - BitMTP、AMTP 与 vLLM MRV2 推动推测解码的跨度控制和状态对齐。
+  - MemT、MemCurrent、SGLang HiCache 与 LMCache LoRA key 强调模型状态和记忆的正确性边界。
+---
+
+> **资料窗口与口径**：北京时间 2026 年 10 月 22 日上午整理。本期优先检查近 24 小时的工程变更，论文主要来自 10 月 20 日提交、21 日进入 arXiv 新论文列表的材料，以及近三日的官方研究博客。文中区分论文提交时间、项目 PR 更新时间与作者自报的实验结果；所有性能数字均非本站独立复现结果。没有可核实新进展的方向不为凑数而收录。
+
+## 今日概览
+
+1. **稀疏注意力优化开始直面物理 tile 利用率，而不只是理论稀疏度。** KPage 把跨逻辑块的有效 K/V 页直接拼入硬件 tile；这提醒我们，稀疏图不变时，访存与 padding 仍能主导实际吞吐。
+2. **推测解码从“固定草稿长度”转向“运行时控制与状态一致性”。** AMTP 通过在线反馈选 horizon；BitMTP 将低比特执行、已接受前缀、因果 KV 边界和 CUDA Graph 共同设计；vLLM 新 PR 则提出树形验证与停止起草的运行时钩子。
+3. **Agent 的长期状态出现两条不同路线。** MemT-1.0 将可更新记忆纳入模型计算；Databricks MemCurrent 将原始轨迹、可编辑派生记忆与异步整合分层。两者不应被混同为同一种“Agent Memory”。
+4. **Agent 的执行接口本身可以成为优化对象。** Agent S4 通过轨迹驱动的接口演化改善计算机操作任务，而不是只改 prompt 或换更大模型。
+5. **生产级缓存正确性比单点命中率更基础。** SGLang 的 DSA+DCP+HiCache、LMCache 的 LoRA 隔离，以及 vLLM 的验证状态钩子都显示：缓存地址、身份、生命周期与模型状态必须在执行路径上保持一致。
+
+## 重点进展：三条正在汇合的系统主线
+
+**第一条是“减少无效工作”**：KPage 处理稀疏 tile 的空洞，AMTP 避免过长且被拒绝的草稿，BitMTP 消除低比特模型多 token 执行中的重复调度与图捕获开销。它们优化的对象分别是物理计算形状、预测长度和运行时状态，而非简单提高理论 FLOPs。
+
+**第二条是“让状态成为显式系统对象”**：MemT-1.0 讨论模型内部可持续更新的记忆，MemCurrent 把 session trace 与整理后的知识分离，SGLang/LMCache 的近期 PR 则明确了缓存的跨层迁移、请求身份和有效性边界。这里的共同问题不是“能存多少”，而是“什么状态有效、属于谁、何时可以复用”。
+
+**第三条是“从最终答案转向执行过程证据”**：Agent S4 优化接口使用轨迹，隐空间 probing 论文区分可读信息与真正参与因果计算的状态；二者都要求研究者对过程、反事实与基线作更细致的验证。
+
+## 核心论文与技术报告
+
+### 1. KPage：跨块页压实，降低稀疏注意力的硬件空洞
+
+**来源与时间**：[KPage: Cross-Block Page Compaction for Hardware-Efficient Sparse Attention](https://arxiv.org/abs/2610.28096)，Junwei Feng 等，arXiv 首次提交于 **2026-10-20**。研究主要针对长序列视频 Transformer 的三维 token 布局，并非直接针对语言模型 decode。
+
+**解决的问题。** Block-sparse attention 即使只计算被选择的逻辑块，也可能因块内有效 token 不足而浪费物理 tile 的行列容量。稀疏率下降并不自动等于硬件执行效率提高。
+
+**核心机制。** KPage 在载入时将跨逻辑块的有效 16-row K/V page 直接压入较大的计算 tile，不在 HBM 额外物化压实张量；同时在 64×256 与 128×128 的 Q tile 之间路由，减少 query 侧 padding。通过精确 mask 与 K/V-owned page packing，前向和反向保持原有稀疏图语义。
+
+**实验与证据。** 作者报告，在五组代表性负载上，相对 NVIDIA Block-Sparse Attention 的裸前向 kernel 加速为 **1.35–2.06×**，几何均值 **1.77×**；完全填满的块仅 **1.03×**，三维部分填充布局几何均值 **2.29×**。物理 Q-K 配对容量从 **334.1G** 降至 **177.5G**，有效交互仍为 **160.6G**。在八种开源稀疏布局上，相对最强 exact sparse baseline，前向 **1.13–4.25×**，前反向合计 **1.02–2.71×**。
+
+**限制与价值。** 这些数字是指定布局与 kernel 的结果，不是 LLM 服务吞吐增益。论文明确表示代码和 cuDNN Frontend PR **待合规审查后**公开，不能称为已开源。对长上下文系统的启示是：比较稀疏方案时，除有效注意力边数外，还应报告 tile occupancy、索引转换与临时内存开销。
+
+### 2. Token-Energy Law：把 decode 能耗拆成活跃字节与实际耗时
+
+**来源与时间**：[The Token-Energy Law of LLM Decode](https://arxiv.org/abs/2610.28576)，Chenxu Niu、Batuhan Sencer、Wei Zhang、Yong Chen，**2026-10-20** 首次提交。
+
+**解决的问题。** 单看模型参数、理论算力或吞吐不足以解释每个输出 token 的 GPU 板级能耗，尤其在 batch 和上下文长度改变时，权重访问的摊销与每请求 KV 访问的增长方向不同。
+
+**核心机制。** 作者把每 token 的逻辑 active bytes 拆为一次 decode iteration 中跨请求共享的 dense weights 与各请求私有的 KV history，并将这些字节坐标和实测 decode time 纳入可校准的仿射能耗模型。它是用于解释和预测的测量模型，不是新的注意力 kernel。
+
+**实验与证据。** 论文覆盖三种模型、BF16、NVIDIA Hopper/Blackwell，以及 Hopper 双 GPU 张量并行。固定模型系数、输入观测到的 decode time 后，留出条件的平均能耗估计与测量误差最大 **3.73%**。作者据此解释 batch 增大时权重摊销与长历史 KV 私有流量的不同贡献。
+
+**限制与价值。** 结论限于 dense full-history decoding、所测模型和硬件；不能直接外推到稀疏注意力、异构 offload 或 Agent 断续工作负载。其方法论价值在于将“每 token 焦耳数”与真实 bytes、time 和 batch 一起报告，而不是只拿峰值带宽推断能耗。
+
+### 3. BitMTP：低比特模型与多 token 预测的算法—系统联合设计
+
+**来源与时间**：[BitMTP: When Multi-Token Prediction Meets Low-Bit Large Language Models](https://arxiv.org/abs/2610.28500)，Ning Zhang 等，**2026-10-20** 首次提交；[作者代码与 Bonsai 权重入口](https://github.com/PolyU-VCLab/BitMTP) 已公开。作者在论文页面标注 NeurIPS 2026，本文不将其视作独立核验过的会议录用公告。
+
+**解决的问题。** 超低比特权重降低权重流量，MTP 减少串行解码轮数，看似可以叠加；但 MTP 的 masked drafting 缺少普通 next-token 训练时可见的中间 token 输入，且更宽的执行与因果 KV 更新会吃掉收益。
+
+**核心机制。** BitMTP 用联合 next-token/MTP 训练让同一 backbone 支持自回归和 block-causal drafting；提供 confidence-only、speculative-only 与 hybrid 三种解码模式，不额外引入独立 draft/verifier 模型。其 **accepted-prefix alignment** 同步已提交前缀、实际物化的因果 KV 边界与 CUDA Graph replay 状态，并配合不同宽度的低比特执行内核及共享 KV 存储。
+
+**实验与证据。** 在 H20 上，作者报告 BitNet b1.58-2B 五任务平均加速 **2.2×**，Bonsai 1.7B–4B 为 **2.1–2.4×**，前提是任务质量可比；RTX 3090 的五任务平均吞吐最高 **2.0×**，Jetson Orin 在 MBPP+ 上最高 **3.3×**。仓库包含训练、转换、生成和回归测试路径，但部署依赖特定模型格式及硬件 kernel。
+
+**限制与价值。** 不能把这些数值直接当作常规 BF16 70B 模型的增益；对 serving 的普遍意义是：推测执行的优化必须同时计入验证宽度、KV 写入、接受前缀修复与图重放状态。
+
+### 4. AMTP：用在线反馈选择 MTP 的草稿跨度
+
+**来源与时间**：[Adaptive Multi-Token Prediction: How far should we go?](https://arxiv.org/abs/2610.28619)，Emile Anand、Mohammed Rehan Parwani、Xinyuan Cao，**2026-10-20** 首次提交。
+
+**解决的问题。** 多头 MTP 一次前向就要确定整个 speculation horizon；较长草稿在高接受率上下文中划算，但一旦早期拒绝，后续计算可能全部浪费。固定 horizon 无法覆盖不同输入和生成阶段。
+
+**核心机制。** AMTP 从每轮 verification 反馈估计 acceptance survival，即草稿前缀全部被接受的概率，并在下一轮选择期望 tokens/s 最大的跨度。控制器无需重训 draft/target，也不改变精确验证器。论文还把 horizon 预测误差与相对最优上下文决策的吞吐 regret、总完成时间界联系起来。
+
+**实验与证据。** 作者在 Llama-3.1-8B-Instruct 的 Medusa heads、Meta MTP 模型及 Qwen3-4B-Inst-2507-MTP 等组成的五组 draft-target 组合上，以 AIME 2025 和 GSM8K 测试。相对标准解码最高 **4.1×**；对比固定窗口，在 **10 组设置中的 8 组**持平或更优，吞吐增益最高 **10%**。
+
+**限制与价值。** 4.1× 的参照是标准解码，10% 才是相对固定窗口的上限，两者不可混写。结果不等于高并发 serving 下的普遍收益；值得关注的是把 acceptance 反馈直接变成运行时决策，而不是预先固定推测深度。
+
+### 5. Agent S4：从任务轨迹自动演化 Agent 的软件接口
+
+**来源与时间**：[Evolving Agent Interfaces](https://arxiv.org/abs/2610.28601)，Saaket Agashe 等，**2026-10-20** 首次提交；[Agent-S 官方仓库](https://github.com/simular-ai/agent-s) 同日记录 Agent S4 公开。
+
+**解决的问题。** 计算机操作 Agent 往往被固定的截图、点击、键盘与 shell 工具接口限制。相同任务可能存在远比逐格编辑、逐行读取更高效的可执行接口，而接口设计与调用时机通常由人手工决定。
+
+**核心机制。** Agent S4 使用 meta-agent 分析任务 Agent 在合成训练任务中的轨迹（不需要这些轨迹的成功标签），自动创建、修改工具接口及其使用知识，并保存在可复用仓库中。随后用对 meta-agent 不可见的验证任务做群体式演化选择，降低只记住训练任务的风险。
+
+**实验与证据。** 作者报告 Qwen3.8-27B 搭配演化接口，在 **OSWorld V2 binary score 为 21.3%**，是同模型固定接口的 **3.8×**；ScienceBoard 成功率从 **41.4%** 到 **58.6%**。论文另给出与商业模型的比较，但这些比较依赖各自成本与 benchmark 设置，不等同于通用模型能力排名。
+
+**限制与价值。** 接口演化需要额外的任务执行、验证环境和权限治理，且 OSWorld V2 与其他 OSWorld 版本不可直接横向对比。研究价值是将 tool interface 视为可以学习、版本化和回归测试的系统资产，而非永远固定的 API 清单。
+
+### 6. MemT-1.0：将长期记忆从外部检索推向模型内部状态
+
+**来源与时间**：[MemT-1.0: Towards Memory-Native Evolution](https://arxiv.org/abs/2610.26825)，Zhiyu Li 等；**10 月 19 日 v1，10 月 20 日 v2**。本次关注的是该新论文与次日版本更新，不把 v2 当作全新论文。
+
+**解决的问题。** 外部 RAG 或保存完整上下文 KV 可以提供历史信息，但检索、重读和持久存储成本会随历史增长。作者研究能否让模型本身持续维护可利用的记忆。
+
+**核心机制。** MemT-1.0 在 Metis 基础上引入 Gated DeltaNet-2，支持轮内稳定的 token 级记忆更新，并用 **Mixture-of-Storage** 扩展原生记忆容量；训练包含持续预训练与后训练两个阶段，报告使用 **34B tokens** 训练数据。论文称已发布 Nano 与 Flash 两个模型家族，但本次核验依据是论文声明，未对所有权重文件逐一做可运行性验证。
+
+**实验与证据。** 作者报告在历史长度 **128K tokens** 时，MemT-1.0-Nano 相比保留完整上下文 KV 的方案，端到端推理约 **1.86×**，持久存储减少约 **66×**；在记忆任务上平均超过参数记忆基线，与检索增强方法有竞争力，并展示过程性经验帮助 Agent 任务成功率。
+
+**限制与价值。** 66× 是对特定 full-context KV baseline 的持久存储比较，不代表与所有 Agent 记忆数据库或压缩方法相比的优势。其重要性是混合/递归状态可能成为一等持久资源：如何持久化、隔离、回滚与迁移模型内部记忆，将与传统 KV 管理不同。
+
+### 7. Present but Hard to Read：可读的隐状态不等于因果使用
+
+**来源与时间**：[Present but Hard to Read: Probing Latent Reasoning with Minimal Pairs](https://arxiv.org/abs/2610.28498)，Aur Shalev Merin，**2026-10-20** 首次提交。
+
+**解决的问题。** 隐空间 probing 的常见推断是“探针读不出某值，说明模型没有表示它”；反过来，“探针读得出，说明模型计算时用到了它”。这两个推断都可能不成立。
+
+**核心机制。** 论文用只改变输入中一个数字的 minimal pairs，分别测试循环模型 Ouro-1.4B 与标准 Transformer Qwen2.5-1.5B；引入 generic mixing 的合成空假设，并用状态 patching 检查探测到的中间量是否真正影响最终输出。
+
+**实验与证据。** 跨问题配对 readout 约 **0.9**，但常规单提示探针在 Ouro/Qwen 上仅 **0.36/0.19**，即使训练使用 5,249 个问题。两步任务中虽能读到未显式写出的 a+b 微弱信号，但把这一值 patch 到其他问题上并未相应推动最终数字；patch 最终答案的表示则有效。
+
+**限制与价值。** 这是小模型、受控合成任务中的方法学证据，不足以证明所有大模型都以相同方式进行隐式推理。对可解释性与安全审计的直接启发是：应将“信息存在”“可被探针读出”“因果上被使用”作为三个不同命题验证。
+
+### 8. MemCurrent：把 Agent 原始经历与可维护记忆分离
+
+**来源与时间**：[MemCurrent: Designing Persistent Memory for Production Agents](https://www.databricks.com/blog/memcurrent-designing-persistent-memory-production-agents)，Databricks AI Research Team，**2026-10-20** 官方研究博客；同日发布 [Agent Memory 产品实现说明](https://www.databricks.com/blog/introducing-agent-memory-databricks)。这是带实验细节的官方工程研究材料，不是独立同行评审论文。
+
+**解决的问题。** 无状态 Agent 反复探索同一数据库 schema、工作流和业务定义；直接回放全部历史则造成 token 开销、陈旧事实与冲突。仅依赖向量检索又缺少事实更新和轨迹追溯能力。
+
+**核心机制。** 系统分为 append-only 的 episodic memory（原始 session/tool trace）与可变的 derived memory（结构化知识文件），入口有自动生成的 memory index。三种操作路径各司其职：plugin 在线记录和注入索引，Agent 工具按需检索与显式修改，离线 dreaming 管线批量提炼、去重、冲突修复和文件合并。公开实现依托 Lakebase，Agent Bricks Memory 为 Beta。
+
+**实验与证据。** 作者在 LoCoMo、LongMemEval、ConvoMem 上报告平均准确率 **88.1%**，与 full-context 的 **87.8%** 相近，而输入 token 约 **8.4K vs 103K**。内部企业任务 benchmark 由 **29 位用户、2,233 个历史 session、114 个测试用例**构成：无记忆 pass rate **22.3%**，MemCurrent **68.4%**，gold injection **78.6%**；相对无记忆方案 token 减少 **31%**、耗时减少 **26%**。消融中仅 derived memory 为 **66.1%**，再加 episodic 为 **68.4%**。
+
+**限制与价值。** 内部 benchmark 和商业系统依赖厂商实现，数字不能无条件迁移到其他 Agent；不同基准的 agent/harness 配置也不同。值得研究的是将记忆更新与检索解耦：同步工具处理即时更正，异步整理负责长期一致性，原始 trace 保留审计和纠错能力。
+
+## 开源项目的重要新闻
+
+### SGLang：DSA + DCP 下的 HiCache 两级状态恢复（PR #45205，未合并）
+
+[sgl-project/sglang#45205](https://github.com/sgl-project/sglang/pull/45205) 于 **10 月 19 日 UTC 创建，10 月 22 日 UTC 更新**，当前为 **open PR**，依赖尚在审查的 [#44322](https://github.com/sgl-project/sglang/pull/44322)。原问题是 ROCm 的 DSA DCP 路径不能使用 HiCache；长前缀 Agent replay 在高并发下挤出 HBM 后必须重新 prefill，交互速度出现断崖。PR 为 DCP 分片后的 target 与 MTP draft 增加 L1 设备缓存、L2 主机缓存的保存/恢复。
+
+作者在 MI355X、GLM-5.2-MXFP4、TP4/EP4+DCP4、FP8 KV、3600 秒 Agent trace 回放中报告：并发 **48** 时 P90 interactivity **6.05→19.90 tok/s/user（3.3×）**，每 GPU 吞吐 **18,169→31,935 tok/s（+76%）**，P90 TTFT **9.94→2.16 秒**。在并发 16/24 且工作集已驻留 HBM 时几乎没有差异。该数据来自 PR 作者的指定负载，不是通用推理性能保证。
+
+**限制与状态**：仅 ROCm/HIP 且 DCP>1，暂不支持 L3、HiSparse、PD disaggregation、prefill CP 或树形 draft；截至核验时 **未合并**。它说明多级缓存价值高度依赖工作集容量临界点，必须与并发、命中率和尾延迟一起评估。
+
+### vLLM：MRV2 为树形验证、可变验证预算和暂停起草增加钩子（PR #62963，未合并）
+
+[vllm-project/vllm#62963](https://github.com/vllm-project/vllm/pull/62963) 于 **2026-10-21 19:35 UTC** 创建，当前 **open PR**。它在 Model Runner V2 的 BaseSpeculator 中提出五类可选扩展：自定义 rejection sampler、验证前输入重写、接受路径的 KV/递归状态整理、逐请求 verify budget，以及当推测不再划算时暂停 drafting。默认实现保持已有内置 speculator 的行为。
+
+PR 的关键不是又实现一个推测算法，而是暴露 **verify 前、accept 后、下一轮 draft 前**这些状态一致性边界。作者提供 B300/Qwen3.8-27B 的初步验证与回归测试，但部分数据来自较早代码修订，且明确有待在新基线上复测；不应将其视为稳定版本的性能承诺。当前 suspended decode 仍限制 prefix caching、KV transfer、DBO 与多种并行配置；草稿权重和 KV 容量不会因暂停而自动释放。
+
+### LMCache：LoRA adapter 必须进入跨实例 KV 缓存身份（PR #5713，未合并）
+
+[LMCache/LMCache#5713](https://github.com/LMCache/LMCache/pull/5713) 创建于 **2026-10-13 UTC**，**10 月 22 日 UTC** 仍有更新，当前 **open PR**。MP connector 原先只用相同 token IDs 和 cache_salt 区分缓存，导致 base model 与不同 LoRA adapter 可能读到彼此生成的 KV。这是静默正确性问题，不只是命中率损失。
+
+修复在请求跟踪层对 salt、adapter 名称与路径做 SHA-256 组合，保留既有 wire protocol 与服务端 key schema。作者的十请求交替测试中，旧路径 **6/10** 使用错误 adapter 的 KV；修复后 **10/10** 与无缓存基线一致。需要注意升级时清理旧 adapter 产生的持久 L2 数据；不同 replica 的 adapter 路径字符串必须一致，隔离配额也需识别派生 salt。其一般意义是：KV identity 至少需要包含影响计算结果的模型配置，不能仅以 token prefix 判断等价。
+
+## 前沿概念和技术
+
+**Accepted-prefix alignment（已接受前缀对齐）** 是 BitMTP 在低比特 MTP 上提出的运行时契约：verifier 接受哪些 token、哪些因果 KV 已真正落地、下一轮 CUDA Graph 从什么状态重放，三者必须一致。它不同于仅统计 acceptance rate；未来评价推测解码框架时应关注拒绝后 KV 修复与混合模型状态迁移的代价。
+
+**Memory-native state 与 external derived memory** 在本期构成明确对照。MemT 的记忆通过 Gated DeltaNet-2 / Mixture-of-Storage 进入模型计算；MemCurrent 的记忆则是可检索、可修改、可审计的外部知识文件与原始轨迹。前者需要模型状态兼容性、序列化和迁移语义；后者需要版本、冲突解决和检索一致性。两者在存储介质上可能相遇，但不是同一个抽象。
+
+**Probe readability 与 causal use** 也不能混为一谈。minimal-pair probing 检测某信息是否随输入变化而进入表征，patching 才进一步询问该信息是否影响输出。把一个线性探针的高分直接当作模型内部“正在这样推理”的证据，风险很高。
+
+## 深度分析：从算法收益到运行时边界
+
+本期最有研究含量的交叉点，是**算法级减少工作量之后，运行时如何兑现收益**。KPage 提醒我们，理论稀疏度不等于物理 tile 效率；BitMTP 提醒我们，减少 decode 轮数不等于减少总时间，因为验证宽度、低比特 kernel、KV 提交与图重放都有成本；AMTP 进一步表明，最优 horizon 会随上下文与接受率改变。因此，评价新的 decode 优化时应报告至少三组指标：有效计算/字节量、实际 GPU 时间及同步开销、端到端请求吞吐与尾延迟。
+
+第二个交叉点是**复用的正确性条件**。LMCache 的 adapter key 冲突说明，相同 token 序列不保证相同 KV；SGLang 的 DCP+HiCache 说明，相同前缀在不同分片所有权下需要正确的保存和重建路径；MemCurrent 则说明相同历史事实可能已被后续纠正。跨系统的共同约束是：缓存必须绑定计算身份、版本、所有权和可验证的有效期，命中率不能替代正确性。
+
+第三个交叉点是**过程证据与系统可观测性**。Agent S4 的轨迹可以指导接口优化，但其验证集必须与生成过程隔离；MemCurrent 保留 episodic trace 供审计，避免只留下无法追溯的摘要；latent probing 研究进一步指出，相关性读出不等于因果解释。这些材料支持一个保守结论：Agent 和模型状态优化的评估需要 trace、反事实与错误恢复测试，而不能只看最终成功率。
+
+## 对大模型推理与存储优化的启发
+
+**一是建立“有效工作量—物理工作量—服务收益”三层评价。** 稀疏注意力报告有效 Q-K 交互之外，还应披露 tile 填充、padding、索引构造与搬运；MTP 报告平均接受长度之外，还应测 draft/verify 宽度、KV 更新、CUDA Graph 命中及 batch 敏感性；能耗评价则结合活跃字节、真实耗时和硬件配置。
+
+**二是将缓存键视为计算语义的一部分。** token IDs 之外，模型版本、adapter、位置编码、缓存布局与并行分片方式都可能影响复用合法性。跨实例缓存协议如果不能表达这些差异，即使数据传输完全可靠，也可能产生静默错误。可采用端到端一致性测试：相同输入分别经无缓存、命中缓存、跨实例恢复，比较输出与中间状态。
+
+**三是针对 Agent 负载采用生命周期与恢复指标。** Agent 的长时间 tool gap、反复回访、前缀共享和高并发突发，决定缓存系统不仅要看 GPU hit rate，还要记录 host reload、重新 prefill、空闲后恢复成本、P90/P99 interactivity，以及状态回滚后的正确性。SGLang PR 的 c16/c24 与 c48 对照说明收益常在容量拐点后才显著出现。
+
+**四是区分可重算的外部知识与不可随意重建的模型状态。** MemCurrent 的派生知识可以异步整理并保留原始轨迹；MemT 的内部记忆则可能依赖特定权重、状态更新算子和序列顺序。把两者都称为“memory”容易掩盖不同的一致性与持久化成本。
+
+## 今夜白的观察
+
+本期值得关注的不是单一论文的最大加速倍数，而是几种技术开始给出更明确的**收益成立条件**：KPage 在部分填充布局上优势大、满块时接近持平；AMTP 相比固定窗口的增益远小于相比普通解码的倍数；SGLang 的 HiCache 在工作集未超出 HBM 时几乎无收益，但在高并发容量拐点后明显改善。这类条件化结果，比脱离负载的“最高 X 倍”更适合指导系统研究。
+
+另一个趋势是**模型内部状态、Agent 外部记忆和推理缓存的语义边界正在被重新明确**。MemT 与 MemCurrent 分别推动内生和外生记忆，LMCache 的 LoRA 隔离与 vLLM 的验证钩子则把状态身份和变更时机落实到代码路径。未来最值得继续跟踪的是这些接口能否在不同模型、并行策略与缓存层级之间保持正确性，并有独立可复现的端到端证据。
+
+最后，可解释性研究提醒我们对“看到了一个中间变量”保持克制。若没有 minimal-pair、合成空假设和因果干预，读出信号很容易被误当作推理机制。系统性能分析同样如此：需要区分统计相关、机制解释与真实执行路径上的因果贡献。
+
+## 原始资料链接与参考资料
+
+**论文与技术报告（原始页面）**：[KPage](https://arxiv.org/abs/2610.28096)；[Token-Energy Law](https://arxiv.org/abs/2610.28576)；[BitMTP](https://arxiv.org/abs/2610.28500)；[Adaptive MTP](https://arxiv.org/abs/2610.28619)；[Evolving Agent Interfaces](https://arxiv.org/abs/2610.28601)；[MemT-1.0 v2](https://arxiv.org/abs/2610.26825)；[Present but Hard to Read](https://arxiv.org/abs/2610.28498)。
+
+**官方研究与工程说明**：[Databricks MemCurrent 研究博客，2026-10-20](https://www.databricks.com/blog/memcurrent-designing-persistent-memory-production-agents)；[Databricks Agent Memory Beta，2026-10-20](https://www.databricks.com/blog/introducing-agent-memory-databricks)。
+
+**代码与 PR（核验时均以原始仓库状态为准）**：[BitMTP 源码](https://github.com/PolyU-VCLab/BitMTP)；[Agent-S / Agent S4](https://github.com/simular-ai/agent-s)；[SGLang #45205：HiCache for DSA DCP](https://github.com/sgl-project/sglang/pull/45205)；[SGLang #44322：ROCm DSA DCP 基础依赖](https://github.com/sgl-project/sglang/pull/44322)；[vLLM #62963：MRV2 speculator hooks](https://github.com/vllm-project/vllm/pull/62963)；[LMCache #5713：LoRA KV identity](https://github.com/LMCache/LMCache/pull/5713)。
+
+**检索与状态说明**：以上论文的 arXiv 版本时间以各论文 submission history 为准；GitHub 项目状态以本次读取的 PR 元数据为准。未找到足够可靠的当天会议官方新公告，因此本期没有单独编造顶会新闻。
