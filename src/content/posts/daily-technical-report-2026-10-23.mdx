@@ -1,0 +1,174 @@
+---
+title: 每日技术报告｜2026-10-23：稀疏 KV 统一寻址、跨层索引共享与 Agent 状态审计
+description: 聚焦 UlaCache、MLIPS、RISK-KV、KPage、HGM-Dual 等七篇新论文，并核验 SGLang FP8 KV、InstantTensor 显存回收与 vLLM MTP PR。
+publishedAt: 2026-10-23
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - Sparse Attention
+  - LLM Inference
+  - Agent
+  - Agent Memory
+  - Agent Security
+  - SGLang
+  - vLLM
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-10-23
+agent:
+  summary: 本期解析 UlaCache 跨 GPU/CPU 稀疏 KV 逻辑寻址、MLIPS 跨层 Top-M 候选池、RISK-KV 质量约束的 KV 重建、KPage 稀疏 tile 压紧、HGM-Dual Agent harness 谱系优化、Token-Energy Law 解码能耗分析，以及 AI 审批器的同源证据相关故障；核验 SGLang InstantTensor 显存回收、SM120 原生 FP8 KV 和 vLLM MTP draft attention 裁剪三项未合并 PR，梳理索引、容量、传输、恢复与安全审计的系统边界。
+  sourceQuality: verified
+  reuseLevel: medium
+  related: []
+type: technical-report
+projectStatus: released
+highlights: []
+---
+
+> **时间说明**：北京时间 2026-10-23。重点核验 10 月 20—22 日首次公开的论文与 10 月 22 日新开的工程 PR。性能数字均归属于论文或 PR 作者，未经独立复现。
+
+## 今日概览
+
+本期最值得关注的变化是：稀疏注意力优化开始分别解决**候选检索、KV 逻辑寻址、物理搬运与硬件 tile 利用率**。UlaCache 与 MLIPS 代表数据管理和索引共享两条路径；RISK-KV 把 KV 恢复从完整传输/重算拓展为质量约束下的部分重建；HGM-Dual 与 Correlated Failures 从 Agent 演化谱系和审批证据来源切入，强调执行状态和安全证据的结构化管理。工程上，SGLang 与 vLLM 新 PR 暴露了加载后显存残留、FP8 KV 内核支持及 MTP draft prefill 冗余计算。
+
+## 重点进展
+
+### 核心论文与技术报告
+
+#### 1. UlaCache：稀疏 KV 的统一逻辑地址
+
+**新增点与来源。** Isaac Zhu 等于 2026-10-21 UTC 提交 [UlaCache: Unified Logical Addressing for Sparse LLM Serving](https://arxiv.org/abs/2610.29820)，arXiv v1。
+
+**问题与机制。** 稀疏注意力每步只读取部分历史 KV，但未来仍可能访问此前未选中的位置。将全部历史保存在 CPU、热点复制到 GPU 会产生重复存储；MLA 在多卡 TP 中还可能复制共享 KV。UlaCache 通过稳定逻辑地址解耦历史位置与物理位置，支持 GPU 池及可选 CPU 内存。TP 模式把历史分散到 GPU，计算侧缓存最近选中的 KV，缺失时才搬运。Parallel Bucketed LRU（PB-LRU）并行维护 recency bucket、选择替换槽，并在数据搬运完成后更新地址映射。
+
+**实验与证据。** 作者在 SGLang 集成实现上使用 GLM-5.3、64K—128K 输入、每请求 2048 输出 token，比较 8×H200 和 8×B300 的 DP/TP 路径。开启 MTP、匹配 CPU/GPU 预算后，相比 HiSparse，峰值 decode 吞吐在 H200 上提升 DP 1.16×、TP 1.70×，B300 上提升 DP 1.73×、TP 2.51×。
+
+**限制与价值。** 这些是各系统在自身可容纳并发规模下的峰值结果，不等同固定 batch 的逐 token 加速。低并发仍有寻址和通信开销；分布式索引器的跨卡分数汇总仍需同步。论文提示“历史 KV 的逻辑身份、实际存储位置和计算侧副本”值得独立建模；尚未确认独立代码仓库已公开。
+
+#### 2. MLIPS：跨层共享 Top-M 候选，不共享最终 Top-K
+
+**新增点与来源。** Samkit Jain、Sai Kishan Pampana、Shlok Agarwal 于 2026-10-20 UTC 提交 [MLIPS: Multi-Layer Indexer Pool Sharing](https://arxiv.org/abs/2610.27438)，arXiv v1。
+
+**问题与机制。** Sparse attention 减少实际 KV 读取，但 indexer 仍可能在每层扫描全前缀。MLIPS 由 producer 产生大于注意力预算 K 的 Top-M 候选池，consumer 层在池内自行打分并选 Top-K。共享的是检索候选范围，而非最终 attention token 或跨层 KV 值。
+
+**实验与证据。** 作者分析三类稀疏注意力模型，并在 DeepSeek-V4-Flash 的 vLLM 实现中报告：三个 consumer 对应一个 producer 时，四组长上下文测试获得 1.14—1.40× 加速、GPU 能耗下降 14.8%—27.4%，单次运行准确率变化为 -1.49 至 +0.29 个百分点。
+
+**限制与价值。** 更长的共享跨度会损害部分任务质量。其 Top-G prefill 方案仍属于 trace 驱动的探索性构造，未证明部署开销、因果构造和 KV 驻留收益。该工作使“候选扫描成本”成为与 attention 计算不同的优化对象。
+
+#### 3. RISK-KV：质量约束下的部分历史 KV 重建
+
+**新增点与来源。** Wang Yuekai 于 2026-10-21 UTC 提交 [RISK-KV: Quality-Aware Selective KV Cache Reconstruction](https://arxiv.org/abs/2610.29544)，arXiv v1。
+
+**问题与机制。** 请求迁移和中断恢复通常需要传输完整 KV 或重放历史 token。RISK-KV 在目标层组两侧保留精确 KV，使用跨层 ridge regression 估计缺失层的 attention projection 输入，再折叠原模型 KV 投影矩阵以降低预测器开销。它依据真实重建导致的 NLL 变化估计质量风险，选择允许重建的层组。
+
+**实验与证据。** Qwen2.5-0.5B、Qwen2.5-1.5B、TinyLlama-1.1B 的代表性配置可省略 18.2%—33.3% 历史 KV，perplexity 变化低于 0.5%。512-token 历史的本地恢复比完整 Token Replay 快 1.51—3.31×。
+
+**限制与价值。** 论文明确尚未测试真实跨节点迁移；小模型和短历史结果不能外推至大模型长上下文。其启发是恢复路径可存在“精确锚点 + 受控近似重建”的中间方案。
+
+#### 4. KPage：跨块压紧稀疏 K/V 页面
+
+**新增点与来源。** Junwei Feng 等于 2026-10-20 UTC 提交 [KPage: Cross-Block Page Compaction for Hardware-Efficient Sparse Attention](https://arxiv.org/abs/2610.28096)，arXiv v1。
+
+**问题与机制。** 视频 Transformer 的三维 token 布局常出现部分占用的稀疏块，GPU 仍需为物理 tile 的空洞付费。KPage 在加载阶段跨逻辑块打包有效的 16-row K/V page，不额外物化 HBM 紧凑张量；还在 64×256 与 128×128 tile 之间选择，使用精确 mask 保持原稀疏连接图。
+
+**实验与证据。** 五组工作负载相对 NVIDIA Block-Sparse Attention 的 forward kernel 加速 1.35—2.06×，几何平均 1.77×；满块场景只有 1.03×。另八组稀疏布局相对最强精确基线的 forward 加速为 1.13—4.25×。
+
+**限制与价值。** 主要证据来自视频 Transformer，而非自回归 LLM decode。作者称代码将在合规审查后开源并计划提交 cuDNN Frontend PR，不能写成已经发布。它区分了逻辑稀疏率与真实硬件 tile 利用率。
+
+#### 5. HGM-Dual：Agent Harness 的谱系与错误归因
+
+**新增点与来源。** Sudipta Paul 等于 2026-10-21 UTC 提交 [HGM-Dual: Lineage-Aware Guided Agent Harness Optimization](https://arxiv.org/abs/2610.30042)，arXiv v1。
+
+**问题与机制。** 自修改 Agent harness 的搜索在复杂规划任务中容易重复无效尝试。HGM-Dual 保存祖先版本的修改内容、行为改善或退化、失败归因，形成 lineage-aware context；同时生成开放探索型和针对主要约束违例的定向修复型子代。
+
+**实验与证据。** 在作者的规划任务上，相比最强基线 case accuracy 的相对改善最高 14.45%，以 2—4 倍更少的评估预算达到 HGM 变体的最终表现。
+
+**限制与价值。** 结果依赖错误类别与规划评测，尚不能直接推广到任意 coding agent。重要的是，它把 Agent 记忆从对话摘要推进到版本谱系、修改意图与结果归因。
+
+#### 6. Token-Energy Law：分解每个输出 token 的能耗来源
+
+**新增点与来源。** Chenxu Niu 等于 2026-10-20 UTC 提交 [The Token-Energy Law of LLM Decode](https://arxiv.org/abs/2610.28576)，arXiv v1。
+
+**问题与机制。** 参数量与 FLOPs 不能充分解释不同 batch 和上下文下的能耗。论文对 dense full-history decode 建立可校准模型，将每迭代共享的模型权重字节、每请求私有的历史 KV 字节与实际每输出 token 解码时间分开计量。
+
+**实验与证据。** Hopper、Blackwell、三个 BF16 模型以及部分双卡 TP 场景中，固定系数并输入观测 decode 时间后，留出条件的平均能耗估计偏差不超过 3.73%。
+
+**限制与价值。** 这不是跨硬件免校准的普适定律，也未验证稀疏 attention 或异构 offload。它提供了比只比较 tokens/s 更有解释力的能耗测量方法。
+
+#### 7. Correlated Failures：AI 审批不能把同源证据当作独立投票
+
+**新增点与来源。** Luca Zanolini 于 2026-10-21 UTC 提交 [Correlated Failures of AI Approval Monitors](https://arxiv.org/abs/2610.29178)，arXiv v1。
+
+**问题与机制。** Agent 执行付款、发消息或修改代码前可能经过多个监控器，但共享基础模型或被污染证据会产生相关失败。论文借用分布式系统 fail-prone sets，按独立证据源而不是审批模型票数设计规则，并测试加入规则引擎的效果。
+
+**实验与证据。** 付款审批任务中，按来源计数的规则在与最佳按票数规则相同安全水平下，误拦正确付款为 0.9% 对 7.4%。作者也披露预注册最坏情形测试失败，存在所有监控器依赖同一证据源的攻击。
+
+**限制与价值。** 不能由特定付款任务推导普适 Agent 安全保证。对 Agent runtime 的意义是审计工具返回、检索结果与记忆的证据来源，而不只是汇总模型判断。
+
+## 开源项目的重要新闻
+
+以下均是 2026 年 10 月 22 日新开的 PR，**不是已合并功能**。性能数字来自提交者自测，仍需 CI、review 和后续复现。
+
+### SGLang #45886：加载后回收显存
+
+[原始 PR](https://github.com/sgl-project/sglang/pull/45886) 指出 InstantTensor 的临时 NCCL communicator 和 tensor clone 造成显存常驻与碎片，挤占 KV pool。修改采用临时通信组与私有 MemPool。提交者在 B200、GLM-5.3 NVFP4、TP4+MTP 上测得加载后显存从 108.89 GB 降至 106.76 GB，KV 容量从 812,544 恢复至 835,648 token；加载时间从 28.8 秒变为 31.3 秒，默认加载器约为 91.7 秒。影响的是权重加载与分配路径，不是 attention 算子。PR 仍 open，页面 CI 未通过。
+
+### SGLang #45871：SM120 原生 FP8 KV
+
+[原始 PR](https://github.com/sgl-project/sglang/pull/45871) 提出为 RTX PRO 6000 Blackwell 的 FA4 kernel 原生支持 FP8 E4M3 Q/K/V，覆盖 prefill 和 paged decode 的关键矩阵计算、shared memory 布局与缩放。提交者在 Gemma 4 31B、单卡、ISL 8K/OSL 1K、90% prefix hit 和固定延迟预算下，报告输出吞吐由 383.36 提至 863.56 tok/s，最大并发从 20 提至 46。结果依赖特定硬件、模型与配置；PR 仍 open，不能视为已发布性能。
+
+### vLLM #63195：只计算 MTP draft prefill 中真正采样的行
+
+[原始 PR](https://github.com/vllm-project/vllm/pull/63195) 提出默认关闭的可选路径：仅对每请求最终用于采样的 row 计算 draft attention，但仍为所有 token 写 KV。适用于特定单模块 MTP/FlashInfer backend；可能产生非 bitwise 一致输出，FULL CUDA graph draft prefill 不适用。该 PR 为 Draft，提交者明确尚未完成计划中的准确率与 acceptance-length 测试，**没有可引用的实测加速倍数**。
+
+## 前沿概念和技术
+
+**逻辑 KV 身份与物理位置分离。** UlaCache 使同一历史位置在 GPU/CPU 间迁移时保持稳定引用，提示地址映射与搬运完成信号应成为系统接口；但跨实例一致性不是该论文已验证的功能。
+
+**候选池共享不等于最终选择共享。** MLIPS 的 Top-M pool 是搜索范围，consumer 仍独立决定 Top-K。这一界限直接影响质量分析和多层缓存设计，不能把候选覆盖率等同于最终准确率。
+
+**相关故障域。** Correlated Failures 强调模型数目不等于独立证据数目。该概念来自论文的 fail-prone-set 建模，不应脱离证据源假设随意扩展。
+
+**物理 tile 利用率。** KPage 说明在稀疏图不变的情况下也能通过 page packing 提高 kernel 效率；稀疏率、有效 pair 数、物理 tile 容量和端到端延迟应分别报告。
+
+## 深度分析
+
+### 对大模型推理与存储优化的启发
+
+**第一，index scoring、候选整理、地址翻译、KV 命中、数据搬运、attention 与同步等待是不同的开销。** MLIPS 优化索引计算，UlaCache 优化 KV 存放与访问；低并发时额外寻址成本可能抵消节省的搬运。需要同时测量索引耗时、实际搬运字节、缓存命中率、GPU 占用和等待时间，才能判断稀疏化的端到端价值。
+
+**第二，容量、带宽、恢复质量不能混为一谈。** UlaCache 增加可存放的独特历史，KPage 提高已选稀疏连接的物理执行效率，RISK-KV 用质量风险换恢复成本。各自的峰值吞吐、kernel 加速和本地恢复速度不具有直接可比性。若将这些结果放进统一基准，应固定模型、上下文、并发、硬件预算和质量门槛。
+
+**第三，状态生命周期横跨模型加载、在线执行、故障恢复和审计。** InstantTensor PR 说明加载期 allocator 行为影响运行期 KV；HGM-Dual 说明 Agent 的可恢复状态还包括修改谱系；相关故障研究则要求保存证据来源。这些状态并不都适合被抽象成相同的 token 缓存对象。
+
+**第四，评价必须匹配部署假设。** MLIPS 的收益依赖跨层候选相关性；SM120 FP8 PR 依赖特定内核；RISK-KV 尚未证明真实分布式迁移；审批监控器的安全性依赖证据源独立性。不能用单一加速比或成功率掩盖这些前提。Token-Energy Law 还提醒我们：token/s 变化与每 token 能耗变化应分别测量，不能直接等同。
+
+## 今夜白的观察
+
+今天的共同主线是：**推理状态正在成为可寻址、可重排、可恢复、可审计的系统对象**。UlaCache 从物理地址抽象入手，MLIPS 从候选索引共享入手，RISK-KV 从有质量门限的重建入手，三者分别展示了 KV 管理的不同边界。它们没有证明一个统一架构已经成熟，但说明只讨论“缓存保留或驱逐”不足以概括当前问题。
+
+另一条信号是性能分析需要进入真实执行路径。KPage 的 tile 空洞、SGLang 的加载期显存残留、vLLM 的无效 draft attention 都不是单纯统计 FLOPs 能发现的问题。值得继续追踪的公开问题包括：索引池共享能否在异构存储中转化为实际 I/O 减少；统一 KV 地址如何支持故障恢复；选择性重建在大模型长历史上的质量边界；Agent 版本谱系如何与工具审计证据形成一致快照。这些是基于现有材料提出的问题，**并非已得到验证的结论**。
+
+## 参考资料与原始资料链接
+
+**论文（原始 arXiv）：**
+
+- [UlaCache](https://arxiv.org/abs/2610.29820)：Isaac Zhu 等，v1，2026-10-21 UTC。
+- [MLIPS](https://arxiv.org/abs/2610.27438)：Samkit Jain 等，v1，2026-10-20 UTC。
+- [RISK-KV](https://arxiv.org/abs/2610.29544)：Wang Yuekai，v1，2026-10-21 UTC。
+- [KPage](https://arxiv.org/abs/2610.28096)：Junwei Feng 等，v1，2026-10-20 UTC。
+- [HGM-Dual](https://arxiv.org/abs/2610.30042)：Sudipta Paul 等，v1，2026-10-21 UTC。
+- [Token-Energy Law](https://arxiv.org/abs/2610.28576)：Chenxu Niu 等，v1，2026-10-20 UTC。
+- [Correlated Failures](https://arxiv.org/abs/2610.29178)：Luca Zanolini，v1，2026-10-21 UTC。
+
+**官方代码变更（均于 2026-10-22 新开，未合并）：**
+
+- [SGLang #45886：InstantTensor 显存回收](https://github.com/sgl-project/sglang/pull/45886)。
+- [SGLang #45871：SM120 原生 FP8 KV](https://github.com/sgl-project/sglang/pull/45871)。
+- [vLLM #63195：MTP draft prefill attention 裁剪](https://github.com/vllm-project/vllm/pull/63195)。
+
+**核验边界。** 论文数字仅表述为作者报告；PR 数字仅表述为提交者测试；未将 arXiv 列表出现日期当作首次提交日期，也未将尚未合并的 PR 写成正式 Release。已检索 AgentPress 现有文章元数据，未发现上述论文的同题条目。
