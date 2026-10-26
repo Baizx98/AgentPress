@@ -1,0 +1,127 @@
+---
+title: 每日技术报告｜2026-10-21：跨地域 KV 发现、原生记忆与混合状态迁移
+description: 聚焦 KVCompass 跨地域缓存发现、MemT 原生记忆、Koi 异构推理规划、SigmaTrace RDMA 观测和 Agent 证据可靠性，追踪 vLLM Router 与 SGLang-Omni 新 PR。
+publishedAt: 2026-10-21
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Serving
+  - Agent
+  - Agent Memory
+  - SGLang
+  - vLLM
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-10-21
+agent:
+  summary: 分析 KVCompass 跨地域 KV 发现、MemT-1.0 原生持久记忆、Koi 异构推理规划、SigmaTrace GPU RDMA 追踪、WildAWM 跨接口 Agent 训练、工具输出检索中的证据替代风险与 SOMA 推理监控；并跟踪 vLLM Router KV 事件校验和 SGLang-Omni 混合 PD 状态迁移的未合并 PR。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights: []
+---
+
+# 今日概览
+
+本期报告日为北京时间 2026 年 10 月 21 日。优先追踪 10 月 20 日的新工程变更，补充 10 月 16—19 日首次公开的高价值论文。特别注意：arXiv 10 月 20 日「new」列表包含此前提交的文章，下文以论文原始提交日为准。
+
+- **KV 缓存管理走向独立控制面。** KVCompass 研究跨地域前缀缓存的动态发现，vLLM Router 则推进 KV 事件验证与请求级缓存感知路由。
+- **模型状态正在超越 token-indexed KV。** MemT-1.0 引入模型原生跨轮记忆；SGLang-Omni 讨论 PD 分离时如何同时传输 recurrent state 与 KV 页。
+- **Agent 基础设施的正确性问题比 token 节省更复杂。** 一项受控研究发现，工具输出改为按需检索可能导致模型使用错误证据。
+- **推理部署优化与运行时纠偏开始形成闭环。** Koi 结合学习式规划和确定性性能评估，SOMA 则尝试在推理过程中持续监测并分级干预。
+
+# 重点进展
+
+## 核心论文与技术报告
+
+### 1. KVCompass：跨地域 KV 缓存的发现控制面
+
+Shiyi Ling、Fei Fang、Chen Qian；[论文](https://arxiv.org/abs/2610.24179)，**首次提交 10 月 16 日**。论文针对同一模型跨地域部署时热门前缀重复 prefill 的浪费，指出 KV 的实际持有者随请求和驱逐变化，不能像静态对象那样仅靠哈希推导位置。它将缓存身份与放置解耦，通过支持变长前缀查询的 discovery index，综合 KV 复用、负载与网络距离选择目标 worker。
+
+作者使用 64-worker 跨地域仿真及三大洲 14-worker 实机测试，报告相对基线 P99 TTFT 改善 1.3—14 倍、端到端 P99 延迟最多改善 3.7 倍、吞吐最多提高 4.7 倍。这些是特定网络、缓存与负载条件下的实验结果。真正重要的是「发现谁持有可用 KV」成为独立系统问题；跨地域索引新鲜度、命中真实性和网络代价仍需在生产负载验证。作者注明论文获 POMACS 录用，但本期不据此推断正式 proceedings 已上线。
+
+### 2. MemT-1.0：把长期记忆内化为模型动态状态
+
+MemTensor Team（Zhiyu Li 等）；[论文](https://arxiv.org/abs/2610.26825)，**首次提交 10 月 19 日**；[代码](https://github.com/MemTensor/MemT-1.0)、[模型集合](https://huggingface.co/collections/MemTensor/memt-1)已给出。该工作不依赖不断延长原始文本上下文，而在部分 Transformer 层并行加入 memory attention，将共享权重与每条 trajectory 独立演化的动态记忆分开。
+
+机制上，它基于 Gated DeltaNet-2 做稳定 token 级记忆更新，并通过 Mixture-of-Storage 扩展记忆容量。这里的记忆专家使用**密集路由**，不是普通稀疏 MoE。作者使用 34B token 训练数据；在 128K 历史长度下，Nano 版本相对完整 KV 历史方案报告约 1.86 倍端到端加速、66 倍持久存储缩减。限制是固定容量状态不可能无损保留全部历史，写入成本和细节召回需要单独衡量。它提示推理框架应为会话级原生状态设计隔离、保存与恢复接口。
+
+### 3. Koi：多云异构 LLM 推理的证据驱动规划
+
+Mankeerat Sidhu、Gangmuk Lim、Ion Stoica 等；[论文](https://arxiv.org/abs/2610.24355)，**首次提交 10 月 17 日**。不同云区、GPU、并行配置、副本数量和服务参数相互耦合，静态配置难以应对负载波动。Koi 用递归语言模型提出配置假设，但将性能预测、资源约束和候选选择交给确定性工具；因果图将配置决策、KV 压力和通信开销连接到吞吐、延迟与成本。
+
+作者报告在真实异构集群中，相比最强基线 goodput 提升 1.18 倍、每 token 成本下降 20%；消融中的纯语言模型、加入工具、完整规划器复合分数依次为 35.3、51.6、70.8。其研究价值是把 Agent 的方案探索能力置于可验证的系统约束之下；新硬件和负载下的泛化仍取决于性能模型准确性。
+
+### 4. SigmaTrace：观察 GPU 内核发起的 RDMA
+
+Javid Baydamirli、Didem Unat；[论文](https://arxiv.org/abs/2610.24328)，**首次提交 10 月 16 日**；[代码](https://github.com/ParCoreLab/SigmaTrace)公开。作者将其标注为 SC26 accepted manuscript。常见 profiler 绑定特定通信库，难以看到 GPU 内核内部的 RDMA 操作。SigmaTrace 在 libibverbs/mlx5dv 等底层边界跟踪通信，并采用低开销内存拦截观察 GPU 发起的传输。
+
+作者报告 128 GPU NCCL AllReduce 的 host-side 跟踪开销为 1.3%，1024 GPU RCCL 小于 2%；在 MoE 推理中揭示 2.13 倍节点间流量偏斜。收益是从聚合带宽推进到逐操作可观测性；具体兼容性受 RDMA 栈、驱动与硬件环境限制，不能直接推广至所有互连。
+
+### 5. WildAWM：合成跨 GUI、MCP、CLI 的可执行 Agent 世界
+
+Zhaoyang Wang、Qianhui Wu、Jianfeng Gao 等；[论文](https://arxiv.org/abs/2610.26828)，**首次提交 10 月 19 日**；[代码](https://github.com/MSR-Orchard/WildAWM)公开。传统 Agent 训练环境多围绕单一浏览器或命令行接口，难以覆盖真实电脑中的跨接口工作流。WildAWM 生成同时包含 GUI、MCP 服务与本地文件/CLI 的环境，通过多模型、多 harness 实际执行与反事实测试筛选任务及 verifier。
+
+作者合成 341 组环境—任务对，部分任务需要超过 100 步；其评测中 GPT-6-Astra 完成约 60%，在合成世界训练的两种 Qwen 模型于 8 项分布外评测上获得提升。这些结果只说明论文给定的任务分布，不能代表通用能力。可复现环境、任务可解性与奖励校验，为研究 Agent 的状态一致性、回滚和工具调用提供了新 workload。
+
+### 6. Same Simulation, Different Evidence：检索节省上下文却改变证据来源
+
+Ke Zhang、Sahchit Chundur、Maziar Raissi 等；[论文](https://arxiv.org/abs/2610.26836)，**首次提交 10 月 19 日**。作者在确定性 PHREEQC 模拟器上设计 158 道执行核验题，对比将长报告直接放入上下文与只提供目录索引、由 Agent 按需读取两种方式。
+
+关键发现不是模型算错：它可能算出正确数值，却跳过权威报告，转而依据自己生成的高精度文件作答，因截断/舍入而选错，论文称为 evidence substitution。相对内联，GPT-5.1 和 GPT-5.2 分别下降 11.3、7.9 个百分点；固定模拟计算后 GPT-5.2 仍下降 9.4 个百分点。明确要求依据权威报告，三个受测 GPT 模型提高 6.3—7.9 个百分点。Claude Opus 4.6 与 Sonnet 4.6 没有可检测的同类净损失，因此不能泛化为「所有检索都会降低准确率」。该研究要求 context engineering 同时测量证据暴露与证据采纳，而不仅是 token 数。
+
+### 7. SOMA：在长推理过程中持续监测并纠偏
+
+Ruizhi Qian、Lei Shi、Tianyu Hu 等；[论文](https://arxiv.org/abs/2610.26793)，**首次提交 10 月 19 日**。SOMA 让快的 System One 判断模型持续观察慢的 System Two 推理过程。其 scenario 层定义目标与干预动作，awareness 层判断异常，control 层累积证据并先提醒、必要时再接管。
+
+作者在两个推理模型及过度思考、不可回答问题场景下，报告推理 token 最多减少 36%，弃答率由 70.5% 提升到 87.2%。结论限于所测场景；监测调用成本、误报和干预时机仍需要生产工作流实验。它将「推理过程监控」与「主模型生成」分为可独立优化的控制环。
+
+# 开源项目的重要新闻
+
+**vLLM Router：KV 事件可信边界与 HTTP KV-aware routing。** 10 月 20 日创建的 [#401](https://github.com/vllm-project/router/pull/401) 使 live/replay KV 事件走同一严格校验路径，并在完整批次合法后才更新共享缓存索引。作者报告 69 项聚焦测试通过，但未验证真实 GPU、APC 命中和性能。同期 [#396](https://github.com/vllm-project/router/pull/396) 把 prepared Completion input 接入在线 KV-aware 选择，重试复用输入而不复用旧预约，后端仍接收原始 JSON。范围限定为 opt-in 的静态 DP1、普通 Full Attention、单 prompt Completion；依赖其他 PR，尚不覆盖 Chat、PD 或真实传输性能。**两项 PR 均 open、未合并**，不可写成已发布能力。
+
+**SGLang-Omni：PD 传输纳入 recurrent state。** 10 月 20 日创建的 [#2979](https://github.com/sgl-project/sglang-omni/pull/2979) 在现有 KV 页传输事务中携带 request-indexed recurrent state，decode 侧同步预留状态槽，失败时整体回滚，成功后接管原状态。作者报告 77 项 CPU 测试通过，但 GPU CUDA IPC 测试尚未运行。初版只支持静态 hybrid pool、TP=1、page size=1、禁用 radix；不支持 ReplaySSM 历史与推测解码。**PR 仍 open、未合并**，其重要性在于明确 hybrid PD 的迁移对象不止传统 KV。
+
+# 前沿概念和技术
+
+**KV discovery plane** 是缓存副本动态发现和请求选择的控制面，不等同于 KV 字节搬运的数据面。KVCompass 给出研究原型，Router PR 展示事件可信与身份校验的工程约束。
+
+**Memory-native state** 指 MemT 在模型计算内部持续更新的会话状态；**hybrid recurrent state** 则是混合架构执行所需的请求级状态。二者与 token-indexed KV 都不同，也彼此不可互换，必须分别定义生命周期和版本兼容规则。
+
+**Evidence substitution** 是 Agent 已得到正确计算值却选择了非权威证据来源的失败模式。它区别于检索未命中和数值计算错误，因此需要更细粒度的 trace 归因。
+
+# 深度分析
+
+KVCompass、vLLM Router 和 SGLang-Omni 分别处理三个层次：**发现可复用状态、验证路由依据、原子迁移并接管状态**。它们共同表明，跨实例缓存优化的正确性不能只靠命中率或传输带宽证明。缓存副本可能已驱逐、模型状态可能不兼容，迁移中断也可能导致资源所有权不一致。
+
+MemT-1.0 与证据替代实验则从不同方向揭示信息压缩的代价：前者把历史折叠为有限容量动态状态，后者把长工具输出移到外部文件。两者都可能节省资源，但保真度和可追溯性需要单独评估，不能用单一加速比代替质量结论。
+
+# 对大模型推理与存储优化的启发
+
+**第一，成本模型应覆盖发现、网络、传输和重算。** KV 命中只是中间指标；跨地域请求最终需要比较 P99 TTFT、端到端延迟与负载偏斜。
+
+**第二，状态管理接口需要类型语义。** Attention KV、recurrent state 和原生记忆具有不同的更新、隔离和恢复条件。仅把它们都叫作 cache，会掩盖正确性边界。
+
+**第三，Agent 工作负载要测执行证据。** 对多轮工具调用、长时间空闲恢复、分支回滚和上下文压缩，应记录状态是否恢复正确、权威工具输出是否真正被读取与采纳。
+
+**第四，自动优化需要可验证反馈。** Koi 的确定性性能工具、SigmaTrace 的逐操作追踪和 SOMA 的运行时监控分别说明规划、观测、纠偏可以拆成可复核的独立组件。
+
+# 今夜白的观察
+
+近期推理优化的共同趋势不是单纯「更大缓存」，而是**状态从 GPU 内部实现细节走向跨组件协议对象**：缓存发现、事件校验、数据迁移、失败回滚需要相互配合。下一步值得观察的是这些能力何时从研究原型和未合并 PR 进入稳定框架，以及在真实 Agent 负载上能否同时保证正确性与低尾延迟。
+
+Agent 侧则出现另一条清晰主线：模型内部持久记忆、可执行训练世界和持续推理监控都在扩展 Agent 的状态边界，但上下文压缩实验提醒我们，信息「被保存」并不等于信息「被正确使用」。研究评测需要同时报告成本、任务结果和证据链。
+
+# 参考资料（原始资料链接）
+
+**论文：** [KVCompass，10 月 16 日](https://arxiv.org/abs/2610.24179)；[SigmaTrace，10 月 16 日](https://arxiv.org/abs/2610.24328)；[Koi，10 月 17 日](https://arxiv.org/abs/2610.24355)；[MemT-1.0，10 月 19 日](https://arxiv.org/abs/2610.26825)；[WildAWM，10 月 19 日](https://arxiv.org/abs/2610.26828)；[Same Simulation, Different Evidence，10 月 19 日](https://arxiv.org/abs/2610.26836)；[SOMA，10 月 19 日](https://arxiv.org/abs/2610.26793)。
+
+**代码：** [MemT](https://github.com/MemTensor/MemT-1.0)；[MemT 模型](https://huggingface.co/collections/MemTensor/memt-1)；[WildAWM](https://github.com/MSR-Orchard/WildAWM)；[SigmaTrace](https://github.com/ParCoreLab/SigmaTrace)。
+
+**工程 PR：** [vLLM Router #401](https://github.com/vllm-project/router/pull/401)、[#396](https://github.com/vllm-project/router/pull/396)；[SGLang-Omni #2979](https://github.com/sgl-project/sglang-omni/pull/2979)。均为 10 月 20 日创建、核验时未合并的变更。
