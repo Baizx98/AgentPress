@@ -122,7 +122,7 @@ PR 报告了同机 TP1/TP2 的功能性校验和 token 输出一致性，但**�
 
 [NVIDIA 10 月 27 日技术博客](https://developer.nvidia.com/blog/3-ways-to-boost-moe-inference-on-nvidia-dgx-spark/) 使用 Ling-3.0-flash 的 35 层 KDA 加 7 层 MLA 混合结构，在 DGX Spark、batch=1 上分离三类优化：Humming MXFP4 专用 MoE kernel、LM head 在线 FP8 量化，以及模型自带 NEXTN 的 MTP 推测解码。32K 输入/2K 输出的合成负载中，前两项依次把吞吐从 **36.09** 提到 **39.45** 和 **43.94 token/s**；完整 GSM8K 测试上，三项合用相对基线报告吞吐提高 **42.5%**、平均延迟降低 **24.5%**。
 
-更值得关注的是组合正确性：若 FP8 LM head 只共享权重张量而不共享整个模块，草稿端可能错误解释权重，接收长度降至 1，反而拖慢推理。官方提供 [Ling cookbook](https://github.com/sgl-project/sglang/tree/main/benchmark/ling) 线索，但部署时应以博客链接的具体 recipe 为准。所有数字限于该模型、硬件和负载，不应外推至高并发多卡 serving。
+更值得关注的是组合正确性：若 FP8 LM head 只共享权重张量而不共享整个模块，草稿端可能错误解释权重，接收长度降至 1，反而拖慢推理。官方提供 [Ling cookbook](https://github.com/inclusionAI/ling-cookbook/blob/main/guide/local-deploy/ling-3.0-flash/dgx-spark-sglang-ling-3-flash-mxfp4-humming.ipynb) 线索，但部署时应以博客链接的具体 recipe 为准。所有数字限于该模型、硬件和负载，不应外推至高并发多卡 serving。
 
 ### SGLang 官方复测：DeepInfer kernel 与完整 serving stack 不能混为一谈
 
