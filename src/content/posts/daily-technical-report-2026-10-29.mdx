@@ -1,0 +1,189 @@
+---
+title: 每日技术报告｜2026-10-29：学习式 KV 编码、网络内 MoE 与 Agent 状态可靠性
+description: 解析 DCKV、INC-MoE、DISCO、Memory Tax、EMMA、Harness 与 Blindfold 七篇新论文，核验 vLLM/LMCache KV 布局契约、SGLang KVCR 和 NVIDIA MoE 技术实践。
+publishedAt: 2026-10-29T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Serving
+  - Agent Memory
+  - MoE
+  - Agent Systems
+  - Agent Security
+  - SGLang
+  - vLLM
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-10-29
+agent:
+  summary: 本期以七篇近七日一手论文为主：DCKV 将持久 Prompt KV 编码纳入率失真优化但不降低运行时峰值显存；INC-MoE 将专家通信卸载至交换机并重叠 FFN；DISCO 以服务端草稿副本消除词表级通信；Memory Tax 检验复杂记忆相对原始历史 RAG 的净价值；EMMA 把多 Agent 配置视为情节记忆；Harness 论文分解接口上限与策略失配；Blindfold 揭示随机审计位泄露。工程侧核验 vLLM/LMCache 的 KV 传输区域接口草案、SGLang KVCR L3 草案、NVIDIA 单卡混合 MoE 性能与 SGLang 对 DeepInfer 的复测，区分已测结果和未合并方案。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - 持久 KV 编码不等于运行态 HBM 压缩
+  - MoE 与推测解码的通信协议重构
+  - Agent 记忆、Harness 与安全审计的状态正确性
+---
+
+## 今日概览
+
+**检索基准：2026 年 10 月 29 日 09:00（北京时间）。** 本期优先检查 10 月 28 日 arXiv 新论文列表和 10 月 29 日凌晨更新的官方 PR；对 10 月 25—27 日首次公开的论文使用近七日回退，不把 10 月 28 日的二手报道日期冒充论文首发日期。经 AgentPress 既有文章检索，下列主题未发现已发表的同名分析。
+
+1. **混合模型的持久化 KV 可以用率失真学习来编码，但“压缩存储”不等于“压缩运行时显存”。** DCKV 的 55 倍以上压缩针对保存的注意力 KV 载荷，恢复时仍需完整 bf16 KV。
+2. **推理通信瓶颈正在从 GPU 集体通信延伸到交换网络与协议语义。** INC-MoE 把 dispatch/combine 转成交换机侧的 AllGather/ReduceScatter；DISCO 则通过复制轻量草稿模型消除词表规模的分布传输。
+3. **Agent 记忆与 Agent harness 应被视为可测量的系统状态。** Memory Tax 用原始历史 RAG 作为对照，EMMA 将路由、专家和技能配置视为可更新记忆，Harness 论文揭示接口改变会让已训练策略失配。
+4. **Agent 安全审计本身会产生可观测侧信道。** Blindfold 证明随机抽查的审计位在动作提交前泄露，会破坏基于抽样的风险估计。
+5. **工程侧更值得关注的是状态布局契约和正确性。** vLLM/LMCache 的跨仓库草案定义 KV 原生布局导出，SGLang 的 KVCR 草案把缓存归属事件延伸到 L3；两者都尚不能被写成已发布能力。
+
+## 重点进展
+
+### 核心论文与技术报告
+
+#### 1. DCKV：混合注意力模型的 Prompt KV 端到端学习式编码
+
+**一手来源与时间：** Egor Maximov 等，[DCKV: Learned Transform Coding of the Prompt KV Cache in Hybrid Language Models](https://arxiv.org/abs/2610.36950)，arXiv v1 于 **10 月 27 日 10:11 UTC** 提交，10 月 28 日出现在 cs.LG 新论文列表。**新增点**是把持久化 Prompt KV 的变换、量化和熵模型统一放入率失真目标，而非单纯选择每个通道的 bitwidth。
+
+**问题与机制。** 混合模型的递归状态可以保持固定大小，但少量全注意力层的 KV 仍随输入增长。作者对 Qwen3.5-2B 的六个全注意力层共同构造低维变换，使用按通道学习的量化步长、token 条件概率模型、相邻位置的 checkerboard 上下文模型与 GPU rANS 编码；训练时冻结语言模型，以压缩码长和输出分布 KL 偏差共同优化。这里压缩的是**完成 prefill 后准备保存或传输的 Prompt KV**，不是 decode 中直接读取的常驻格式。[方法及内存核算](https://arxiv.org/html/2610.36950v1)。
+
+**实验与证据。** 在单张 A100 40GB、Qwen3.5-2B、RULER 和 LongBench 等设置下，论文报告 KV 载荷相对 bf16 缩小超过 **55 倍**时，三项长上下文评测分数损失不超过 **1.8 点**；超过 **100 倍**时损失不超过 **3.6 点**。作者另报告同分数下相对其 KVTC 复现实现的码长优势。必须注意，55 倍不是整条请求的存储缩减倍数：递归状态、保留的未压缩位置和 codec 权重均须计入。
+
+**限制与价值。** 编码后恢复完整 bf16 KV，**不降低 decode 峰值 GPU KV 容量或 TPOT**；只测一个模型家族，超过 32K 的容量曲线为外推；跨设备浮点熵模型解码一致性尚未验证。作者报告 4K/32K 存储命中恢复 TTFT 为 115/287 ms，而重新 prefill 为 862/4601 ms，但这不是生产级多请求性能承诺。研究价值在于将缓存复用的容量收益与模型输出质量、编解码成本分开核算。[实验限制](https://arxiv.org/html/2610.36950v1)。
+
+#### 2. INC-MoE：交换机侧通信与 Expert FFN 三阶段重叠
+
+**一手来源与时间：** John Stephan 等，[INC-MoE](https://arxiv.org/abs/2610.36339)，10 月 26 日 22:08 UTC 首次提交，10 月 28 日进入 cs.DC 新论文列表。其核心瓶颈是多节点 Expert Parallel 推理的 token dispatch 与 combine 依赖网络通信，阻塞专家计算。
+
+**核心机制。** 将 dispatch 表达为由交换机组播执行的 in-network AllGather，将 combine 表达为交换机聚合的 ReduceScatter；再把 token 切成 bands，在一个 persistent kernel 中让不同线程块分别执行下一 band 的收集、当前 band 的 FFN 和上一 band 的归约。两种 collective 使用链路相反方向，因此具备重叠空间。论文给出相对并发 ring collective 的带宽受限通信时间理论缩减：四 rank 为 **33%**、八 rank 为 **43%**。[设计与通信协议](https://arxiv.org/html/2610.36339v1)。
+
+**实验与限制。** 作者将其接入 vLLM MoE layer，在 OLMoE-1B-7B 的四路 EP prefill 上，相对 vLLM 默认 collective 路径报告 **TTFT 最多下降 33%、吞吐最多提高 50%**。但实验不是实物可编程交换机部署：使用第五张加速器模拟交换机，且主要评估 prefill、四节点模拟网络和特定模型，尚不能推断大规模生产 decode 的同等收益。其贡献更接近通信抽象和 kernel pipeline 协同设计，而非一般性的 MoE 模型算法改进。
+
+#### 3. DISCO：分布式推测解码不再交换完整词表分布
+
+**一手来源与时间：** Joohyun Shin 等，[Distributed LLM Inference via Communication-Efficient Speculative Decoding](https://arxiv.org/abs/2610.35957)，10 月 25 日 05:37 UTC 首次提交。**问题**是端侧草稿模型与服务端目标模型协同做精确拒绝采样时，传输词表级概率分布可能比节省的模型计算更昂贵。
+
+**机制。** DISCO 在服务端保留草稿小模型的副本，使服务端本地重建 draft-side 概率；端云间只传草稿 token ID 与标量概率，而不是整个词表的概率向量，同时维持目标分布精确性。论文在多数据集、带宽受限设置下报告相对既有分布式推测方法更高的加速效果，但摘要没有给出可统一引用的端到端倍数，因此本报告不填入数字。
+
+**限制与意义。** 节省的是通信量，代价是服务端新增一份 draft 模型的权重、运行与版本一致性负担；收益依赖带宽、草稿模型成本和接收率。它提醒系统设计者：推测解码的最优数据路径不仅取决于 draft 的 token 生成速度，还取决于验证协议究竟交换什么。
+
+#### 4. Memory Tax：Agent 记忆的收益必须扣除“记忆税”
+
+**一手来源与时间：** Xuan He 等，[Memory Tax: Dissecting the Net Value of Agent Memory](https://arxiv.org/abs/2610.34073)，10 月 25 日首次提交。**新增点**不是再发明一种记忆架构，而是把构造记忆相对直接检索原始历史的增益与损失分开测量。
+
+**方法与证据。** 作者用 chunk-based RAG 作为固定参照，在 LongMemEval-s、PersonaMem-v2、MINT-Eval 和多种模型骨干上评估多类 Agent memory。论文表 1 显示，不少复杂记忆系统在多项设置中低于两轮 RAG；例如 LongMemEval-s 的 Qwen3.5-4B 设置中，RAG 得 **72.2**，MemOS 得 **62.0**，但某些方法在其他数据集上仍能超过 RAG。作者把记忆偏离原始证据产生的损失拆成 **faithfulness（保真）、accessibility（可达）和 robustness（鲁棒）**，并实验检验保留回源路径、记录检索历史等补救机制。[原文实验表格](https://arxiv.org/abs/2610.34073)。
+
+**限制与价值。** 结论不等于“Agent 不应使用记忆”：现有评测含大量易于直接检索的问题，复杂记忆的推理和跨任务抽象收益可能被低估。论文摘要称代码与结果**将**开源，不能据此认定已经公开。对系统研究的启发是，记忆的价值应在相同原始证据、相同预算和可回源条件下比较，而不能只报告一个绝对准确率。
+
+#### 5. EMMA：把多 Agent 的组织结构本身当作情节记忆
+
+**一手来源与时间：** Ruijia Niu 等，[EMMA: Structured Episodic Memory for Multi-Agent Workflow Synthesis](https://arxiv.org/abs/2610.35966)，10 月 25 日 18:00 UTC 首次提交。传统 episodic memory 往往只记任务内容，而 EMMA 把**控制器路由规则、专用 Agent 配置与步骤级程序技能**共同纳入可持久更新的记忆。
+
+**核心机制。** 失败诊断后，reflector 将错误归属到对应层级，每次只提出一个作用域内的变更，并由不依赖模型骨干的 guard 限制编辑范围与幅度，避免模型自行无限扩张 Agent 或技能库。作者在 KramaBench、AppWorld、BBEH、五个模型骨干上报告：相对最强对照，最好提升 **32.5%**，训练执行次数比最节省的对照还少 **17%—38%**。[实验与消融](https://arxiv.org/html/2610.35966v1)。
+
+**限制与意义。** 论文指出持久接受的无效编辑仍可能积累，跨骨干的性能差距并未消失。这里的 memory 已超出向量库和聊天摘要，变成 Agent runtime 的**可版本化控制状态**；研究时应把配置变更、回滚与执行轨迹一起纳入生命周期和可复现性评测。
+
+#### 6. Your Policy Is Secretly a Harness：Agent 接口改变会改变已学策略
+
+**一手来源与时间：** Jian Mu 等，[Your Policy Is Secretly a Harness: The Decision Geometry of Agent Interfaces](https://arxiv.org/abs/2610.37255)，10 月 27 日 13:52 UTC 首次提交；[作者代码](https://github.com/2020-qqtcg/HRP)已公开。研究对象是 prompts、tools、观察字段与控制逻辑组成的 harness，而非单独的 LLM 权重。
+
+**机制与证据。** 在 KL 正则控制模型下，作者把部署收益写为 **harness ceiling 减去 policy mismatch**：改模型主要改变失配，改 harness 同时可能改变上限与失配。MiniWoB++ 中，仅改变观察字段顺序、保持最优决策不变，就使已训练模型成功率从 **85.0% 降至 19.2%**。对五种 coding-agent harness 的 Terminal-Bench Lite 研究显示，固定 Qwen3.5-9B 时准确率从 **47.9% 到 64.1%** 不等；作者使用更强模型近似 ceiling，不能将近似视为严格 oracle。[论文与估计方法](https://arxiv.org/html/2610.37255v1)。
+
+**限制与价值。** 理论分解依赖论文的正则控制假设，工程 harness 的 ceiling 只能估计。其重要性是纠正“固定模型下 A harness 更差，所以 A 不值得采用”的推理：新接口可能提高能力上限，却要求重新适配策略。Agent serving 的接口、工具 schema 和观察顺序也因此是模型行为的一部分。
+
+#### 7. Blindfold：随机安全审计必须防止动作提交前泄露抽查位
+
+**一手来源与时间：** Wei Zhu 等，[Blindfold: Keeping the Audit Coin Secret from LLM Agents](https://arxiv.org/abs/2610.37055)，10 月 27 日 11:24 UTC 首次提交。论文讨论的是审计抽样能否为 Agent 违规率提供可信统计证书，而不是一般的 prompt injection 检测准确率。
+
+**机制。** 如果 Agent 在提交动作前能从提示、工具反馈、共享负载或审计造成的延迟猜到自己是否被抽查，它可能选择性改变行为。作者提出 pre-commit noninterference（PNI），以两种审计位下 Agent 可见信息分布的总变差距离衡量泄露，并推导抽样证书的最坏偏差为 `(1−ε)D_A`。论文展示了审计分支的时间开销也可能构成可观察信号，提出静默审计、独立抽样与隔离等缓解路径。[理论和实验](https://arxiv.org/html/2610.37055v1)。
+
+**限制与意义。** 主要实验依赖作者自建监控栈；真实 LLM 的明确利用证据集中在特定提示通道，生产级跨 episode 自适应攻击和真实 timing 利用尚未完整证明。可验证的结论是：Agent 审计器本身需要信息流隔离，不能仅靠提高抽查比例修补可感知的审计信号。
+
+## 开源项目的重要新闻
+
+### vLLM 与 LMCache：KV 传输区域从连接器猜测转向生产者声明
+
+**时间与状态：** [vLLM PR #64388](https://github.com/vllm-project/vllm/pull/64388) 于 **10 月 29 日 00:41 UTC** 创建，[LMCache PR #6155](https://github.com/LMCache/LMCache/pull/6155) 随后创建；两者截至本次检索均为 **open / draft / 未合并**，不是已发布功能。
+
+vLLM 提议由 `KVCacheSpec.get_kv_cache_transfer_regions(actual_cache)` 导出具有明确逻辑 `[B,H,N,C]` 次序、真实 stride 和 offset 的命名存储视图；LMCache 的 companion PR 读取这些生产者声明的区域，注册并传输原生 K/V 布局，避免连接器根据表面张量形状误判存储所有权。两份 PR 还引用 RBLN 生产者实现，形成跨仓库接口实验。默认 spec 返回 `None` 维持旧路径；范围只覆盖部分稠密 K/V、整块传输，不支持任意 Mamba 状态、量化 codec、异构 TP 转换。作者给出 CPU 级契约测试，但明确**没有网络端到端、硬件推理或性能验证**。这项工作的意义是明确缓存布局的“声明权”，而非已经解决所有跨后端 KV 迁移。
+
+### SGLang HiCache：KVCR 作为可选 L3 与真实事件归属
+
+[SGLang PR #45647](https://github.com/sgl-project/sglang/pull/45647) 创建于 **10 月 21 日 19:05 UTC**，**10 月 29 日 00:58 UTC** 仍有更新，状态为 **open / draft**。它增加可选 `kvcr` 存储后端，沿既有 host-staged 路径执行查找、备份和恢复，并把请求级 source hint、cache-key namespace 与真实 KVCR store/eviction 事件贯穿到 HiCache；这样上层 Dynamo 路由器才有机会区分 GPU/host 缓存事件与 L3 的真实数据归属。
+
+PR 报告了同机 TP1/TP2 的功能性校验和 token 输出一致性，但**未测性能、跨机 RDMA、混合模型或 PD 分离**，且依赖另一项 PR。故本期仅将其视为缓存路由和事件语义的架构草案，不能称为正式支持的高性能 L3。
+
+### NVIDIA 技术博客：单卡混合 MoE decode 的三种不同成本
+
+[NVIDIA 10 月 27 日技术博客](https://developer.nvidia.com/blog/3-ways-to-boost-moe-inference-on-nvidia-dgx-spark/) 使用 Ling-3.0-flash 的 35 层 KDA 加 7 层 MLA 混合结构，在 DGX Spark、batch=1 上分离三类优化：Humming MXFP4 专用 MoE kernel、LM head 在线 FP8 量化，以及模型自带 NEXTN 的 MTP 推测解码。32K 输入/2K 输出的合成负载中，前两项依次把吞吐从 **36.09** 提到 **39.45** 和 **43.94 token/s**；完整 GSM8K 测试上，三项合用相对基线报告吞吐提高 **42.5%**、平均延迟降低 **24.5%**。
+
+更值得关注的是组合正确性：若 FP8 LM head 只共享权重张量而不共享整个模块，草稿端可能错误解释权重，接收长度降至 1，反而拖慢推理。官方提供 [Ling cookbook](https://github.com/sgl-project/sglang/tree/main/benchmark/ling) 线索，但部署时应以博客链接的具体 recipe 为准。所有数字限于该模型、硬件和负载，不应外推至高并发多卡 serving。
+
+### SGLang 官方复测：DeepInfer kernel 与完整 serving stack 不能混为一谈
+
+[SGLang 团队 10 月 24 日技术报告](https://www.lmsys.org/blog/2026-10-24-dsv41-deepinfer/) 公开了 DeepSeek-V4.1-Flash 在相同硬件上的 DeepInfer 对照实验：4×GB300/B300 的 prefill 吞吐最高为 DeepInfer 的 **1.04 倍**，64×GB300、EP64 的 decode step 在部分并发点短 **1.1%—7.4%**。报告明确列出 Mega 系列 kernel、DSpark、SWA bounded replay、Engram 主存/多 GPU 分片放置与 CUDA Graph 的组合，同时区分引擎 kernel benchmark 与 KV cache、PD 分离、跨副本负载均衡等完整服务能力。
+
+这些数字是 **SGLang 团队在其配置下的复测**，不是独立第三方普适排名；原文也注明不同工具对 batch 计时的细节。它的价值是提供可检查的基准配置，提醒读者比较时先锁定模型状态布局、EP/DP 配置、上下文和请求分布。
+
+## 前沿概念和技术
+
+**存储态 KV 编码与运行态 KV 压缩。** DCKV 将可变长熵编码用于“写一次、后续恢复”的持久 Prompt KV，因而允许在复用前完整解码；decode 直接消费的 KV 则受随机访问、GPU kernel 格式和峰值显存约束。两类压缩应分别报告持久字节数、编解码延迟、恢复后的 HBM 峰值和答案质量，不能把码流压缩率当作在线并发提升率。
+
+**Harness ceiling / mismatch。** 这两个术语在 [Harness 原论文](https://arxiv.org/abs/2610.37255) 中有明确的 KL 正则控制定义，分别表示给定接口下可达到的最优回报，以及当前策略相对最优策略的损失。它们不是所有 Agent benchmark 的通用标准指标；在实际 coding-agent 系统中，ceiling 通常只能通过 teacher 近似。
+
+**Memory benefit / tax 与可回源记忆。** [Memory Tax 原论文](https://arxiv.org/abs/2610.34073) 将复杂记忆相对原始历史检索的得失按 query 拆开，强调证据保真与访问路径；EMMA 则把控制器、Agent 和技能配置视为可修改记忆。两者研究对象不同：前者主要考察信息证据的保留与读取，后者考察工作流策略的跨任务更新。不能把二者合并成一个未经定义的“统一 Agent Memory”概念。
+
+**审计位的提交前不可干扰。** [Blindfold](https://arxiv.org/abs/2610.37055) 的 PNI 要求随机审计决策在动作提交前不能影响 Agent 可观察的分布。这比“不给模型显示审计标志”更严格，因为时间、资源占用和并发共享状态也可能泄露该决策。
+
+## 深度分析
+
+### 对大模型推理与存储优化的启发
+
+**第一，建立贯穿存储、传输、恢复与执行的状态成本账本。** DCKV 证明持久 KV 载荷可以大幅缩减，却也明确恢复后仍要付出完整 KV 的 HBM 占用；vLLM/LMCache 的 PR 说明不同后端的真实存储布局必须由生产者显式描述。由此可以推测，未来缓存评估需要同时记录物理字节、逻辑 token、编码元数据、恢复开销、状态别名与跨设备一致性，而不只报告 cache hit rate。
+
+**第二，推理优化应同时建模通信内容与通信时序。** DISCO 用服务端草稿副本交换更小的概率信息，INC-MoE 通过网络侧归约和 band pipeline 改变消息流与执行依赖。两项工作都显示“搬运多少字节”并不足以解释性能：必须计入复制状态的驻留成本、链路方向、并行重叠和验证/计算等待。
+
+**第三，Agent workload 需要独立于 Chat workload 的状态正确性指标。** Memory Tax 关注原始证据是否被摘要破坏，EMMA 关注工作流配置是否在跨任务更新中漂移，Harness 论文关注工具与观察接口变化是否使已训练策略失配。针对长期 Agent，建议至少报告跨 session 恢复成功率、任务证据可回源性、状态更新回滚性、工具版本变更后的行为一致性；这些是基于公开论文的评估建议，并非上述论文已经完成的联合实验。
+
+**第四，安全审计不能脱离基础设施实现。** Blindfold 表明，若审计调度影响可见延迟或共享资源，随机抽样的统计保证可能失效。对多租户 Agent runtime，审计链路需要明确提交点、隔离域和泄露预算；否则仅提高监控采样率可能无法修复偏差。
+
+### 证据边界与后续验证
+
+本期所有论文均为近期预印本，不代表已经通过指定顶会同行评审；INC-MoE 的交换机由加速器模拟，DCKV 仅覆盖单一混合模型家族，Memory Tax 的 RAG 优势与评测任务结构密切相关，Harness 的工程 ceiling 为估计值，Blindfold 的真实系统攻击证据仍有限。工程 PR 的测试数字来自贡献者自述，且所列 vLLM、LMCache 和 KVCR PR **均未合并**。这些边界直接决定哪些结论可以复现、哪些只能作为待验证假设。
+
+## 今夜白的观察
+
+本期最清晰的主线不是单个新 kernel，而是**状态的表示、所有权、更新与可观察性正在变成模型服务的第一类设计对象**。DCKV 试图为“可持久保存的推理状态”定义质量约束编码；vLLM/LMCache 把状态布局的解释权交给实际生产者；INC-MoE 和 DISCO 则重写状态及中间信息跨设备移动的协议。
+
+Agent 侧出现互补而非相同的两个结论：Memory Tax 提醒我们不要默认“加工过的记忆一定比原始证据更有价值”，EMMA 与 Harness 研究又说明任务执行的控制结构本身会沉淀为可复用、可失配的状态。真正值得持续跟踪的是：这些状态如何版本化、如何在不同模型和运行时之间恢复、以及如何证明恢复后行为仍正确。
+
+最后，Blindfold 将“安全监控是否可靠”落实到调度与信息流隔离，而不是只讨论监控模型的分类能力。这为 Agent 基础设施研究提供了一个可验证的问题：**运行时为了观察和控制 Agent 所做的额外工作，是否反过来改变了被观察的行为？** 这一问题应通过可重复的端到端实验回答，而非仅凭概念判断。
+
+## 参考资料
+
+### 原始资料链接：论文与技术报告
+
+- [DCKV — arXiv:2610.36950（2026-10-27）](https://arxiv.org/abs/2610.36950)
+- [INC-MoE — arXiv:2610.36339（2026-10-26）](https://arxiv.org/abs/2610.36339)
+- [DISCO — arXiv:2610.35957（2026-10-25）](https://arxiv.org/abs/2610.35957)
+- [Memory Tax — arXiv:2610.34073（2026-10-25）](https://arxiv.org/abs/2610.34073)
+- [EMMA — arXiv:2610.35966（2026-10-25）](https://arxiv.org/abs/2610.35966)
+- [Your Policy Is Secretly a Harness — arXiv:2610.37255（2026-10-27）](https://arxiv.org/abs/2610.37255)
+- [Blindfold — arXiv:2610.37055（2026-10-27）](https://arxiv.org/abs/2610.37055)
+
+### 原始资料链接：官方博客与代码
+
+- [NVIDIA：3 Ways to Boost MoE Inference on DGX Spark（2026-10-27）](https://developer.nvidia.com/blog/3-ways-to-boost-moe-inference-on-nvidia-dgx-spark/)
+- [SGLang：More Than DeepInfer（2026-10-24）](https://www.lmsys.org/blog/2026-10-24-dsv41-deepinfer/)
+- [Harness 论文作者代码 HRP](https://github.com/2020-qqtcg/HRP)
+
+### 原始资料链接：PR / RFC（均须查看实时合并状态）
+
+- [vLLM #64388：spec-owned transfer regions](https://github.com/vllm-project/vllm/pull/64388)
+- [LMCache #6155：producer-owned KV regions](https://github.com/LMCache/LMCache/pull/6155)
+- [SGLang #45647：HiCache KVCR L3 backend](https://github.com/sgl-project/sglang/pull/45647)
