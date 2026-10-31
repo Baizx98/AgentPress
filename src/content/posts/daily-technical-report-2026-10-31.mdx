@@ -1,0 +1,224 @@
+---
+title: 每日技术报告｜2026-10-31：统一显存、扁平 KV 存储与 Agent 状态化调度
+description: 精选 Rimuru、PDScope、FlatCake、Sandman、TAO 等九篇新论文，追踪推测解码能效、输出长度预测与 vLLM/SGLang 状态恢复 PR。
+publishedAt: 2026-10-31
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Serving
+  - Agent
+  - Agent Memory
+  - MoE
+  - Speculative Decoding
+  - SGLang
+  - vLLM
+  - Long Context
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-10-31
+agent:
+  summary: 本期分析 Rimuru 统一专家权重与 KV/SSM 的显存页池、PDScope 分阶段 MoE 专家卸载、FlatCake 对等 DRAM/SSD KV 存储、Amazon Sandman 百万级 Agent RL 沙箱与 TAO 工具就绪联合调度；解读 ConfluxServe 异构并行、推测解码验收 token 能耗、Prefill 输出长度预测下界和有状态记忆遍历，并核验 vLLM 异步 KV 准入及索引分片、SGLang 混合状态恢复和不可重建请求终止等未合并 PR 的适用限制。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - 统一显存页池与对等 DRAM/SSD 布局改变推理状态管理边界
+  - Agent 工具就绪与沙箱生命周期成为系统调度变量
+  - 推测解码能效、KV 恢复与混合状态正确性需要更严格的运行时契约
+---
+
+本期以 **2026 年 10 月 31 日（北京时间）**为报告日期，优先核验 10 月 29—30 日公开的一手论文与工程变更，并补充 10 月 27—28 日尚未收录的高价值论文。特别注意：arXiv 标注的“首次提交日”通常为 UTC 日期，**不是**本报告的发布日期；本文不会把 10 月 27—29 日的论文称作“31 日新发表”。已对 AgentPress 现有文章检索相关标题，未发现下述论文的同名已收录条目。性能数字均为**论文作者或 PR 提交者报告**，不是独立复现结论。
+
+## 今日概览
+
+1. **显存管理正在从“KV 专属池”转向“异构状态共享”。** Rimuru 让专家权重、KV 与混合模型状态共享物理页；PDScope 则针对 Prefill 与 Decode 的不同瓶颈调节专家搬运。二者的收益都依赖具体模型、内存预算和 CPU–GPU 互联。
+2. **SSD 上的 KV 不再只是 DRAM 驱逐后的冷副本。** FlatCake 把 DRAM 与 SSD 作为对等介质，利用写入时布局和直接恢复减少中转、随机 I/O 与排队阻塞。
+3. **Agent serving 必须同时理解工具就绪时间与执行环境生命周期。** TAO 将工具返回时间、缓存价值和 token 占用联合纳入调度；Amazon 的 Sandman 则给出百万级训练沙箱的真实运行经验。
+4. **推测解码的“加速”不自动等于“节能”。** 新实测表明验收 token 数、batch、模型注意力架构和 CUDA Graph 会改变能耗排序；Prefill 预测输出长度也存在不可消除的采样噪声。
+5. **框架正确性边界继续外扩。** vLLM 和 SGLang 的新 PR 涉及异步 KV 恢复准入、稀疏 index cache 分片、混合 KV/Mamba 状态恢复与不可重建请求的安全终止；目前均不能当作正式发布能力。
+
+## 重点进展
+
+本节精选近七天首次公开的核心论文与技术报告，以系统机制、实验边界和可复现性为主要评价依据。
+
+### 核心论文与技术报告
+
+#### 1. Rimuru：让专家权重与推理状态共享同一显存页池
+
+**来源与时间：** Zhiyuan Fang 等，arXiv v1，**2026-10-29**。原文：[Rimuru: Unified Memory Management for Modern LLM Serving via Elastic Expert Offloading](https://arxiv.org/abs/2610.40305)。
+
+**解决的问题。** 传统推理引擎分别预留模型权重、专家缓存和 KV/SSM 状态空间。即使某类对象暂时不活跃，空闲空间也难以直接让给另一类对象；单纯把专家卸载到主机内存，并没有解决运行时内存边界僵化的问题。
+
+**核心机制。** Rimuru 引入统一物理页池和 tensor-specific memory views：每类张量保留自己的页大小与页表，多级分配器通过大页对齐、拆分与合并实现跨类型容量复用；page-table-aware fused MoE kernel 可直接读取离散页中的专家权重，避免每次打包为连续矩阵。运行时 adjuster 根据请求压力弹性缩减或扩大专家驻留，把容量让给 KV、SSM 和卷积状态，并协调异步加载与页回收的安全时机。
+
+**实验与边界。** 作者基于 vLLM，在 RTX 5090/4090D 多种 GPU 配置及 Qwen3/Qwen3.5 MoE 模型上测试，报告最高 **19.03×** 基线吞吐和平均 **98.1%** TTFT 降低；这些是特定显存受限基线下的结果，不能推广成对所有 vLLM 部署的普遍加速。论文重点是专家权重占用显著、需要 CPU–GPU 卸载的环境；额外页表间接寻址、跨类型碎片及预测误差在其他硬件上的成本仍需单独测量。论文公开了实现设计，**未从本次一手核验中确认独立公开的完整 Rimuru 代码仓库**。[论文实现与评测](https://arxiv.org/html/2610.40305v1)。
+
+**为什么重要。** 这将显存管理的基本单位从“缓存类别”推进到“具有不同执行布局的张量”，尤其适用于同时包含 MoE、KV 与状态空间层的模型。
+
+#### 2. PDScope：按 Prefill/Decode 阶段分别优化 MoE 专家搬运
+
+**来源与时间：** Enda Yu 等，arXiv v1，**2026-10-29**；作者在论文及仓库中标注 PPoPP 2027 录用，本文仅将其作为作者声明，不替代官方 proceedings 核验。[论文](https://arxiv.org/abs/2610.39216)｜[公开仓库](https://github.com/nezha-Anonymous/PDScope)。
+
+**解决的问题。** 在专家权重主要位于 CPU 内存、GPU 预算有限且 batch 较小时，Prefill 倾向多加载专家以提高 GPU 计算占比，Decode 却容易被细碎 PCIe 传输拖慢。统一的专家缓存/加载策略会在两个阶段之间形成性能跷跷板。
+
+**核心机制。** PDScope 结合阶段相关的专家激活预测、跨层代价模型和动态放置，Prefill 采用更积极的加载与流水线，Decode 控制传输并利用 CPU/GPU 协同；实现中使用静态图、缓存预取及零拷贝异步 I/O 来压低调度开销。
+
+**实验与边界。** 论文报告相对于所评估基线的 Prefill 吞吐提升 **2.5–10.3×**、Decode 提升 **2.1–6.1×**。重要的是，**仓库已公开，但不等于完整论文实验全部可复现**：仓库 README 明确表示当前发布的参考实现以 Qwen3-30B-A3B、单 GPU、单请求为主，使用因果 gate-fallback predictor 代替论文中的 learned predictor，且不复现论文的多模型、多 batch 比较。仓库给出了硬件、构建和复现实验说明。[作者代码与限制说明](https://github.com/nezha-Anonymous/PDScope)。
+
+**为什么重要。** 这是“阶段特定的资源瓶颈决定数据放置策略”的具体证据，也提醒读者区分论文全量结果与公开 artifact 的实际覆盖范围。
+
+#### 3. FlatCake：将 DRAM 与 NVMe SSD 变为对等 KV 介质
+
+**来源与时间：** Xin Huang 等，arXiv v1，**2026-10-28**。[论文](https://arxiv.org/abs/2610.38355)。
+
+**解决的问题。** 传统层级缓存假设 DRAM 能过滤热点、SSD 只承接冷数据；然而长周期 Agent 会话可能跨越 DRAM 容量，SSD 读取成为关键路径。若 KV 按 DRAM 驱逐顺序增量落盘，同一会话的数据在 SSD 上离散，恢复时出现 I/O 放大和主机 staging buffer 争用。
+
+**核心机制。** FlatCake 在统一 64 位全局地址中编码介质、节点和偏移；按会话复用范围在**创建时**将不可变 KV block 直接放到 DRAM 或 SSD，避免之后的跨介质迁移。它按会话和层组织 SSD 布局，合并连续 I/O，通过 GPUDirect Storage 直接流入有限的 GPU 恢复窗口；DRAM-ready 与 SSD-preparing 两条队列分离，避免慢速恢复阻塞快速命中。
+
+**实验与边界。** 作者在 Claude Code 生产 trace、DeepSeek-V4-Flash 设置下报告高负载时 **94%** 命中率（对比 Mooncake 的 **64%**）、消除所测基线 **6.5–6.7×** SSD 读取放大、平均 TTFT 改善 **1.6×** 且吞吐改善 **1.6×**；Llama-3.1-70B 的 8K–128K 上下文实验报告相对 Mooncake 最高 **2.4×** TTFT 改善。它依赖 KV 写后不可变、会话粒度访问、可在写入时判断放置范围及可用 GDS 路径；不同 SSD 寿命、动态修改状态或更细粒度共享情况下的表现不能由这些实验直接推出。**未核验到可直接复现的独立代码仓库。**[方法与数据路径](https://arxiv.org/html/2610.38355v1)。
+
+**为什么重要。** 它挑战的不是“SSD 能不能存 KV”，而是 DRAM 必须充当 SSD 的缓存与中转层这一传统假设。
+
+#### 4. Sandman：Amazon 生产 Agent RL 的状态化沙箱基础设施
+
+**来源与时间：** Yiming Yan 等，Amazon，arXiv v1，**2026-10-29**。[论文](https://arxiv.org/abs/2610.39711)。
+
+**解决的问题。** Agentic RL 训练并非一串无状态模型调用。每条轨迹需要能跨工具调用保留文件与进程状态的执行环境；训练启动会产生沙箱创建突发，失败重试、清理遗留资源和独立评测环境均会影响训练吞吐及结果可信度。
+
+**核心机制。** Sandman 以 Kubernetes Pod 承载未修改的任务镜像，通过注入小型 daemon 提供命令、文件操作；provider 负责创建、限速、放置和清理，per-job pool 负责预热与复用。训练用的 rollout 环境和评测用的环境分离，以降低状态污染风险。
+
+**实验与边界。** 论文报告受控扩展实验达到 **11,858** 个同时存在的小型沙箱，2026 年 10 月四轮 SWE 训练 campaign 累计创建约 **313 万** 个沙箱。作者明确界定其“production”为内部模型开发日常使用，并非面向外部客户的 SLA 服务；规模测试中的 tiny sandbox 也不能直接代表大型软件仓库任务的资源开销。论文称 **daemon/provider/pool 将开源**，因此截至本文核验不能写作“完整实现已经开源”。[系统与生产记录](https://arxiv.org/html/2610.39711v1)。
+
+**为什么重要。** Agent 系统的状态生命周期、工具调用间隔和执行环境回收本身已经成为需要独立设计的基础设施问题。
+
+#### 5. TAO：把工具返回就绪时间纳入 Agent 推理调度
+
+**来源与时间：** Shuhuai Li 等，arXiv v1，**2026-10-27**。[论文](https://arxiv.org/abs/2610.37230)。
+
+**解决的问题。** Agent 会在 GPU 推理和外部 CPU 工具之间交替。只根据请求排队长度或缓存命中安排 GPU，容易忽略某个会话的工具结果即将返回、缓存价值正在随等待时间衰减等信息。
+
+**核心机制。** TAO 为会话建立联合价值接口，结合短期工具就绪预测、节点相关的缓存 credit（带时间衰减）和 token footprint，使用动态规划在 GPU 容量约束下共同决定准入与放置，而非先选请求再分配节点。
+
+**实验与边界。** 作者在报告的 **12** 组模型—负载—并发设置中，给出相对各指标最强基线的延迟最高降低 **26.8%**、平均 TTFT 最高降低 **36.3%**、Decode 吞吐最高提高 **29.5%**。这些最高值可能来自不同设置，不能相乘或视为同一运行的联合收益；预测工具就绪时间的准确性和动态规划开销仍是落地变量。**本次未确认官方代码公开。**
+
+**为什么重要。** Agent 的“未来可运行时间”与其缓存位置具有联合价值，普通 Chat serving 的队列模型不足以表达这一约束。
+
+#### 6. Only Accepted Tokens Count：推测解码节能取决于验收与 batch
+
+**来源与时间：** Bole Ma 等，arXiv v1，**2026-10-29**。[论文](https://arxiv.org/abs/2610.40287)。
+
+**解决的问题。** 推测解码常用 tokens/s 或延迟评估，但验证阶段会处理最终被拒绝的 draft token；随着 batch 增加，权重读取已被并行请求摊薄，额外验证计算未必划算。
+
+**核心机制与证据。** 作者在 SGLang（启用 CUDA Graph）上使用 H100/H200、**11 个模型、5 类草稿方法、最高 batch 64、5 类文本**，比较每个最终接受 token 的 GPU 板卡能耗，并分析 draft/verify 开销与 roofline 转变。研究发现代码文本的 draft 验收通常优于对话文本，低资源语言上的验收也可能更差；部分低验收率草稿在大 batch 时反而增加每 token 能耗。论文还指出禁用 CUDA Graph 可能把 MoE 推测解码的节能估计扭曲 **19–39 个百分点**。[实验方法与局限](https://arxiv.org/html/2610.40287v1)。
+
+**限制与价值。** 测量使用 GPU 能量计数器，不覆盖 CPU、网络与机房制冷；批次是固定同时到达的请求，不能直接替代开放式生产队列。结论不是“推测解码不节能”，而是必须在固定 TTFT/TBT 目标下联合报告接受 token、batch、GPU 能耗与 CUDA Graph 配置。
+
+#### 7. Prefill-Based Decoding Length Prediction：输出长度预测存在统计下界
+
+**来源与时间：** Haowen Shi 等，arXiv v1，**2026-10-29**。[论文](https://arxiv.org/abs/2610.40541)｜[代码与分析工具](https://github.com/ShwStone/DecodingPredict)。
+
+**解决的问题。** 推理调度希望在 Prefill 后估计 Decode token 数，以预留 KV 和分配执行资源。但只比较预测器 MAE 会混淆模型预测能力和生成采样的随机性；同一输入在不同采样下本来就可能有不同输出长度。
+
+**核心机制。** 论文将生成终止建模为 stopped stochastic process，分析逐步终止概率变化，推导单 prompt 输出长度分布的近似正态性、误差项及均值—方差关系，并给出只依赖 Prefill 隐状态的方法不可突破的误差边界。多种 MLP、FiLM、MoE 等预测器在固定模型与采样条件下接近这一边界。
+
+**实验与边界。** 作者报告理论分布对 per-prompt MAE 和主要概率质量的拟合误差在数个百分点量级；公开仓库包含数据导出、预测训练和统计分析脚本。该结论依赖其停止过程假设及所测模型/数据，不能直接认定所有 Agent 任务的工具调用长度或分支长度均服从相同分布。
+
+**为什么重要。** 对缓存预留与调度研究而言，应报告条件误差、尾部风险和采样配置，而不是将预测误差全部归咎于模型容量不足。
+
+#### 8. Retrieval as Traversal：让 Agent 检索保留“位置状态”
+
+**来源与时间：** Daniel Strauß 等，arXiv v1，**2026-10-29**；作者标注 NeurIPS 2026 Long-Context Foundation Models Workshop。[论文](https://arxiv.org/abs/2610.40545)。
+
+**解决的问题。** 长上下文 Agent 的相邻步骤往往检索相近记忆，但全局检索每次重新搜索，压缩式递归记忆又必须提前决定保存什么。
+
+**核心机制。** 作者把记忆内容的价值与索引地址的几何邻近性分开，以带访问成本的目标鼓励互补信息在局部可共同到达，并惩罚冗余项占据同一局部检索集合。Agent 通过持久化 traversal head 沿记忆地址空间局部移动，而不是每步重新全局定位。
+
+**实验与边界。** 在 **MiniGrid Memory** 的固定几何概念验证中，作者报告五 token 上下文下平均回报达到 **0.95** 需要 **0.59M** 训练步；Gaussian absolute addressing 达到 **0.95** 约需 **0.94M** 步（原摘要对后者的表述以训练步数比较），categorical addressing 超过 **2M** 步。**论文明确未测试学习式几何或重复检索**，因此不能把结果宣传为已经解决真实长文本 Agent memory retrieval。它的价值在于提出“检索指针本身是状态”的可检验假设。
+
+#### 9. ConfluxServe：Prefill/Decode 不必使用同一种并行度
+
+**来源与时间：** Wenhao Chen、Hong Zhang，arXiv v1，**2026-10-27**。[论文](https://arxiv.org/abs/2610.37810)。
+
+**解决的问题。** Prefill 与 Decode 的算力、带宽需求互补，但最优并行配置不同：完全分离阶段浪费互补资源，简单混合 batch 又迫使它们共享不合适的并行度。
+
+**核心机制。** Conflux Parallelism（XP）利用 Transformer 算子级结构，让 Prefill 和 Decode 在同一批次中沿不同算子采用不同的 batching/parallelism 路径；ConfluxServe 在 TTFT、TBT 约束下优化 goodput。
+
+**实验与边界。** 作者在所测生产工作负载上报告相对最强基线 **1.26–1.62×** goodput。其收益取决于阶段混合比例、算子切分成本、互联拓扑与服务 SLO；不能据此认定传统 PD 分离已失去价值。**本次未核验到公开完整实现。**
+
+## 开源项目的重要新闻
+
+以下均为 **2026-10-30 创建或更新的 GitHub PR**，逐项标注状态；它们不是已发布 Release，也不能视为 main 分支已有功能。
+
+### vLLM #64649：异步 KV 加载与 speculative reservation 的队头阻塞
+
+[PR #64649](https://github.com/vllm-project/vllm/pull/64649)（**Open，未合并**）修复异步 KV connector 加载时，为一次 speculative decode 预留的 block 数超过请求距 `max_model_len` 的真实剩余需求，导致一个本来装得下的远端 KV hit 永远无法准入，并阻塞后续请求。修复将每组 margin 截断到真实可用的 token/block 上限。提交者提供 RTX A6000、Qwen3-0.6B dummy weights 的双服务端复现：原分支远端命中请求卡在 WAITING、无关请求超时；补丁分支分别在约 0.11s/0.04s 完成。测试包含本地端到端与单元测试，但并非全部生产配置验证。**启示：** 缓存恢复的 admission margin 必须与请求可执行上界一致。
+
+### vLLM #64631：MiniMax M3.1 NVFP4 index cache 的张量并行分片
+
+[PR #64631](https://github.com/vllm-project/vllm/pull/64631)（**Draft，未合并**）尝试将 NVFP4 index cache 按 indexer context parallelism 分片，而非每个 TP rank 复制完整索引。提交者报告 TP2 每 token 每稀疏层从 **72 B** 降至 **36 B**、TP4 降至 **18 B**；但 prefill gather、score merge 与 kernel 路径也发生变化，局部 indexer 延迟并非全面下降。作者明确列出对前置 PR 和 MSA 变更的依赖，尚未完成端到端 serving、准确率与多 GPU CI。**启示：** index cache 的物理容量优化必须连同 scorer/通信开销一起评估。
+
+### SGLang #47535：FULL+MAMBA 混合状态的外部直接恢复
+
+[PR #47535](https://github.com/sgl-project/sglang/pull/47535)（**Draft，未合并，依赖 #47514/#45650**）将 KVCR direct linker 扩展到 FULL+MAMBA hybrid pool，使 KV 与 Mamba state 可以通过同一外部恢复流程协调，并为 Mamba 请求到 token 的映射增加传输完成等待；同时加入 G3 层的存储配置与发现语义。作者报告 226 项单元测试通过、20 项跳过，**端到端测试尚未完成**；MTP draft、ReplaySSM 等布局明确不支持。**启示：** “KV 命中”对混合模型不是单个 tensor 的可用性，而是多类状态的完整性与同步条件。
+
+### SGLang #47521：不可重建的多模态/embedding 请求必须显式失败
+
+[PR #47521](https://github.com/sgl-project/sglang/pull/47521)（**Open，未合并**）针对 PD decode rebootstrap 和本地 re-prefill 的 retract 路径，识别只有 token IDs、缺少多模态输入或 embedding override 时无法正确重建 KV 的情况，改为返回错误并终止请求，而不是静默生成错误输出。它还处理已经向客户端发送 token 后重启生成造成的拼接错位。**启示：** 抢占、回滚与恢复必须携带“可重建性”条件，不能把所有模型输入都等价为 token 序列。
+
+## 前沿概念和技术
+
+**一、Tensor-specific memory views。** 这不是 CUDA Unified Memory 的同义词。Rimuru 的定义是：同一物理页池由不同张量类型通过各自页表和粒度解释，配合可直接消费离散页的执行内核。它解决的是“可分配”与“可执行”之间的鸿沟；如果内核仍要求连续专家权重，统一分配本身无法消除重打包开销。[Rimuru](https://arxiv.org/abs/2610.40305)。
+
+**二、Flat KV storage。** FlatCake 的“flat”指 DRAM/SSD 作为对等后端，并将介质位置编码进地址句柄；它不等于所有数据同延迟，也不等于取消放置策略。其代价是写入时的会话范围判断、跨介质调度和不可迁移约束。[FlatCake](https://arxiv.org/abs/2610.38355)。
+
+**三、Stateful retrieval pointer。** Retrieval as Traversal 认为连续任务的检索地址具有状态延续性，试图以局部移动替代反复全局搜索；目前仅为固定几何 MiniGrid 证据。应将“地址可达性”“内容信息增益”和“真实检索开销”分开评估。[Retrieval as Traversal](https://arxiv.org/abs/2610.40545)。
+
+**四、可重建性（rebuildability）是推理状态的正确性属性。** SGLang 的新 PR 说明，仅存 token IDs 不能覆盖图像、embedding overrides 等输入。重算前必须知道重建所需的原始输入、派生状态与输出进度是否齐全。[SGLang #47521](https://github.com/sgl-project/sglang/pull/47521)。
+
+## 深度分析
+
+### 对大模型推理与存储优化的启发
+
+**容量优化与 I/O 优化不能分开。** Rimuru 把可用显存从固定类别配额中释放出来，FlatCake 减少 DRAM staging 与 SSD 读放大，PDScope 根据阶段选择专家数据移动强度。它们分别优化“空间能否复用”“数据怎样布局与恢复”“何时值得搬运”。对于新的推理框架设计，至少应联合报告实际容量、传输字节、请求排队、TTFT/TBT 和 goodput，而不能只看单项 cache hit rate 或峰值 tok/s。
+
+**Agent 的时间轴是调度变量。** TAO 的工具就绪估计和 Sandman 的沙箱生命周期共同表明，GPU 上的模型推理只是 Agent 工作流的一部分。工具等待、环境预热、长时间闲置后的恢复、沙箱清理与评测隔离都可能影响端到端完成时间。Agent serving benchmark 应记录会话、工具调用、状态保留、等待间隔、取消与重试，而非把每次模型调用独立抽样。
+
+**状态恢复需要正确性契约。** vLLM #64649 证明“有空间但无法准入”可能是调度预留计算错误；SGLang #47521 证明“能重新跑 Prefill”不等于“能重建原 KV”。对混合模型，#47535 又增加 Mamba 状态及传输完成事件。一个可靠的恢复接口应明确描述输入可重建性、状态类型、生命周期、传输完成条件和失败语义。
+
+**能效和预测指标必须匹配真实系统目标。** Only Accepted Tokens Count 说明固定 batch 与固定 CUDA Graph 设置是比较 speculative decoding 能效的必要控制变量；Decoding Length Prediction 说明预测器存在采样噪声下界。因此，在线系统应报告给定 SLO 下的能耗、预测不确定性与最坏情况，而不是用单一均值预测或接受率替代完整运行时证据。
+
+## 今夜白的观察
+
+本期最有价值的共同变化是：**大模型系统正在把“状态是什么、能否复用、能否重建、应放在哪里”提升为跨模型架构与运行时的系统问题。** Rimuru 与 FlatCake 分别从异构张量和异构介质重构空间抽象；TAO 与 Sandman把 Agent 工具和执行环境纳入运行时；SGLang 的混合状态 PR 则说明状态正确性已经超出传统 KV Cache。
+
+仍未解决的关键问题至少有三类：第一，统一显存与对等存储如何在高并发、多租户场景保持稳定的尾延迟；第二，Agent 工具就绪预测、输出长度预测和长期状态复用的不确定性如何转化为可解释的在线调度边界；第三，混合注意力、SSM 与多模态请求的状态恢复怎样定义统一、可验证的正确性契约。上述判断来自本文列出的公开论文和 PR，不代表这些系统已经给出通用答案。
+
+## 参考资料
+
+### 原始资料链接
+
+**论文与技术报告（按首次公开日期）：**
+
+- 2026-10-29：[Rimuru](https://arxiv.org/abs/2610.40305)；[PDScope](https://arxiv.org/abs/2610.39216)；[Sandman（Amazon）](https://arxiv.org/abs/2610.39711)；[Only Accepted Tokens Count](https://arxiv.org/abs/2610.40287)；[Prefill-Based Decoding Length Prediction](https://arxiv.org/abs/2610.40541)；[Retrieval as Traversal](https://arxiv.org/abs/2610.40545)。
+- 2026-10-28：[FlatCake](https://arxiv.org/abs/2610.38355)。
+- 2026-10-27：[TAO](https://arxiv.org/abs/2610.37230)；[ConfluxServe](https://arxiv.org/abs/2610.37810)。
+
+**公开代码与复现实验：**
+
+- [PDScope reference implementation（明确披露与论文实验的差异）](https://github.com/nezha-Anonymous/PDScope)。
+- [DecodingPredict 分析与预测脚本](https://github.com/ShwStone/DecodingPredict)。
+
+**工程 PR（2026-10-30，均未合并）：**
+
+- [vLLM #64649：async KV-load admission margin](https://github.com/vllm-project/vllm/pull/64649)。
+- [vLLM #64631：NVFP4 index cache sharding](https://github.com/vllm-project/vllm/pull/64631)。
+- [SGLang #47535：hybrid FULL+MAMBA direct linker](https://github.com/sgl-project/sglang/pull/47535)。
+- [SGLang #47521：unrebuildable retract abort](https://github.com/sgl-project/sglang/pull/47521)。
+
+**资料状态说明：** 本期没有以二手报道日期替代原始发布时间；论文指标按作者实验表述，PR 指标按提交者复现表述；未核验到的代码、官方会议录用或尚未完成的端到端实验均已明确标注。
