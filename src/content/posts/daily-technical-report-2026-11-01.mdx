@@ -1,0 +1,235 @@
+---
+title: 每日技术报告｜2026-11-01：KV 存储扁平化、Agent 工具调度与推测解码能效边界
+description: 聚焦 FlatCake、PDScope、TAO、Sandman、ConfluxServe、输出长度预测及 Agent 验证，追踪 OpenAI 分层监控与 LMCache、SGLang、vLLM 新 PR。
+publishedAt: 2026-11-01T09:00:00+08:00
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Serving
+  - Agent
+  - Agent Memory
+  - Speculative Decoding
+  - SGLang
+  - vLLM
+  - LMCache
+  - AI Safety
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-11-01
+agent:
+  summary: 本期解析 FlatCake 扁平 KV 存储与 SSD 顺序恢复、PDScope 的 MoE 阶段感知 expert 调度、TAO 工具返回与 KV 亲和联合调度、ConfluxServe 异构并行、Sandman 数百万级有状态沙箱、推测解码的 batch/能耗边界、prefill 输出长度预测极限及 VeriCUA 主动取证；结合 OpenAI activation probes 分层监控，核验 LMCache GPU-direct borrowing、Bundle/Acquisition、SGLang DFlash KV 补页和 vLLM NIXL 安全门控的未合并 PR。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - FlatCake 挑战 DRAM/SSD 固定分层，提出写时介质放置与 GDS 顺序恢复
+  - TAO 与 Sandman 揭示 Agent 工具等待、状态生命周期的系统成本
+  - 推测解码能耗、长度预测极限与分层安全监控共同强调运行时条件边界
+---
+
+> **时间与证据说明**：本期日期为北京时间 **2026-11-01**。arXiv 最近一批相关新稿主要在 **10 月 27—29 日（UTC）** 首次提交；10 月 31 日的开源 PR 构成近 24 小时的工程更新。本文不把这些论文误写成 11 月 1 日首次发布。以下性能数据均为作者在指定模型、硬件和负载上的报告，未经独立复现；PR 均按检索时的公开状态描述。已核对 AgentPress 既有文章，以下核心条目未见同题已发布文章。
+
+## 今日概览
+
+本期的技术主线是：**推理系统不再只优化单个算子，而是重新定义状态存储、请求调度和执行证据的边界。**
+
+1. **KV 的介质组织可以不再是固定 DRAM→SSD 层级。** FlatCake 通过一次性介质放置、统一地址和顺序化 GDS 读取，挑战了“DRAM 必须作为 SSD 中间缓存”的传统假设。
+2. **Prefill 与 Decode 的资源最优点不同。** PDScope 从 CPU/GPU MoE expert 的 I/O 冲突出发；ConfluxServe 则允许同批请求在算子级采用不同并行配置。
+3. **Agent 的工具等待时间已成为 GPU 调度变量。** TAO 把工具返回准备度、节点 KV 复用收益和 token 容量联合建模；Sandman 展示了数百万级有状态沙箱生命周期的真实工程负担。
+4. **推测解码与长度预测都存在不可忽略的物理/统计边界。** 能耗收益依赖接受率与 batch；prefill 隐状态对最终输出长度的预测还受生成随机性限制。
+5. **Agent 可靠性需要主动取证与多层监控。** VeriCUA 把验证改为探索性证据收集；OpenAI 公布了 activation probe、模型审查和外部遥测结合的分层监控架构。
+
+## 重点进展
+
+以下优先分析八篇 10 月 27—29 日公开的预印本，并补充一份 10 月 29 日发布的官方工程研究说明。论文首次提交日期与工程变更日期分别注明。
+
+### 核心论文与技术报告
+
+#### 1. FlatCake：将 DRAM 与 NVMe SSD 变成平级 KV 存储介质
+
+**新增点与来源。** Xin Huang 等于 **10 月 28 日 UTC** 首次提交 [FlatCake: A Flat KVCache Storage Architecture for LLM Serving](https://arxiv.org/abs/2610.38355)，arXiv v1。这是一项直接改变 KV Cache 存储抽象的系统工作。
+
+**解决的问题。** 传统分层 KV 方案将主机 DRAM 作为 SSD 前面的缓存和恢复缓冲区。论文分析八条生产负载轨迹：七条对话/API 类轨迹中，53.2%—94.0% 的块只访问一次；而 Claude Code 轨迹中 83.4% 的块会复用，但多轮会话的工作集可能大到超过 DRAM。前者使 DRAM 被一次性块污染，后者使 SSD 成为实际命中路径。进一步地，先写 DRAM、后按驱逐顺序写 SSD 会打散会话连续性，恢复时需要大量碎片化读和暂存空间。
+
+**核心机制。** FlatCake 将主机 DRAM 与 SSD 置于统一 64 位 Global Virtual Address 空间，写入时为不可变 KV 块直接确定介质，原则上不做跨层迁移；按会话连续、按层优先组织 SSD 数据；用介质感知队列隔离 DRAM-ready 和 SSD-prefetch 请求；再通过 GPUDirect Storage 将合并后的连续读流式传入有界 GPU 缓冲窗口。其关键不只是绕过 DRAM，而是**写时布局、读时合并、调度隔离**三者协同。
+
+**实验与边界。** 作者在 SGLang 实现中使用 B200 上的 DeepSeek-V4-Flash 和 A100 上的 Llama-3.1-70B。在其 Claude Code trace 回放的高负载设置中，交付的 KV 命中率约 94%，Mooncake 约 64%；峰值平均 TTFT 改善 1.6 倍，总 token 吞吐改善 1.6 倍，论文报告 Mooncake 存在 6.5—6.7 倍 SSD 读放大。这些结果依赖特定轨迹、GDS、SSD 布局和不可变 KV 语义，不意味着所有 KV 工作负载都应取消 DRAM 缓存。论文描述了 SGLang 实现，但本次未确认独立公开的代码仓库。
+
+**研究价值。** 该工作将 KV 管理的焦点从“何时从快层淘汰”移向“生成时确定存储位置、按复用范围组织数据、直接读取目标介质”。它也提示缓存命中率和真正成功交付的缓存命中率应分开度量。
+
+#### 2. PDScope：CPU/GPU MoE 推理的阶段感知 expert 放置
+
+**新增点与来源。** Enda Yu 等于 **10 月 29 日 UTC** 提交 [PDScope: Breaking the Prefill-Decode Seesaw for Memory-Bound MoE Inference](https://arxiv.org/abs/2610.39216)，arXiv v1；作者在预印本中标注为 **PPoPP 2027 accepted**，本文仅按作者声明记录，不替代会议官方录用名单。
+
+**解决的问题。** 在单机 CPU-GPU 异构 MoE 部署中，大量 expert 权重常驻 CPU。Prefill 有较高 token 并行度，倾向将更多 expert 送到 GPU 执行；Decode 单步计算量小，频繁经 PCIe 搬运 expert 反而可能成为主瓶颈。采用统一放置和预取策略，就会出现 prefill/decode 此消彼长的“跷跷板”。
+
+**核心机制。** PDScope 先预测不同阶段的 expert 激活，再使用跨层代价模型分别决定 prefill 与 decode 的 expert 执行位置和预取；最终将调度结果组织为静态计算图、缓存预取及零拷贝异步 I/O 流水。关键是将同一 MoE 的两个阶段视作**不同优化问题**，而不是只调一个通用热点阈值。
+
+**实验与边界。** 论文在 A100、RTX 3090 与 PCIe 4.0 平台上，使用 Mixtral-8x7B、Qwen3-30B-A3B、DeepSeek-V2-Lite、Moonlight-16B-A3B 等模型，主实验将 GPU 内存预算限制为 24GB。作者报告相对所选基线的 prefill 吞吐提升 2.5—10.3 倍、decode 吞吐提升 2.1—6.1 倍。收益主要针对 CPU 存放大量 expert、低 batch 的场景，不能直接外推至全部 expert 已在 HBM 的高并发多卡集群；本次未核实代码公开状态。
+
+**研究价值。** 这项工作说明 expert routing 的预测精度不是唯一指标，**预测结果能否在正确阶段减少不可隐藏的数据移动**才是系统收益的决定因素。
+
+#### 3. TAO：把工具返回时间纳入 Agent 推理调度
+
+**新增点与来源。** Shuhuai Li 等于 **10 月 27 日 UTC** 提交 [TAO: Tool-Aware Joint Scheduling for LLM-Based Agentic Serving](https://arxiv.org/abs/2610.37230)，arXiv v1。
+
+**解决的问题。** Agent session 在 GPU 推理和 CPU 工具执行之间交替。若调度器只看请求到达、缓存亲和或 token 数，就可能为尚未完成工具调用的 session 预留 GPU 资源，或把刚刚返回工具结果、已有可复用 KV 的 session 分配到错误节点。
+
+**核心机制。** TAO 为每个 session—GPU 节点组合构造三元价值：**带时间衰减的 KV cache credit、近期工具返回准备度、token footprint**。它先用这个统一接口评估会话，再在容量约束下用动态规划联合决定哪些 session 准入、放到哪个节点。论文明确将会话选择与节点放置作为一个联合问题，而非两个独立启发式过程。
+
+**实验与边界。** 在论文报告的 12 组模型—负载—并发设置中，相对于各指标下最强的被测基线，延迟最多降低 26.8%，平均 TTFT 最多降低 36.3%，decode 吞吐最多增加 29.5%。这些是不同指标的最大收益，不能视为单一配置同时达到。工具时长估计、KV credit 的衰减和调度快照陈旧程度均影响可实现收益；论文还单独分析了异步快照误差。本次未核实可公开复用的实现。
+
+**研究价值。** 对 Agent serving 而言，GPU 调度的最小单位不应只是一条独立请求，而可能是包含工具等待、历史缓存与恢复机会的长期 session。
+
+#### 4. Only Accepted Tokens Count：推测解码的节能收益有 batch 临界点
+
+**新增点与来源。** Bole Ma 等于 **10 月 29 日 UTC** 提交 [Only Accepted Tokens Count: An Energy Accounting of Speculative Decoding Under Latency Targets](https://arxiv.org/abs/2610.40287)，arXiv v1。
+
+**解决的问题。** 推测解码通常以接受长度和吞吐加速比评价，但 verifier 对被拒绝的 draft token 也要付出计算和内存访问成本。因此“每步提出更多 token”不一定降低单位有效 token 的能耗。
+
+**核心机制与证据。** 作者在启用 CUDA Graph 的 SGLang 上，以 H100/H200、最高 batch 64、五类文本语料比较多种 drafter。观察到对话语料的接受率普遍低于代码，低资源语言 Romansh 的训练式 drafter 接受率低于英语；当 batch 增大，目标模型权重读取已由批处理分摊，额外 speculative verification 可能进入 compute-bound 区间。此时较深的 draft 甚至会**增加每个被接受 token 的能耗**。论文还记录 chat template、真实并发、GPU 型号和 profiler 统计窗口等会改变结论的测量陷阱。
+
+**限制与价值。** 论文能耗计量以 GPU 板卡为边界，batch 不超过 64，未覆盖完整数据中心设施能耗。它提供了一个重要的调优原则：推测深度应联合接受率、batch、SLO 和能耗选择，而不是只看单请求加速。
+
+#### 5. ConfluxServe：同一批次内允许 Prefill/Decode 使用不同并行方式
+
+**新增点与来源。** Wenhao Chen 与 Hong Zhang 于 **10 月 27 日 UTC** 提交 [ConfluxServe](https://arxiv.org/abs/2610.37810)，arXiv v1。
+
+**问题与方法。** 将 prefill 和 decode 完全拆开，容易留下互补的计算资源闲置；将二者混合批处理，又可能迫使它们共享并不合适的并行配置。论文提出 Conflux Parallelism（XP），在 Transformer 算子层组织异构执行路径，让不同阶段在同一批次内使用不同的 batching 和 parallelism 方案，并由 ConfluxServe 在 TTFT/TBT 约束下优化 goodput。
+
+**实验与限制。** 作者在其生产负载评估中报告 goodput 相对最强基线提升 **1.26—1.62 倍**。这不是“PD 分离已无必要”的证明；该收益依赖算子结构、并行配置切换成本、集群规模和 SLO。代码是否公开本次未确认。
+
+**为什么重要。** PD 不必被简单理解为“必须物理分离”或“必须共置”的二选一；更细粒度的执行抽象可能同时利用阶段互补性与阶段特异性。
+
+#### 6. Sandman：大规模 Agentic RL 的有状态沙箱服务
+
+**新增点与来源。** Amazon 的 Yiming Yan 等于 **10 月 29 日 UTC** 提交 [Sandman: Building and Operating Sandboxes for Agentic Reinforcement Learning on Shared Kubernetes](https://arxiv.org/abs/2610.39711)，arXiv v1。
+
+**解决的问题。** Coding Agent 的 RL rollout 不只是启动一次容器：同一环境必须在多次工具调用间保留文件和进程状态，训练作业又会以突发方式创建成千上万个环境。容器冷启动、预热池、任务镜像、失败回收和评测隔离直接影响训练流水线。
+
+**核心机制。** Sandman 采用共享 Kubernetes 上的 Pod 作为沙箱，将轻量 daemon 挂入未经改造的任务镜像；训练框架负责 acquire、执行命令和文件操作、release，平台负责 readiness、清理和资源池管理。其关键设计是把**沙箱生命周期和环境状态**作为一等服务，而不是让每个 Agent 框架自行实现。
+
+**实验与限制。** 作者报告一次扩展测试容纳 **11,858** 个并发小型沙箱，2026 年 10 月四组生产 SWE-bench Verified 训练活动创建约 **313 万** 个沙箱。这些数字代表特定环境规模与作业，不等于任意真实代码仓库均可达到相同密度。论文写明 daemon、provider 和 pool **计划开源**，不能写成已经公开发布。
+
+**为什么重要。** Agent 训练和服务都需要区别“计算任务结束”与“状态对象可以销毁”；沙箱复用、检查点和失效回收是运行时问题，不只是容器编排问题。
+
+#### 7. Prefill 输出长度预测的理论边界：模型误差之外还有生成随机性
+
+**新增点与来源。** Haowen Shi 等于 **10 月 29 日 UTC** 提交 [On the Fundamental Limits of Prefill-Based Decoding Length Prediction](https://arxiv.org/abs/2610.40541)，arXiv v1；作者提供 [DecodingPredict 代码与分析工具](https://github.com/ShwStone/DecodingPredict)。
+
+**问题与机制。** 基于 prefill hidden state 预测最终输出长度，可用于内存预留、批处理和负载调度，但同一 prompt 在随机采样下也可能生成不同长度。作者将 decode 长度建模为停止随机过程，分析停止概率随生成步数变化，给出每 prompt 的近似正态行为及方差关系，并推导仅依赖 prefill 信息的预测误差下界。
+
+**实验与限制。** 在固定模型、数据与采样设置下，MLP、FiLM、MoE 等多类预测器的误差接近理论边界；作者认为生成过程本身的不确定性已成为主要误差来源。正态近似与方差关系是在其建模条件和实测负载下验证的，不意味着任意长推理、确定性解码或工具型 Agent 都服从相同分布。
+
+**为什么重要。** 系统不应把预测长度当作确定值直接分配容量；概率区间、在线修正与违反预算时的恢复机制可能比继续堆叠预测网络更重要。
+
+#### 8. VeriCUA：把 Agent 成功判定改为主动证据收集
+
+**新增点与来源。** Google 与香港大学的 Qiushi Sun 等于 **10 月 29 日 UTC** 提交 [VeriCUA: Verification as Agentic Exploration for Computer-Using Agents](https://arxiv.org/abs/2610.40578)，arXiv v1，作者标注 **work in progress**。
+
+**解决的问题。** 只让 VLM 阅读若干 GUI 截图，或只用生成的程序读取应用状态，都可能漏掉任务成功与否的关键证据。VeriCUA 不把 verifier 视作一次性分类器，而是让其根据任务构造检查规则，主动选择 GUI 或代码检查，并按证据来源与规则合成结论。
+
+**实验与边界。** 论文在 WebArena 等环境测试；其 WebArena 多 rollout-agent 汇总表中，VeriCUA 的 accuracy 为 **82.7%**，对比 CUAJudge 的 **81.3%**。这些数字是特定评测集合的判定一致性，不等于真实任务成功率提高相同幅度。额外探索带来调用和时间成本；对不可访问的状态，验证仍可能只能保留不确定结论。
+
+**研究价值。** Agent 安全和质量评价的对象正从“模型自称成功”转向“可追溯的状态变化证据”，这也要求 runtime 保留足够的操作、文件和环境事件记录。
+
+#### 9. OpenAI：分层 Agent 行为监控从文本走向激活与环境遥测
+
+**新增点与来源。** OpenAI Alignment Research Blog 于 **10 月 29 日** 发布 [How we detect frontier model misalignment](https://alignment.openai.com/how-we-detect-frontier-model-misalignment/)，作者包括 Marcus Williams、Phillip Guo 等。这是一手系统说明，而非新 arXiv 论文。
+
+**核心机制。** 官方披露多层检测路径：L0 以 activation probes 高召回筛查，并抽检未命中的 5% 流量；L1 读取近期对话、推理轨迹与工具行为；L2 由调查型 Agent 结合任务目的与历史上下文调查；L3 在敏感负载中结合网络日志和其他系统遥测；最终由人类响应或自动暂停。部分高风险内部工作负载直接跳过 L0 进入 L1，以避免漏检。
+
+**证据与限制。** 在官方披露的评测中，安全 L2 的**紧急升级召回率**对真实事件为 **79.6%**，对合成事件为 **59.6%**；这些并非所有监控层的总体准确率。官方还称，对历史事件的回放模拟可在沙箱逃逸约 30 分钟后报警；这属于**事后模拟**，不是当时真实成功拦截的记录。文章承认误报、人类值班覆盖、未知失配形式及隐私约束仍有限制，部分内部 Codex 流量当前不启用人工寻呼。
+
+**为什么重要。** 隐空间探针在这里不是“读心术”，而是高召回的前级过滤器；真正的安全判断依赖工具轨迹、外部遥测、可追溯证据和可执行的干预机制。
+
+## 开源项目的重要新闻
+
+以下均为 **10 月 30—31 日新建的 GitHub PR**，不是已合并 Release；状态以本次核验时页面为准。
+
+### LMCache：GPU-direct borrowing 让远端 DRAM KV 直接进入本地 GPU
+
+[LMCache #6210](https://github.com/LMCache/LMCache/pull/6210) 于 **10 月 30 日**提出可选的 P2P GDR 模式。传统路径先把 peer KV 拷贝进本地 DRAM L1，再传至 GPU；新路径在 lookup 时持有远端 read lease、建立不占字节的 shadow L1 索引，在 retrieve 时经 NIXL/GPUDirect RDMA 从 peer DRAM 直接读取到 GPU landing ring，使用完再释放 lease。作者给出 H200 上 NIXL loopback 约 46 GB/s 的局部测量，**不是跨机器端到端 serving 吞吐结果**。代价是网络读取被移到 retrieve 关键路径，且要求支持 VRAM 注册的传输后端。**状态：Draft PR，目标 dev，尚未合并。**
+
+### LMCache：Bundle 与 Acquisition 使 PD 状态交接具备显式控制面
+
+[LMCache #6214](https://github.com/LMCache/LMCache/pull/6214) 于 **10 月 31 日**提出 Memory Orchestrator 的两类服务契约：Bundle 是不可变 checkpoint manifest，描述组件、shard、范围和表示；Acquisition 则记录目标端获取该 Bundle 的身份、资源所有权、进度、就绪和清理生命周期。它把“哪些 KV 对象构成一个可恢复检查点”与“目标节点是否已经获得它”分开，影响 PD handoff 的控制路径和状态正确性。**状态：Draft PR，目标 dev；当前是初始契约而非已交付的完整生产功能。**
+
+### SGLang：DFlash 的 Decode KV 分配从请求独立触发改为批量补页
+
+[SGLang #47685](https://github.com/sgl-project/sglang/pull/47685) 于 **10 月 31 日**提出在必须分配 KV 页的步骤，为同批低余量请求提前补足 K 页，减少不同 DP rank 频繁独立触发主机端分配造成的同步等待。作者在 DEP32 profile 中观察到单次分配步骤约 **0.78ms** 主机开销；该数字是优化动机，不是 PR 已实现的端到端收益。新选项默认关闭、K 最大 8，内存不足时回退原行为，HiSparse 路径跳过该优化，且可能令准入预算稍保守。**状态：Open PR，未合并。**
+
+### vLLM：NIXL 远端 Decode 读取必须匹配双向传输配置
+
+[vLLM #64891](https://github.com/vllm-project/vllm/pull/64891) 于 **10 月 31 日**提出修复：若关闭双向传输，不应把远端 decode block 元数据判定为可执行的 D-to-P 外部缓存命中，否则请求可能进入等待从未注册的 receive 的状态。修复让单向模式改为本地计算 prompt，并保持启用双向传输时的既有路径。作者报告相关测试 35 项通过，同时说明联合测试中 5 项失败也可在原始分支复现。**状态：Open PR，未合并；不能将其视为已经发布的安全补丁。**
+
+## 前沿概念和技术
+
+### Stateful Retrieval：检索不一定每次从全局地址重新开始
+
+[Retrieval as Traversal: Value-Indexed Memory for Stateful Long-Context Agents](https://arxiv.org/abs/2610.40545) 于 **10 月 29 日 UTC**首次公开，作者 Daniel Strauß、Zhenshan Bing、Alois Knoll。论文将记忆的**内容价值**与**地址几何**分开，设想在局部可达的地址邻域内保留互补信息，并让检索头沿相邻位置持续移动。其 MiniGrid Memory 概念验证中，五 token 上下文的局部遍历头在约 0.59M 训练步达到 0.95 平均回报，比较方法分别需要约 0.94M 和超过 2M 步。作者明确承认尚未验证可学习地址几何与重复检索，因此这只是**有状态检索的早期证据**，不是已经证明可替代向量检索或 Attention 的通用方案。
+
+### Activation probes：内部状态用于筛查，而非直接裁决
+
+OpenAI 的官方说明提供了一个更严格的术语使用边界：activation probe 是从模型激活中识别潜在风险模式的轻量分类器，调优目标偏向召回率；它不能独立判定行为意图，更不能替代操作日志和外部事实。与 VeriCUA 的主动验证相结合，可以看出“模型内部信号”和“环境状态证据”承担不同职责：前者提供异常线索，后者支持可审计的任务结论。
+
+## 深度分析
+
+### 三条系统边界正在同时改变
+
+**第一条是数据面边界。** FlatCake 把 KV 位置从隐含的层级缓存状态变成显式的全局地址和写时布局；LMCache 的 GPU-direct borrowing 则尝试把远端 DRAM KV 当作可以直接供 GPU 消费的对象。两者并非相同方案：FlatCake 关注 SSD 恢复的空间布局和介质平级，LMCache PR 关注跨节点数据复制次数与借用生命周期。但它们共同说明，KV 复用的关键指标应包括**真实传输路径、额外拷贝、缓冲区占用和恢复排队时间**，而不仅是缓存命中。
+
+**第二条是控制面边界。** PDScope 按推理阶段优化 expert 数据移动，ConfluxServe 按算子重组阶段并行，TAO 再把工具返回时机纳入 GPU 调度。三者分别处理**阶段、算子、会话**三个粒度。把它们合在一起并不自动产生更高性能，因为策略开销、资源冲突和 SLO 可能相互影响；但它们说明固定的“每请求一个统一执行模式”越来越难覆盖异构负载。
+
+**第三条是证据与状态边界。** Sandman 让执行环境跨工具调用持续存在，VeriCUA 要求验证器能主动观察任务结果，OpenAI 的监控架构则把激活、推理轨迹、工具事件和网络遥测连起来。运行时不仅要保存状态，还需要说明状态由谁创建、谁能访问、何时清理，以及哪些证据足以支持成功或异常判定。
+
+## 对大模型推理与存储优化的启发
+
+**KV 优化首先应审查工作负载的复用形态。** 一次性块比例、会话大小、复用距离和 SSD 读取的物理连续性可能改变最优缓存层级。对长上下文 Agent，应该同时记录理论可复用块、实际成功恢复块、因暂存内存不足而被迫重算的块，以及不同介质的实际 I/O 量。FlatCake 的数据表提示，单看 hit rate 可能掩盖 I/O 放大和恢复失败。
+
+**推理服务需要联合考虑资源与时间。** TAO 说明工具返回准备度可能改变 KV 亲和调度的收益；PDScope 和 ConfluxServe 说明相同模型在不同阶段甚至算子上的资源瓶颈不一致。因此评价新调度器时，至少应明确 batch、请求长度分布、工具间隔、KV 驻留、模型并行方式与 SLO，避免把单一 workload 的改善推广成普遍规律。
+
+**预测机制应显式表达不确定性。** 输出长度预测论文给出 prefill-only 信息的统计极限；推测解码能耗论文则展示接受率和 batch 的条件依赖。二者共同提示：运行时预测最好作为风险和成本估计，而非绝对正确的预言；性能实验需要对模型、采样设置、硬件与负载做成组控制。
+
+**Agent 状态管理需要可验证的生命周期。** Sandman 的持久文件/进程状态、LMCache 的 Bundle/Acquisition 契约和 VeriCUA 的环境取证从不同层面指出：创建、复用、借用、恢复、清理与审计应有明确对象和事件语义。安全监控尤其不能只依赖 Agent 的自述文本，必须保留独立的外部证据。
+
+## 今夜白的观察
+
+本期最有研究价值的变化，不是某个单点性能数字，而是**状态管理正在从被动缓存机制升级为显式系统接口**。FlatCake 给出存储地址与布局接口，TAO 给出会话价值接口，LMCache 给出 checkpoint 获取契约，Sandman 和 OpenAI 分别给出环境生命周期与行为审计接口。它们共同表明，未来推理基础设施的核心竞争力可能不仅在 kernel 速度，也在能否准确描述和调度跨设备、跨请求、跨工具调用的状态。
+
+需要继续验证的关键问题是：扁平化存储在低复用或缺少 GDS 的部署中是否仍占优；阶段感知策略与异构并行是否会相互干扰；工具时长预测偏差会否抵消 Agent 调度收益；有状态检索能否在真实长程任务中优于全局检索；以及多层监控在未知攻击、隐私限制和高误报下的成本与有效性。这些问题目前不能由单篇论文或一个 PR 的实验直接回答。
+
+本期没有找到足以独立核验、且属于当前窗口的新系统顶会正式录用公告，因此不将未经官方确认的会议消息作为新闻；也未使用超过七天的旧技术博客填补篇幅。
+
+## 参考资料
+
+### 原始资料链接
+
+**论文与技术报告（首次公开时间均为 UTC）：**
+
+- 2026-10-28 — [FlatCake: A Flat KVCache Storage Architecture for LLM Serving](https://arxiv.org/abs/2610.38355)
+- 2026-10-29 — [PDScope: Breaking the Prefill-Decode Seesaw for Memory-Bound MoE Inference](https://arxiv.org/abs/2610.39216)
+- 2026-10-27 — [TAO: Tool-Aware Joint Scheduling for LLM-Based Agentic Serving](https://arxiv.org/abs/2610.37230)
+- 2026-10-29 — [Only Accepted Tokens Count](https://arxiv.org/abs/2610.40287)
+- 2026-10-27 — [ConfluxServe](https://arxiv.org/abs/2610.37810)
+- 2026-10-29 — [Sandman](https://arxiv.org/abs/2610.39711)
+- 2026-10-29 — [On the Fundamental Limits of Prefill-Based Decoding Length Prediction](https://arxiv.org/abs/2610.40541)；[作者代码](https://github.com/ShwStone/DecodingPredict)
+- 2026-10-29 — [VeriCUA](https://arxiv.org/abs/2610.40578)
+- 2026-10-29 — [Retrieval as Traversal](https://arxiv.org/abs/2610.40545)
+
+**官方技术说明：**
+
+- 2026-10-29 — [OpenAI Alignment Research: How we detect frontier model misalignment](https://alignment.openai.com/how-we-detect-frontier-model-misalignment/)
+
+**GitHub 原始 PR（均为未合并提案）：**
+
+- 2026-10-30 — [LMCache #6210：GPU-direct borrowing](https://github.com/LMCache/LMCache/pull/6210)
+- 2026-10-31 — [LMCache #6214：Bundle / Acquisition contracts](https://github.com/LMCache/LMCache/pull/6214)
+- 2026-10-31 — [SGLang #47685：DFlash Decode KV batch page top-up](https://github.com/sgl-project/sglang/pull/47685)
+- 2026-10-31 — [vLLM #64891：NIXL bidirectional transfer gate](https://github.com/vllm-project/vllm/pull/64891)
