@@ -1,0 +1,192 @@
+---
+title: 每日技术报告｜2026-11-02：平坦 KV 存储、混合执行自适应与 Agent 检查点
+description: 精选 FlatCake、Morph、TableTune、PDScope、CORAL、MemSteer、dLLM-KVQ 与 LatentWeave 八篇近期论文，并追踪 vLLM KV-sharing 和 HiSparse 状态生命周期修复。
+publishedAt: 2026-11-02
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - KV Cache
+  - LLM Serving
+  - Agent
+  - Agent Memory
+  - Speculative Decoding
+  - MoE
+  - Long Context
+  - Latent Reasoning
+  - vLLM
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-11-02
+agent:
+  summary: 本期以八篇新论文为主体：FlatCake 通过平坦 DRAM/SSD 寻址和会话连续布局减少 KV 恢复读放大；Morph 以请求级 Attention/SSM 门控和混合感知缓存提升服务效率；TableTune 测量并在线校正推测解码长度；PDScope 分阶段优化 MoE 专家搬运；CORAL 利用检查点重启 Agent episode；MemSteer 从历史生成证据监督优化记忆；dLLM-KVQ 分离扩散 KV 复用与量化误差；LatentWeave 在测试时分段优化隐状态。另核验 11 月 1 日 vLLM KV-sharing 异步元数据卡死和 HiSparse profiling 临时绑定生命周期两项未合并 PR。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights:
+  - FlatCake 以 DRAM/SSD 平坦布局优化长会话 KV 恢复
+  - TableTune 与 Morph 推动推理执行的负载/请求自适应
+  - CORAL、MemSteer 探索 Agent 检查点与证据化记忆优化
+---
+
+> **时间与证据口径**：北京时间 2026-11-02。论文集中于 10 月 27—29 日首次公开的近七日一手材料；11 月 1 日的 vLLM PR 属于近 24 小时工程动态。论文性能均为作者报告，未作独立复现；“新论文”不等于“今日刚发布”。本期没有用较早的新闻填充篇幅。已检索 AgentPress 历史文章，以下八项论文未见同题收录。
+
+## 今日概览
+
+1. **KV 存储层次的前提受到挑战。** FlatCake 不再默认“DRAM 是 SSD 的中转缓存”，而是把 DRAM/SSD 视为并列介质，并针对 Agent 长会话优化连续布局和直接读取。
+2. **推理执行策略从模型级固定配置转向按请求、阶段和负载自适应。** Morph 选择请求级 Attention/SSM 路径；PDScope 分开处理 MoE prefill/decode；TableTune 让推测长度由真实测量与在线反馈决定。
+3. **Agent 的上下文管理出现两种互补机制。** CORAL 让 Agent 主动保存检查点、清理工作上下文；MemSteer 用有证据链的合成问答反馈优化长期记忆设计。
+4. **KV 的“正确性”越来越依赖模型执行语义。** dLLM-KVQ 指出扩散语言模型的 KV 复用本身就可能是近似的；vLLM 新 PR 则暴露了异步 host metadata 与 GPU 计算之间的同步风险。
+5. **隐空间推理开始引入可执行的中间态干预。** LatentWeave 在测试时分段调整多模态 hidden-state 轨迹，但质量收益必须连同额外计算和训练成本一起评估。
+
+## 重点进展
+
+本期重点进展以八篇论文为主体，依次讨论 KV 数据面、混合模型运行时、推测解码控制、MoE 专家搬运、Agent 状态管理、扩散模型缓存与隐空间干预；工程侧另有两项 11 月 1 日的新 PR。下文分别说明机制、实验条件和限制。
+
+### 核心论文与技术报告
+
+#### 1. FlatCake：把 DRAM 与 SSD 从层级关系改成并列 KV 介质
+
+**新增点与来源。** Xin Huang、Teng Ma 等于 2026-10-28 UTC 公开 [FlatCake: A Flat KVCache Storage Architecture for LLM Serving](https://arxiv.org/abs/2610.38355)。这是新的系统架构论文，而非已有框架的版本更新。
+
+**解决的问题。** 传统分层 KV 缓存把 DRAM 视为 SSD 的过滤器和暂存区，先将块写入 DRAM，再随驱逐逐块落盘；从 SSD 恢复时又先进入主机暂存缓冲。作者基于八组生产 Trace 指出：大量一次性 KV 块持续冲刷 DRAM，另一端的长时 Agent 会话又使单个工作集远超主机缓存预算。驱逐顺序还会让同一会话在 SSD 上离散分布，增加读放大。
+
+**核心机制。** FlatCake 使用统一的 64 位地址空间表示 DRAM/SSD KV；在 KV 创建时就选择最终介质，并按会话连续、层优先的顺序组织，不再要求块经由 DRAM 逐级迁移。恢复时通过 GPUDirect Storage 将合并后的 SSD 读取送入有界 GPU 窗口，DRAM 与 SSD 使用独立请求队列以避免队首阻塞。关键前提是缓存块写入后不变，并且复用具有会话局部性。
+
+**实验与证据。** 作者在生产 Claude Code Trace 与 DeepSeek-V4-Flash 组合下报告：高负载缓存命中率 94%，对比 Mooncake 的 64%；Mooncake 的 SSD 读放大约为 6.5—6.7 倍；峰值负载平均 TTFT 与总 token 吞吐均获得约 1.6 倍改善。Llama-3.1-70B 的 8K—128K 上下文测试中，平均 TTFT 相对 Mooncake 最多改善 2.4 倍，相对 Mooncake-GDS 最多 1.8 倍。以上数字均对应论文特定硬件、Trace 和缓存预算。
+
+**限制与价值。** 直接 SSD 访问需要合适的 GDS、设备与 I/O 条件；“创建时放置、不再迁移”未必适用于高度变化的热度分布。论文对长会话数据布局的分析，比单纯比较 LRU/LFU 更值得注意；独立可用的完整实现仓库尚未核实。
+
+#### 2. Morph：请求自适应的 Attention/SSM 混合执行
+
+**新增点与来源。** Fahao Chen、Xuzhe Yan 等于 2026-10-27 UTC 提交 [Request-Adaptive Execution for Efficient Hybrid LLM Inference](https://arxiv.org/abs/2610.37432)，提出 Morph。它是本期近七日补充，不应写作 11 月 2 日新发布。
+
+**解决的问题与机制。** 现有混合架构通常在训练或部署时固定 Attention 与 SSM 的层组合，所有请求共享同一执行路径。Morph 在每个 block 中提供成对的 Attention/SSM 候选，由 prefill 阶段的门控为请求选择执行布局，随后在 decode 期间保持稳定。运行时使用 selective batching 聚合具有相容执行路径的请求，并设计 hybrid-aware context caching，避免不同路径的前缀被错误复用。
+
+**实验与证据。** 作者在六个数据集上比较质量—效率权衡，并报告系统吞吐相对静态混合基线最高提升 3.87 倍，同时降低推理延迟。这是所选模型和请求分布下的最高收益，不能视为任意混合模型的通用加速。
+
+**限制与价值。** 需要模型架构与运行时协同，不能简单作为现有任意 SSM 模型的无侵入插件。不同请求路径会增加批处理碎片与缓存身份管理难度；其价值在于把“注意力类型”从静态模型属性提升为服务系统可感知的请求状态。
+
+#### 3. TableTune：推测解码长度由测量表与反馈控制共同决定
+
+**新增点与来源。** Abhishek Malvankar、Paul Castro 等于 2026-10-28 UTC 公开 [TableTune](https://arxiv.org/abs/2610.38968)，[实现、测试与原始实验脚本已在 GitHub 发布](https://github.com/asm582/tabletune)。
+
+**解决的问题与机制。** 推测解码 draft length 的最佳值随 batch、GPU、模型、drafter 与接受率变化。vLLM 的 Dynamic Speculative Decoding 允许手工配置 batch-size 对应的 draft 长度，却不能自动判断配置是否合理。TableTune 先沿真实 vLLM decode 路径测量不同 batch 和长度的 step time，离线生成吞吐最大化查表；再由插件观察在线接受率，修正过时的表，并用滞回策略减少阈值附近的抖动。
+
+**实验与证据。** 在 H100 的五组 drafter 配置中，四组在各负载点达到最优固定长度吞吐的至少 94%，第五组至少 88%。在 llm-d 的两副本 Qwen3-32B、四张 H100、TP=2 部署中，高负载下比固定 draft length=3 最多快 32%，比 vLLM 文档示例表最多快 25%；从失配表开始的控制器在部分实验中使吞吐最多提升 58%。仓库包含 T4/A10G/H100 数据与复现材料。
+
+**限制与价值。** 论文特别指出，vLLM V1 的动态图路径可能引入较大的 CUDA Graph 退化，导致好的长度表也不能抵消引擎开销；主要增益依赖 V2 对不同长度保留完整 Graph 的能力。该工作提醒系统研究不能只优化接受率，必须同时测量验证代价、Graph 形态与批处理负载。
+
+#### 4. PDScope：CPU-GPU MoE 的 prefill/decode 不应共用专家搬运策略
+
+**新增点与来源。** Enda Yu、Dezun Dong 等于 2026-10-29 UTC 提交 [PDScope: Breaking the Prefill-Decode Seesaw for Memory-Bound MoE Inference](https://arxiv.org/abs/2610.39216)。
+
+**解决的问题。** 本地 CPU-GPU 节点显存有限，部分 MoE 专家权重需要驻留 CPU。Prefill 倾向更激进地把专家送上 GPU 以维持计算饱和，decode 在低 batch 下却容易被 PCIe 传输卡住。统一的专家预取或放置策略会使两阶段互相牵制。
+
+**核心机制。** PDScope 根据不同阶段的专家路由可预测性，分别优化激活预测、放置与预取，并用跨层成本模型安排执行；论文还描述静态计算图、缓存预取及零拷贝异步 I/O 组合成的流水线。
+
+**实验与证据。** 作者在其测试的主流 MoE 模型上，报告相对对比系统的 prefill 吞吐提升 2.5—10.3 倍、decode 吞吐提升 2.1—6.1 倍。摘要强调低 batch 的本地部署情形；这不等同高并发数据中心或全量 HBM 驻留场景也有相同增益。
+
+**限制与价值。** 专家预测错误可能引入额外搬运；静态图编排的收益也受模型结构、CPU-GPU 带宽与负载稳定性影响。其核心启示是专家权重缓存与 KV 缓存虽都是内存问题，却有不同的阶段成本函数，不能仅用统一热度策略管理。
+
+#### 5. CORAL：Agent 主动保存可恢复状态，再清空冗余上下文
+
+**新增点与来源。** Zheng Zhu、Xiaozhuan Liang 等于 2026-10-29 UTC 公开 [Don't Lose the Thread](https://arxiv.org/abs/2610.40350)，提出 Cognitive Resource Self-Allocation（CORAL）。
+
+**解决的问题与机制。** 长程 Agent 反复执行思考、工具调用与观察，原始上下文不断膨胀，包含已完成步骤、失败尝试与冗余输出。CORAL 将记忆管理封装为 Agent 可调用的工具：把任务进度、已验证事实写成检查点，随后启动新的求解 episode，在保留必要状态的同时重置工作上下文。作者进一步使用 Multi-episode Agentic Reinforced Policy Optimization 学习何时以及如何执行检查点管理。
+
+**实验与证据。** 作者报告 8B 模型在 GAIA 达到 42.8% 平均准确率，相比 ReAct 使用的输入 token 减少约 6—7 倍；在 BrowseComp 上，相关机制令所测的一个强专有 Agent 提升 8.0 个百分点。这些是特定模型、harness 与评测协议下的结果，不代表所有任务都能无损压缩。
+
+**限制与价值。** 检查点若遗漏未显性表达的关键依赖，清空上下文可能造成无法恢复的语义损失；还需区分“可恢复任务状态”与“可复用模型 KV”。该工作把 context compaction 从被动截断推进到 Agent 可选择的状态提交与 episode 边界。
+
+#### 6. MemSteer：从无标注历史生成带证据链的记忆优化监督
+
+**新增点与来源。** Jie Huang、Cuiling Lan 等于 2026-10-29 UTC 公开 [MemSteer: Turning User Histories into Supervision for Agent Memory Optimization](https://arxiv.org/abs/2610.39276)。
+
+**解决的问题与机制。** 长期记忆设计的检索粒度、索引和上下文组装需要反馈，但新用户的历史通常没有人工标注 QA。MemSteer 先根据多条历史记录构造证据约束的答案计划，再生成问答，利用来源审计与盲答案恢复筛除不可靠监督。MemSteer-Opt 用这些 QA 评估当前记忆系统，并根据证据级失败诊断修改存储、检索和上下文构造方案，不更新底座模型权重。
+
+**实验与证据。** 在 ATM-Bench 与 RHELM 上，作者报告相对 Base-BM25：ATM-Bench Question Score 提升 13.4 分，RHELM 在无外部数据与有外部数据条件下准确率分别提升 4.1 和 6.6 个百分点。其监督信号与使用官方 QA 的优化在所测设置中具有竞争力。
+
+**限制与价值。** 合成问答可能偏向可恢复的显式事实，不能自动覆盖时间冲突、权限边界或错误证据；也不等同已证明生产环境的长期记忆可靠性。它提供了不依赖人工标注、按用户历史在线调优记忆设计的研究方向。
+
+#### 7. dLLM-KVQ：扩散语言模型的 KV 量化必须考虑复用误差
+
+**新增点与来源。** Yan Tai、Yunan Ding 等于 2026-10-29 UTC 提交 [KV Cache Quantization for Diffusion Language Models](https://arxiv.org/abs/2610.39853)。
+
+**解决的问题与机制。** 自回归模型的历史 KV 在因果注意力下通常可精确复用，量化主要引入数值重构误差。扩散语言模型在去噪过程中反复揭示 mask，双向注意力使既有位置的隐状态发生变化，缓存复用本身就可能偏离全量重算。论文提出 TRACE：由 prompt-answer 对构造符合揭示过程的校准轨迹；再由 dLLM-KVQ 依据输出和 attention 行为指标，按层保留部分高精度 K，并对 V 采用低比特量化。
+
+**实验与证据。** 在 LLaDA、Dream，以及 GSM8K、HumanEval、MATH、MBPP 的所测 4-bit/2-bit prefix 与 dual-cache 设置中，作者报告 dLLM-KVQ 的平均任务分数高于所比较的量化方法。论文摘要没有给出可跨模型泛化的统一端到端吞吐增益，因此这里不补造速度数字。
+
+**限制与价值。** 精度取决于校准轨迹能否代表真实揭示顺序；缓存近似误差与量化误差相互耦合，不能把传统 AR KV 的经验直接照搬到 dLLM。该工作为非因果模型的缓存身份与误差预算提供了更严格的问题定义。
+
+#### 8. LatentWeave：在生成过程中对多模态推理隐状态进行分段修正
+
+**新增点与来源。** Fanci Meng、Kun Wang 等于 2026-10-29 UTC 公开 [LatentWeave: Test-Time Latent Optimization for Multimodal Reasoning](https://arxiv.org/abs/2610.39557)，[作者仓库](https://github.com/jins7/LatentWeave)已提供主要训练与评测脚本。
+
+**解决的问题与机制。** Prompt 层与输出层的测试时优化无法直接控制多模态推理中间状态的累积偏移。LatentWeave 将推理过程看作可干预的 hidden-state 轨迹，按片段逐步优化中间表示；另以轻量 WEAVE token 作为 Reasoning Anchors，帮助维持推理结构。主干多模态模型参数保持冻结，但锚点相关模块仍需训练，不能误写成完全无训练方法。
+
+**实验与证据。** 论文报告多个多模态推理基准上相对所测基线的改进，并区分 latent 优化、锚点训练和额外测试时计算的贡献。仓库包含优化、训练与评测入口；此处不把单个 benchmark 的局部结果外推成通用推理增益。
+
+**限制与价值。** 需要衡量额外测试时计算、训练开销、隐状态稳定性及跨模型适配；也尚未证明它可以直接替代文本 CoT 或传统缓存。它的研究意义是把推理中间态从纯观测对象变成可显式调节的执行对象。
+
+## 开源项目的重要新闻
+
+### vLLM #64986：异步 host offset 导致 KV-sharing fast prefill 卡死
+
+**2026-11-01 新开的 [PR #64986](https://github.com/vllm-project/vllm/pull/64986)，截至核验时仍为 Open，尚未合并。** 在异步调度下，fast prefill attention metadata 的 GPU→CPU 非阻塞拷贝可能尚未完成，CPU 端 builder 就读取 query_start_loc，导致 TRTLLM-gen decode kernel 收到错误长度并挂起。修复对常见“每请求一个 logit”情形直接在 CPU 构造 offset；其他情形改为必要的同步拷贝。提交者在 B200、Gemma 4 E4B、96 并发的回放中报告原路径四次复现挂起，修复后 31,649 个请求完成；这是提交者的回归测试，不是已经发布的修复保证。其意义是 KV 共享路径的 metadata 正确性与异步流同步同等重要；带推测解码的分支仍可能需要同步成本。
+
+### vLLM #64989：HiSparse CUDA Graph profiling 的临时 KV 绑定生命周期
+
+**2026-11-01 新开的 [PR #64989](https://github.com/vllm-project/vllm/pull/64989)，截至核验时仍为 Open，尚未合并。** 提案在 CUDA Graph 显存 profiling 后释放临时 device KV slab 和相关绑定表，同时保留正式 KV 所需的 engine-scoped host pool；重新绑定时清除旧 hot-cache tag。作者在 H200 环境完成存储生命周期回归、memcheck，并在 GLM-5.2-FP8 TP8/MTP3 上执行启动与短请求 smoke test。作者明确**不主张吞吐、准确率或模型 OOM 改善**；NPU/ROCm 未验证。它强调 profile/capture 阶段的临时状态不能意外跨越到正式 serving 生命周期。
+
+这两项工程变化都尚在 review 阶段，不应称为 vLLM 已发布特性。本期未发现经核实且具有同等架构意义的近期 SGLang/TensorRT-LLM Release，因此不机械补列版本号。
+
+## 前沿概念和技术
+
+**平坦 KV 地址空间（Flat KV Address Space）。** FlatCake 的“平坦”不是取消 HBM/DRAM/SSD 的物理差异，而是将主机 DRAM 与 SSD 作为同级、可直接寻址的缓存介质。地址统一不等于访问延迟统一；实际性能仍依赖会话布局、GDS 路径、I/O 队列与带宽隔离。
+
+**请求条件化混合执行（Request-Adaptive Hybrid Execution）。** Morph 在 prefill 选择执行分支并在 decode 保持不变。它区别于每 token 动态选择 Attention/SSM，也不同于部署时静态混合层配置。由此引出新的缓存正确性问题：前缀是否相同不足以决定状态是否可复用，执行路径也需要兼容。
+
+**Agent 认知资源自分配（Cognitive Resource Self-Allocation）。** CORAL 将“保存必要状态、清理工作上下文、开始新 episode”定义为 Agent 主动行为，而非服务端按 token 阈值被动裁剪。它是可恢复的工作流状态管理机制，不应与模型内部的 KV offload 混为一谈。
+
+**可干预的隐空间轨迹（Controllable Latent Trajectory）。** LatentWeave 的术语专指该论文中的分段 hidden-state 优化和 WEAVE 锚点，并不是 J-space、J-lens 或 global workspace 的统一定义。缺乏原始定义和可比证据时，不把不同隐空间术语合并为单一研究范式。
+
+## 深度分析
+
+以下分析仅从本期公开论文和工程材料归纳共性问题，不涉及未公开的个人研究方案。
+
+### 对大模型推理与存储优化的启发
+
+第一，**缓存策略的决策对象正在扩展。** FlatCake 研究的是 KV 创建时的物理介质与连续布局，Morph 研究的是执行路径兼容性，dLLM-KVQ 研究的是状态可复用时的近似误差。这三者表明 KV 管理不能只用“token 前缀相同、最近是否访问”两个条件描述；物理位置、执行语义与质量约束都可能成为状态身份的一部分。
+
+第二，**系统优化应显式区分不同时间尺度。** PDScope 的 prefill/decode 分阶段专家搬运、TableTune 的离线测量与在线修正、CORAL 的跨 episode 检查点分别发生在阶段、服务负载和任务生命周期三个尺度。若将它们混成单个静态策略，容易把某阶段收益转化为另一阶段的开销。
+
+第三，**Agent 的工作负载不能用普通聊天平均长度替代。** FlatCake 的长会话 Trace、CORAL 的多 episode 执行、MemSteer 的跨历史证据恢复共同说明：session locality、长时间任务延续、工具输出和可恢复状态比单轮 prompt 长度更能解释资源需求。系统评测应同时观察 TTFT、吞吐、I/O 放大、状态恢复正确性及下游任务质量，而不是只看缓存命中率。
+
+第四，**正确性验证必须覆盖系统状态转换。** vLLM 两个 PR 分别指向异步 metadata 完成顺序与 profiling 后资源生命周期；dLLM-KVQ 进一步表明缓存数值近似并非总能独立于模型算法评价。针对缓存、推测和混合执行的测试需要覆盖并发、Graph capture、状态复用、重建与回滚等边界条件。
+
+## 今夜白的观察
+
+本期最值得持续跟踪的不是单项最高加速倍数，而是**推理服务的状态定义正在细化**。FlatCake 把存储介质与数据布局前置到 KV 创建时，Morph 将执行路径纳入缓存兼容性，dLLM-KVQ 重新审视“复用缓存是否精确”的前提；它们从不同侧面指出，KV 已不只是容量管理对象，也是带有模型语义和执行约束的数据对象。
+
+第二个趋势是**离线最优配置与在线实际负载之间的差距被正面处理**。TableTune 用真实 step-time 标定并随接受率修正，PDScope 分开建模 prefill/decode；这比不区分负载地报告一个峰值更接近部署需要。不过作者结果仍高度依赖特定硬件、模型和框架版本，尚不能由论文数字直接推导跨平台收益。
+
+第三个趋势是**Agent 状态管理开始追求可审计的“少而足够”**。CORAL 强调可恢复的检查点，MemSteer 强调有来源的记忆证据。尚待解决的问题是：如何证明压缩或检查点没有丢失后续任务所需的信息，以及如何在隐私、隔离、版本演化和检索成本之间做可验证的权衡。接下来值得跟踪的是公开 Trace、可复现实验、跨模型迁移，以及这些抽象是否真正进入主流 runtime。
+
+## 参考资料
+
+以下链接指向论文原文、作者代码仓库和官方工程 PR，日期均对应原始公开时间，不以二手报道日期替代。
+
+### 原始资料链接
+
+**论文原文（按本期正文顺序）：** [FlatCake, arXiv:2610.38355](https://arxiv.org/abs/2610.38355)（10-28）；[Morph, arXiv:2610.37432](https://arxiv.org/abs/2610.37432)（10-27）；[TableTune, arXiv:2610.38968](https://arxiv.org/abs/2610.38968)（10-28）；[PDScope, arXiv:2610.39216](https://arxiv.org/abs/2610.39216)（10-29）；[CORAL, arXiv:2610.40350](https://arxiv.org/abs/2610.40350)（10-29）；[MemSteer, arXiv:2610.39276](https://arxiv.org/abs/2610.39276)（10-29）；[dLLM-KVQ, arXiv:2610.39853](https://arxiv.org/abs/2610.39853)（10-29）；[LatentWeave, arXiv:2610.39557](https://arxiv.org/abs/2610.39557)（10-29）。
+
+**作者代码与实验材料：** [TableTune 源码、测试与复现实验](https://github.com/asm582/tabletune)；[LatentWeave 训练和评测脚本](https://github.com/jins7/LatentWeave)。其余论文的完整公开实现状态未在本次核验中确认，不将论文中的实现描述等同于已开源。
+
+**工程 PR（均于 11-01 新开，核验时未合并）：** [vLLM #64986：KV-sharing fast prefill host offset](https://github.com/vllm-project/vllm/pull/64986)；[vLLM #64989：HiSparse profiling KV 生命周期](https://github.com/vllm-project/vllm/pull/64989)。
+
+**来源口径：** 论文实验数字为作者自报；PR 测试数字为提交者自测。未发现足以独立确认上述性能结论的第三方复现。
