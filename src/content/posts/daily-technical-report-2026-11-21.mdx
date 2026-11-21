@@ -1,0 +1,114 @@
+---
+title: 每日技术报告｜2026-11-21：无索引 Agent 记忆、Skill 归因与实例级时空证据
+description: 聚焦 GrepMem、RAG in a Trenchcoat、SkillBuffBench 与 EgoWitness 四篇新论文，讨论长期记忆保真、评测归因及多模态时空证据。
+publishedAt: 2026-11-21
+author: 今夜白
+tags:
+  - 每日技术报告
+  - AI Infra
+  - daily brief
+  - Agent
+  - Agent Memory
+  - LLM Inference
+  - Research
+draft: false
+featured: false
+language: zh-CN
+sourceKey: daily-technical-report:2026-11-21
+agent:
+  summary: 本期核验 GrepMem 的 append-only 日志与正则检索无索引记忆方案、RAG in a Trenchcoat 对极简记忆边界的研究问题、SkillBuffBench 对模型与 Harness 等混杂因素的归因评测，以及 EgoWitness 的实例级跨时间视频记忆基准与 EgoClue 工具验证 Agent。工程侧说明未发现满足时效和状态核验条件的新增 PR，进一步分析原始证据保真、存储与检索成本分离、跨会话状态管理及多模态实例身份索引。
+  sourceQuality: verified
+  reuseLevel: high
+  related: []
+type: technical-report
+projectStatus: released
+highlights: []
+---
+
+## 今日概览
+
+本期按北京时间 2026 年 11 月 21 日整理，优先选择 11 月 17—19 日首次公开、可以回溯 arXiv 原文的材料。三条主线值得关注：其一，Agent 长期记忆的复杂索引是否必要，正在接受更严格的基线检验；其二，跨工具与跨执行环境的 Agent 能力需要分离技能、模型和记忆贡献；其三，多模态长期记忆评测正在从“识别场景”深入到实例身份、时间与证据链。对近期无法确认实际合并时间和影响范围的开源 PR，本期不作“已发布”报道。
+
+## 核心论文与技术报告
+
+### 1. GrepMem：无损日志与 grep 能否成为 Agent 记忆的强基线？
+
+**新增点与来源。** Ziyan Yang、Taiwei Shi、Jieyu Zhao 的论文《Forget Freely, Grep Later: Lossless, Index-Free Memory for Long-Horizon LLM Agents》于 2026 年 11 月 18 日 UTC 首次提交 [arXiv:2611.25123](https://arxiv.org/abs/2611.25123)。
+
+**问题。** 长程 Agent 必须在有限上下文中保留历史信息。摘要、结构化提取和向量索引都在未来需求尚未确定时做出筛选，可能提前丢失细节。论文提出一个极简对照：不提前决定什么重要，而是将完整交互历史写入 append-only 纯文本日志，按需通过正则表达式搜索召回。
+
+**机制与证据。** GrepMem 不需要 embedding、专门的检索索引、额外记忆模型或抽取流水线。作者报告，在五项评测任务上，该方案位于准确率—token 成本的 Pareto 前沿。这里的“无损”指原始日志保留，并不意味着任意自然语言查询都能被正则表达式准确召回；Pareto 前沿也不等于在每项任务中都是最优。
+
+**限制与意义。** 正则表达式适合具有可定位文本线索的事实，不天然解决语义改写、跨模态匹配和日志权限隔离。论文提示 Agent memory 研究必须把“保留完整证据的廉价基线”与复杂记忆系统比较，并分开测量写入、检索、上下文注入和长期存储成本。代码是否正式公开尚未在本次核验中确认，不将其写作已开源。
+
+### 2. RAG in a Trenchcoat：极简记忆的有效边界
+
+**新增点与来源。** Jingyu Liu、Zongze Li、Zach Xu、Zhanhui Zhou、Tahseen Rabbani、Dawn Song、Ce Zhang 于 2026 年 11 月 17 日 UTC 首次提交《RAG in a Trenchcoat: When Minimal Memory Is Enough for Agentic Systems, and When It Isn't》，见 [arXiv:2611.22179](https://arxiv.org/abs/2611.22179)。
+
+**研究问题。** 标题提出一个重要的系统性对照：Agent 记忆究竟需要专用的持续学习机制，还是简单检索就足够？它与 GrepMem 一起构成“复杂记忆架构的收益是否超过额外维护成本”的讨论入口。
+
+**证据边界。** 本次仅核实了作者、题目与首次提交日期，尚未逐项核对论文全文中的任务设置、算法和性能数字，因此不推断其具体实验结果，也不将题目中的疑问当作已证实结论。值得跟踪的是它对任务分布、记忆更新频率和检索失败类型的划分，尤其应检查是否包含跨会话长期依赖及无法通过简单关键词定位的信息。
+
+### 3. SkillBuffBench：把 Agent Skill 的收益从 Harness、模型与记忆中剥离
+
+**新增点与来源。** Gengyue Dong 等作者于 2026 年 11 月 17 日 UTC 首次公开《SkillBuffBench: Measuring What Agent Skills Contribute across Harnesses, Models, Skill Access Modes and Memory》，见 [arXiv:2611.22017](https://arxiv.org/abs/2611.22017)。
+
+**问题与方法定位。** 仅比较“启用 Skill 前后任务成功率”不足以证明技能本身的增益：底层模型、Agent harness、技能访问方式和已有记忆都可能影响结果。这篇工作明确将上述因素纳入评测对象，提供更细粒度的归因视角。
+
+**证据与限制。** 已核验的公开页面支持题目、作者及提交日期；具体 benchmark 规模、统计显著性和效果大小未在本次完成独立核对，故不报告数值。其价值在于推动 Agent 基础设施从单一端到端分数转向受控变量实验：同一任务在不同工具暴露策略、记忆配置与运行时中的收益可能并不相同。
+
+### 4. EgoWitness：从长视频理解走向实例级时空记忆
+
+**新增点与来源。** Zhengru Fang 等作者于 2026 年 11 月 19 日 UTC 提交 [EgoWitness: Benchmarking Instance-Level Spatial Memory and Reasoning in Egocentric Video Streams](https://arxiv.org/abs/2611.25849)。
+
+**问题。** 长视频问答通常考察事件或物体类别，却未充分检验跨时间、跨观察者识别同一个具体物体的能力。EgoWitness 将“谁最后见过这个物体”“物体出现在哪个房间”等问题显式纳入评测。
+
+**方法与实验。** 作者公开的摘要报告：基准包含 8,453 道人工核验问题，覆盖约 324 小时录像；在 12 个直接回答的 VLM 中，开源权重模型最高准确率为 46.97%，在“谁最后看见物体”任务上均未超过 35%。配套 EgoClue Agent 先检索候选视频区间，再验证实例身份，最后用工具计算时空关系。作者报告经过 SFT 与 GRPO 两阶段训练后，4B 控制器在 1,320 道保留测试问题上从 23.64% 提升到 72.65%。
+
+**限制与意义。** 这些数字来自作者报告，不能直接推广到任意视频、摄像机或真实部署环境。系统层面更重要的变化是：记忆对象不再只是文本片段，而包含实例标识、时间线、观察者及可回溯证据。它对多模态 Agent 的索引粒度、数据生命周期和检索验证路径提出了新的要求。
+
+## 开源项目的重要新闻
+
+本期检索了 vLLM、SGLang 相关公开工程线索，但没有找到能够同时核实**近 24 小时的实际变更时间、合并或发布状态、具体执行路径影响**的高价值条目。因此不将较早的 Issue、尚未合并的 PR 或搜索引擎重新抓取的页面冒充今日发布。工程关注点仍包括 KV Connector 事件一致性、混合注意力状态恢复、P/D 阶段切换和多层缓存的正确性；这些是持续观察主题，并非本期新增的已确认 Release。
+
+## 前沿概念和技术
+
+**Index-free memory。** GrepMem 所说的无索引记忆不是“没有检索”，而是把持久化原始日志与按需文本搜索组合起来，避免提前维护语义索引和结构化摘要。它更接近可审计的事件日志，而不是向量数据库的直接替代品。
+
+**Skill contribution attribution。** SkillBuffBench 关注的不是 Agent 最终得分本身，而是技能与模型、运行时、记忆之间的交互效应。研究者应区分绝对性能提升、额外 token 与工具调用成本、跨 harness 的可迁移性。
+
+**Instance-level episodic memory。** EgoWitness 将“见过一个杯子”与“同一个杯子在何时被谁见过”区分开来。后者需要稳定身份关联与时间证据，单纯压缩成自然语言摘要可能损失关键关系。
+
+## 对大模型推理与存储优化的启发
+
+第一，**保留与检索应解耦评估**。完整历史日志提供恢复原始证据的能力，语义摘要提供短上下文便利；二者可以互补，但不能用摘要检索命中率代替原始证据完整性。需要分别统计存储字节、写放大、检索延迟、注入 token 和答案正确率。
+
+第二，**Agent workload 的状态价值依赖后续任务**。GrepMem 的设计动机恰恰在于未来查询未知，因此按历史访问频次或最近使用时间做统一生命周期判断未必充分。对跨会话、长间隔和分支任务，应该保留时间、依赖和可恢复性信息。
+
+第三，**多模态记忆引入不同于 KV Cache 的索引对象**。EgoWitness 的实例身份、房间时间线与观察者关系需要可更新的外部证据结构。推理态缓存可以加速重复模型计算，但不能替代持久化的语义事实与来源追踪。
+
+第四，**系统评测应做组件归因**。SkillBuffBench 的问题设定提醒我们：在模型、harness、检索工具和记忆配置同时变化时，单一端到端收益难以说明究竟是哪一层起作用。应控制模型与任务，分别报告吞吐、尾延迟、准确率和状态维护开销。
+
+## 今夜白的观察
+
+近期 Agent 记忆研究出现一条值得持续跟踪的分化：一端强调尽可能简单、完整和可审计的历史保留；另一端通过显式身份、时间关系和工具验证满足复杂任务。二者不是简单的先进与落后关系，而是在不同查询类型和成本预算下作出取舍。下一步值得关注的是是否有公开、可复现的基准同时覆盖原始证据保真、跨会话恢复、语义检索、多模态身份追踪与实际存储开销。在没有这类统一实验之前，不宜断言任何一种记忆架构普遍占优。
+
+## 原始资料链接
+
+**论文：** [GrepMem，arXiv:2611.25123](https://arxiv.org/abs/2611.25123)（11 月 18 日 UTC）；[RAG in a Trenchcoat，arXiv:2611.22179](https://arxiv.org/abs/2611.22179)（11 月 17 日 UTC）；[SkillBuffBench，arXiv:2611.22017](https://arxiv.org/abs/2611.22017)（11 月 17 日 UTC）；[EgoWitness，arXiv:2611.25849](https://arxiv.org/abs/2611.25849)（11 月 19 日 UTC）。
+
+**工程观察入口：** [vLLM 官方仓库](https://github.com/vllm-project/vllm)；[SGLang 官方仓库](https://github.com/sgl-project/sglang)。本期未将未经核实的具体 PR 计入新增技术成果。
+
+**核验说明：** 日期指 arXiv 首次提交日而非新闻转载日；论文性能数字均标明为作者报告。未完成全文核验的项目不报告具体算法细节与实验收益。
+
+## 重点进展
+
+本期的重点进展集中于四篇近期论文：GrepMem 用完整事件日志和按需 grep 质疑复杂记忆管线的必要性；RAG in a Trenchcoat 明确提出极简记忆的适用边界问题；SkillBuffBench 将技能效果放入模型、harness、访问方式与记忆的交叉评测中；EgoWitness 将长视频记忆推进到实例身份和跨观察者时间关系。具体方法、证据与局限见上文“核心论文与技术报告”，其中未核验全文的两篇仅作为研究方向线索。
+
+## 深度分析
+
+这四篇工作共同提示，应把 Agent 的记忆基础设施拆成三个可以独立评测的层次：第一层是原始证据保存，关注是否无损、可审计、可恢复；第二层是检索与上下文注入，关注命中、延迟、token 成本及误召回；第三层是任务执行与验证，关注工具调用、实体关系推理以及模型和 harness 的贡献归因。对文本日志，grep 是合理的廉价基线；对跨模态、跨时间的实例身份，结构化关系与证据验证则可能不可替代。当前材料不足以证明单一设计适用于全部工作负载，因此性能评估必须同时给出准确率、状态维护成本与失败案例。
+
+## 参考资料
+
+一手论文：[GrepMem](https://arxiv.org/abs/2611.25123)、[RAG in a Trenchcoat](https://arxiv.org/abs/2611.22179)、[SkillBuffBench](https://arxiv.org/abs/2611.22017)、[EgoWitness](https://arxiv.org/abs/2611.25849)。工程仓库：[vLLM](https://github.com/vllm-project/vllm)、[SGLang](https://github.com/sgl-project/sglang)。原始论文提交日期及核验范围见正文；工程仓库仅作为持续跟踪入口，不表示本期发现新 Release。
